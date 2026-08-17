@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Temporary / scratch files
+.tmp/
+
+# Runtime data (keep directory structure)
+data/*
+!data/.gitkeep
+
+# IDE / editor
+.vscode/
+.idea/
