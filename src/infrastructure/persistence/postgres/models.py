@@ -73,7 +73,6 @@ class ExerciseRow(Base):
     __table_args__ = (
         UniqueConstraint("external_id", "source", name="uq_exercise_external_source"),
     )
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     external_id: Mapped[str] = mapped_column(String(128), index=True)
     source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
@@ -96,6 +95,36 @@ class ExerciseRow(Base):
     limitations: Mapped[list] = mapped_column(JSON, default=list)
     images: Mapped[list] = mapped_column(JSON, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class WorkoutProgramRow(Base):
+    """Версия программы тренировок.
+
+    Храним полную Pydantic-модель в JSONB (data) + денормализованные
+    колонки для списков/фильтров. Каждая версия — отдельная строка,
+    история не перезаписывается.
+    """
+
+    __tablename__ = "workout_programs"
+    __table_args__ = (
+        UniqueConstraint("program_id", "version", name="uq_program_id_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    program_id: Mapped[str] = mapped_column(String(64), index=True)
+    profile_id: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    generation_source: Mapped[str] = mapped_column(String(32), default="deterministic")
+    generator_version: Mapped[str | None] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(200))
+    training_days_per_week: Mapped[int] = mapped_column(Integer, default=3)
+    duration_weeks: Mapped[int] = mapped_column(Integer, default=8)
+    data: Mapped[dict] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

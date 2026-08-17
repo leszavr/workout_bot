@@ -32,3 +32,15 @@ class FileStorageError(WorkoutBotError):
 
 class NotificationError(WorkoutBotError):
     """Не удалось доставить уведомление администратору."""
+
+
+class ProgramGenerationError(WorkoutBotError):
+    """Не удалось сгенерировать программу (пустой пул, неверный профиль)."""
+
+
+class ProgramValidationError(WorkoutBotError):
+    """Программа не прошла валидацию."""
+
+
+class ProgramPersistenceError(WorkoutBotError):
+    """Не удалось сохранить/прочитать программу в хранилище."""

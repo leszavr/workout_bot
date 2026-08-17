@@ -124,6 +124,90 @@ export interface ListResponse<T> {
   items: T[];
 }
 
+export interface ProgramExercise {
+  exercise_external_id: string;
+  exercise_source: string;
+  order: number;
+  sets: number;
+  repetitions_min: number;
+  repetitions_max: number;
+  rest_seconds: number;
+  intensity: string | null;
+  notes: string | null;
+  technique_notes: string | null;
+}
+
+export interface TrainingDay {
+  day_number: number;
+  title: string;
+  focus: string;
+  exercises: ProgramExercise[];
+}
+
+export interface ProgramDetail {
+  schema_version: string;
+  program_id: string | null;
+  profile_id: string;
+  version: number;
+  status: string;
+  generation: {
+    source: string;
+    generator_version: string;
+    safe_pool_size: number | null;
+    candidate_pool_total: number | null;
+  };
+  title: string;
+  description: string | null;
+  duration_weeks: number;
+  training_days_per_week: number;
+  training_days: TrainingDay[];
+  progression: {
+    description: string | null;
+    weekly_increase_percent: number | null;
+  };
+  safety_notes: string[];
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ProgramListItem {
+  program_id: string;
+  profile_id: string;
+  version: number;
+  status: string;
+  title: string;
+  generation_source: string;
+  generator_version: string;
+  training_days_per_week: number;
+  duration_weeks: number;
+  created_at: string | null;
+}
+
+export interface ProgramVersionInfo {
+  version: number;
+  status: string;
+  created_at: string | null;
+}
+
+export interface ProgramResponse {
+  program: ProgramDetail;
+  versions: ProgramVersionInfo[];
+}
+
+export interface GenerateResponse {
+  program: ProgramDetail;
+  pool_stats: {
+    total_exercises: number;
+    candidates_included: number;
+    candidates_excluded: number;
+    safe_allowed: number;
+    safe_excluded: number;
+    safe_warnings: number;
+    safe_requires_review: number;
+    active_restrictions: string[];
+  };
+}
+
 export const api = {
   dashboard: () => request<Dashboard>("/api/v1/dashboard"),
   profiles: (params?: { search?: string; status?: string; limit?: number; offset?: number }) => {
@@ -145,4 +229,30 @@ export const api = {
     return request<ListResponse<ExerciseListItem>>(`/api/v1/exercises?${qs}`);
   },
   exercise: (id: number) => request<ExerciseDetail>(`/api/v1/exercises/${id}`),
+  exerciseByExternalId: (externalId: string, source?: string) => {
+    const qs = new URLSearchParams();
+    if (source) qs.set("source", source);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request<ExerciseDetail>(
+      `/api/v1/exercises/external/${encodeURIComponent(externalId)}${suffix}`
+    );
+  },
+  programs: (params?: { limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    qs.set("limit", String(params?.limit ?? 50));
+    qs.set("offset", String(params?.offset ?? 0));
+    return request<ListResponse<ProgramListItem>>(`/api/v1/programs?${qs}`);
+  },
+  program: (id: string, version?: number) => {
+    const qs = new URLSearchParams();
+    if (version) qs.set("version", String(version));
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request<ProgramResponse>(`/api/v1/programs/${id}${suffix}`);
+  },
+  profilePrograms: (profileId: string) =>
+    request<ListResponse<ProgramListItem>>(`/api/v1/profiles/${profileId}/programs`),
+  generateProgram: (profileId: string) =>
+    request<GenerateResponse>(`/api/v1/profiles/${profileId}/programs/generate`, {
+      method: "POST",
+    }),
 };

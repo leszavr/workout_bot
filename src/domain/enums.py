@@ -91,4 +91,50 @@ class ConsentScope(StrEnum):
     ACCURACY = "accuracy"
 
 
+# --- Программы тренировок (этап 3A) -------------------------------------------
+
+
+class ProgramStatus(StrEnum):
+    """Жизненный цикл версии программы."""
+
+    DRAFT = "draft"
+    GENERATED = "generated"
+    VALIDATED = "validated"
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+    FAILED = "failed"
+
+
+class GenerationSource(StrEnum):
+    """Источник генерации программы. AI появится на следующем этапе."""
+
+    DETERMINISTIC = "deterministic"
+    MANUAL = "manual"
+    AI = "ai"
+
+
+class SafetyDecision(StrEnum):
+    """Решение safety-правила по упражнению."""
+
+    ALLOW = "allow"
+    EXCLUDE = "exclude"
+    WARNING = "warning"
+    REQUIRES_REVIEW = "requires_review"
+
+
+class MovementRestriction(StrEnum):
+    """Нормализованные ограничения движений (не медицинские диагнозы).
+
+    Профиль указывает ограничение в свободной форме; слой нормализации
+    переводит его в один или несколько типов движений, которых следует избегать.
+    """
+
+    AVOID_HIGH_IMPACT = "avoid_high_impact"
+    AVOID_HEAVY_SPINAL_LOADING = "avoid_heavy_spinal_loading"
+    AVOID_OVERHEAD_LOADING = "avoid_overhead_loading"
+    AVOID_DEEP_KNEE_FLEXION = "avoid_deep_knee_flexion"
+    AVOID_HIGH_INTRA_ABDOMINAL_PRESSURE = "avoid_high_intra_abdominal_pressure"
+    AVOID_HIGH_INTENSITY_CARDIO = "avoid_high_intensity_cardio"
+
+
 CONSENT_DOCUMENT_VERSION = "1.0"

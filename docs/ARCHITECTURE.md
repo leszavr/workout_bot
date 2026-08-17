@@ -18,6 +18,8 @@
 │       описание вопросов, review, labels                    │
 │   src/application/profiles      — финализация (идемпотент.)│
 │   src/application/notifications — уведомление админа       │
+│   src/application/programs      — pipeline генерации:      │
+│       filtering, safety, generator, validator, service     │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
 ┌────────────────────────────────────────────────────────────┐
@@ -25,13 +27,16 @@
 │   src/domain/profile.py — FitnessProfile + вложенные модели│
 │   src/domain/consents.py— ConsentRecord                    │
 │   src/domain/exercise.py— Exercise                         │
+│   src/domain/program.py — WorkoutProgram + TrainingDay     │
+│   src/domain/pools.py   — CandidatePool / SafeExercisePool │
+│   src/domain/safety.py  — ExerciseCharacteristics          │
 │   src/domain/enums.py   — все enum предметной области      │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
 ┌────────────────────────────────────────────────────────────┐
 │ Infrastructure Layer                                       │
 │   src/infrastructure/persistence — ProfileRepository       │
-│       (File / Postgres), ExerciseRepository, Alembic       │
+│       (File / Postgres), ProgramRepository, Alembic        │
 │   src/infrastructure/files       — FileStorage (Local)     │
 │   src/infrastructure/telegram    — TelegramAdminSender     │
 │   src/infrastructure/config.py, logging_setup.py           │
@@ -106,6 +111,84 @@ export/delete (`repository.get` / `repository.delete`,
 `src/infrastructure/logging_setup.py`: в логи пишутся только
 user_id, profile_id, event, status, error_class. Содержимое ответов,
 полные профили и токены в логи не попадают.
+
+## Pipeline генерации программ (этап 3A)
+
+```
+Profile → ExerciseFilter → CandidatePool → SafetyEngine → SafeExercisePool
+→ ProgramGenerator → ProgramValidator → ProgramRepository (versioned)
+```
+
+Оркестрацию выполняет `ProgramService` (application-слой); FastAPI routes
+и Telegram handlers не содержат бизнес-логики и получают сервис через
+фабрику зависимостей (`apps/backend/api/v1/dependencies.py`).
+
+### Exercise Filtering (`filtering.py`)
+Детерминированный отбор кандидатов. Учитываются:
+- **оборудование**: свободный текст профиля нормализуется в теги каталога
+  (`EQUIPMENT_ALIASES`); зал без списка → полный набор зала; дом → только
+  перечисленное + `body only`;
+- **уровень подготовки**: опыт профиля → допустимые `difficulty`;
+- **предпочтения**: `CardioPreference.EXCLUDE` исключает кардио;
+  `excluded_exercises` пользователя исключаются по имени/алиасам.
+Результат — `ExerciseCandidatePool` с причиной каждого исключения.
+
+### Safety Framework (`safety.py`)
+```
+Restriction (свободный текст) → Normalization → MovementRestriction
+→ SafetyRule (централизованный реестр) → ExerciseCharacteristics → Decision
+```
+- Нормализация: ключевые слова → `MovementRestriction`
+  (avoid_high_impact, avoid_heavy_spinal_loading, avoid_overhead_loading,
+  avoid_deep_knee_flexion, avoid_high_intra_abdominal_pressure,
+  avoid_high_intensity_cardio).
+- Характеристики упражнения выводятся rule mapping'ом из полей каталога
+  (category + equipment + name patterns), без ручной разметки 873 упражнений.
+- Решения: ALLOW / EXCLUDE / WARNING / REQUIRES_REVIEW. При недостатке
+  данных (equipment=other, type=other) правило понижает EXCLUDE до
+  REQUIRES_REVIEW вместо необоснованного исключения.
+- **Safety Rules — технические правила отбора движений, а не медицинская
+  диагностика или рекомендация.** Система не утверждает «упражнение
+  безопасно при заболевании X»; она исключает движения того типа, которых
+  профиль просит избегать. Нераспознанные ограничения → REQUIRES_REVIEW.
+
+### ProgramGenerator (`generator.py`)
+`ProgramGenerator` — Protocol (контракт). Реализация —
+`DeterministicProgramGenerator`: без случайности, только из SafeExercisePool.
+- цель → параметры нагрузки (подходы/повторения/отдых), длительность,
+  приоритет ролей; опыт → объём тренировки;
+- 1–2 тренировки/нед → full body; 3+ → сплит (ноги+жим / тяга+корпус) + full body;
+- упражнения группируются по двигательной роли (legs/push/pull/core/cardio),
+  compound-упражнения ранжируются выше.
+В будущем `AIProgramGenerator` реализует тот же контракт; профиль, каталог,
+репозиторий, API, валидаторы и safety-слой не изменятся.
+
+### Program Validator (`validator.py`)
+Независимый слой проверки (будущий AI-вывод пройдёт через него же):
+строгая Pydantic-схема, существование упражнений в каталоге, принадлежность
+SafeExercisePool, отсутствие дубликатов в дне, число дней и упражнений,
+диапазоны повторений.
+
+### Версионирование и хранение
+Таблица `workout_programs`: каждая версия — отдельная строка
+`(program_id, version)` с UNIQUE-констрейнтом; полная Pydantic-модель в
+JSONB (`data`), денормализованные колонки для списков. Исторические версии
+не перезаписываются. `ProgramRepository` — интерфейс,
+`PostgresProgramRepository` — реализация.
+
+### API программ
+- `GET /api/v1/programs` — список (последние версии);
+- `GET /api/v1/programs/{id}?version=N` — программа + список версий;
+- `GET /api/v1/profiles/{id}/programs` — программы профиля;
+- `POST /api/v1/profiles/{id}/programs/generate` — запуск генерации;
+- `GET /api/v1/exercises/external/{external_id}` — поиск упражнения по
+  каноническому ID (программы ссылаются на external_id, а не surrogate id).
+
+### Web UI программ
+`/programs` (список), `/programs/{id}` (карточка: дни, упражнения,
+подходы/повторения/отдых, прогрессия, safety notes, переключение версий).
+Упражнения кликабельны (ExerciseLink резолвит external_id → внутренний id).
+Страница профиля: блок «Workout Programs» + кнопка «Generate Program».
 
 ## Запуск
 

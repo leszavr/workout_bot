@@ -1,10 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
-import { api, getToken, ProfileDetail } from "@/lib/api";
+import { api, getToken, ProfileDetail, ProgramListItem } from "@/lib/api";
 
 function Section({
   title,
@@ -69,6 +70,16 @@ export default function ProfileDetailPage() {
   const [profile, setProfile] = useState<ProfileDetail | null>(null);
   const [error, setError] = useState("");
   const [view, setView] = useState<"structured" | "raw">("structured");
+  const [programs, setPrograms] = useState<ProgramListItem[]>([]);
+  const [generating, setGenerating] = useState(false);
+  const [generateError, setGenerateError] = useState("");
+
+  const loadPrograms = useCallback(() => {
+    api
+      .profilePrograms(params.id)
+      .then((res) => setPrograms(res.items))
+      .catch(() => setPrograms([]));
+  }, [params.id]);
 
   useEffect(() => {
     if (!getToken()) {
@@ -79,7 +90,21 @@ export default function ProfileDetailPage() {
       .profile(params.id)
       .then(setProfile)
       .catch((e) => setError(e.message));
-  }, [params.id]);
+    loadPrograms();
+  }, [params.id, loadPrograms]);
+
+  async function onGenerate() {
+    setGenerating(true);
+    setGenerateError("");
+    try {
+      await api.generateProgram(params.id);
+      loadPrograms();
+    } catch (e) {
+      setGenerateError(e instanceof Error ? e.message : "Ошибка генерации");
+    } finally {
+      setGenerating(false);
+    }
+  }
 
   if (error) {
     return (
@@ -228,6 +253,49 @@ export default function ProfileDetailPage() {
                         <td>{c.consent_version}</td>
                         <td>{c.granted_at ? new Date(c.granted_at).toLocaleString("ru-RU") : "—"}</td>
                         <td>{c.source}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </Section>
+            <Section title="Workout Programs">
+              {generateError && <div className="error">{generateError}</div>}
+              <div style={{ marginBottom: 12 }}>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={generating}
+                  onClick={onGenerate}
+                >
+                  {generating ? "Генерация..." : "Generate Program"}
+                </button>
+              </div>
+              {programs.length === 0 ? (
+                <p className="muted">Программ пока нет</p>
+              ) : (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Версия</th>
+                      <th>Статус</th>
+                      <th>Источник</th>
+                      <th>Название</th>
+                      <th>Создана</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {programs.map((p) => (
+                      <tr key={`${p.program_id}-v${p.version}`}>
+                        <td>v{p.version}</td>
+                        <td>{p.status}</td>
+                        <td>{p.generation_source}</td>
+                        <td>
+                          <Link href={`/programs/${p.program_id}`}>{p.title}</Link>
+                        </td>
+                        <td className="muted">
+                          {p.created_at ? new Date(p.created_at).toLocaleString("ru-RU") : "—"}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

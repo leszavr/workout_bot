@@ -10,6 +10,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 
+from apps.backend.api.v1.dependencies import build_program_service
 from apps.backend.auth import (
     LoginRequest,
     TokenResponse,
@@ -17,12 +18,15 @@ from apps.backend.auth import (
     require_admin,
     verify_credentials,
 )
+from src.domain.program import WorkoutProgram
+from src.errors import ProgramGenerationError, ProgramValidationError
 from src.infrastructure.persistence.postgres.db import get_session_factory
 from src.infrastructure.persistence.postgres.models import (
     ConsentRow,
     ExerciseRow,
     ProfileRow,
     UserRow,
+    WorkoutProgramRow,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -58,13 +62,15 @@ async def dashboard(_: Annotated[str, Depends(require_admin)]) -> dict:
                 select(func.count()).select_from(ExerciseRow).where(ExerciseRow.is_active.is_(True))
             )
         ).scalar_one()
+        programs_total = (
+            await session.execute(select(func.count()).select_from(WorkoutProgramRow))
+        ).scalar_one()
     return {
         "users_total": users_total,
         "profiles_total": profiles_total,
         "profiles_today": profiles_today,
         "exercises_total": exercises_total,
-        # Программ тренировок пока нет — фиктивную статистику не показываем.
-        "programs_total": None,
+        "programs_total": programs_total,
     }
 
 
@@ -264,6 +270,53 @@ async def list_exercises(
 
 
 @router.get(
+    "/exercises/external/{external_id}",
+    responses={404: {"description": "Exercise not found"}},
+)
+async def get_exercise_by_external_id(
+    external_id: str,
+    _: Annotated[str, Depends(require_admin)],
+    source: Annotated[str | None, Query(max_length=64)] = None,
+) -> dict:
+    """Поиск упражнения по каноническому external_id (+source).
+
+    Используется web-интерфейсом для перехода из программы на карточку
+    упражнения (программы ссылаются на external_id, а не на surrogate id).
+    """
+    stmt = select(ExerciseRow).where(ExerciseRow.external_id == external_id)
+    if source:
+        stmt = stmt.where(ExerciseRow.source == source)
+    async with get_session_factory()() as session:
+        row = (await session.execute(stmt.limit(1))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Exercise not found")
+    return {
+        "id": row.id,
+        "external_id": row.external_id,
+        "source": row.source,
+        "source_version": row.source_version,
+        "name": row.name,
+        "name_ru": row.name_ru,
+        "aliases": row.aliases or [],
+        "description": row.description,
+        "technique": row.technique,
+        "technique_ru": row.technique_ru,
+        "common_mistakes": row.common_mistakes,
+        "primary_muscles": row.primary_muscles or [],
+        "secondary_muscles": row.secondary_muscles or [],
+        "equipment": row.equipment or [],
+        "exercise_type": row.exercise_type,
+        "difficulty": row.difficulty,
+        "force": row.force,
+        "mechanic": row.mechanic,
+        "contraindications": row.contraindications or [],
+        "limitations": row.limitations or [],
+        "images": row.images or [],
+        "is_active": row.is_active,
+    }
+
+
+@router.get(
     "/exercises/{exercise_id}",
     responses={404: {"description": "Exercise not found"}},
 )
@@ -297,4 +350,98 @@ async def get_exercise(exercise_id: int, _: Annotated[str, Depends(require_admin
         "limitations": row.limitations or [],
         "images": row.images or [],
         "is_active": row.is_active,
+    }
+
+
+# --- Programs -----------------------------------------------------------------
+
+
+def _program_summary(program: WorkoutProgram) -> dict:
+    return {
+        "program_id": program.program_id,
+        "profile_id": program.profile_id,
+        "version": program.version,
+        "status": program.status.value,
+        "title": program.title,
+        "generation_source": program.generation.source.value,
+        "generator_version": program.generation.generator_version,
+        "training_days_per_week": program.training_days_per_week,
+        "duration_weeks": program.duration_weeks,
+        "created_at": program.created_at.isoformat() if program.created_at else None,
+    }
+
+
+@router.get("/programs")
+async def list_programs(
+    _: Annotated[str, Depends(require_admin)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    service = build_program_service()
+    total, programs = await service.list_all(limit=limit, offset=offset)
+    return {"total": total, "items": [_program_summary(p) for p in programs]}
+
+
+@router.get(
+    "/programs/{program_id}",
+    responses={404: {"description": "Program not found"}},
+)
+async def get_program(
+    program_id: str,
+    _: Annotated[str, Depends(require_admin)],
+    version: Annotated[int | None, Query(ge=1)] = None,
+) -> dict:
+    service = build_program_service()
+    program = await service.get(program_id, version)
+    if program is None:
+        raise HTTPException(status_code=404, detail="Program not found")
+    versions = await service.list_versions(program_id)
+    return {
+        "program": program.model_dump(mode="json"),
+        "versions": [
+            {"version": v.version, "status": v.status.value, "created_at": v.created_at.isoformat() if v.created_at else None}
+            for v in versions
+        ],
+    }
+
+
+@router.get("/profiles/{profile_id}/programs")
+async def list_profile_programs(
+    profile_id: str, _: Annotated[str, Depends(require_admin)]
+) -> dict:
+    service = build_program_service()
+    programs = await service.list_for_profile(profile_id)
+    return {"total": len(programs), "items": [_program_summary(p) for p in programs]}
+
+
+@router.post(
+    "/profiles/{profile_id}/programs/generate",
+    responses={
+        404: {"description": "Profile not found"},
+        422: {"description": "Generation or validation failed"},
+    },
+)
+async def generate_program(
+    profile_id: str, _: Annotated[str, Depends(require_admin)]
+) -> dict:
+    """Запуск детерминированной генерации программы (без AI)."""
+    service = build_program_service()
+    try:
+        result = await service.generate(profile_id)
+    except ProgramGenerationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProgramValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "program": result.program.model_dump(mode="json"),
+        "pool_stats": {
+            "total_exercises": result.candidate_pool.total_exercises,
+            "candidates_included": len(result.candidate_pool.included),
+            "candidates_excluded": len(result.candidate_pool.excluded),
+            "safe_allowed": len(result.safe_pool.allowed),
+            "safe_excluded": len(result.safe_pool.excluded),
+            "safe_warnings": len(result.safe_pool.warnings),
+            "safe_requires_review": len(result.safe_pool.requires_review),
+            "active_restrictions": [r.value for r in result.safe_pool.active_restrictions],
+        },
     }
