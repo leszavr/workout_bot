@@ -1,0 +1,43 @@
+services:
+  telegram-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "apps.telegram_gateway.main"]
+    env_file:
+      - ../.env
+    environment:
+      WORKOUT_DATA_DIR: /app/data
+    volumes:
+      - bot-data:/app/data
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      WORKOUT_DATA_DIR: /app/data
+    volumes:
+      - bot-data:/app/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # PostgreSQL подготовлен, но пока не используется в runtime.
+  # Подключение — на следующем этапе (см. REFACTORING_REPORT.md).
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-workout_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-workout_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    profiles:
+      - with-postgres
+    restart: unless-stopped
+
+volumes:
+  bot-data:
+  pg-data:
