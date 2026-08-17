@@ -6,7 +6,10 @@
 ┌────────────────────────────────────────────────────────────┐
 │ Transport Layer                                            │
 │   apps/telegram_gateway  — aiogram handlers/keyboards/FSM  │
-│   apps/backend           — FastAPI (/health, /ready, /api) │
+│   apps/backend           — FastAPI (/health, /ready,       │
+│                            /api/v1: auth, profiles, users, │
+│                            exercises, dashboard)           │
+│   apps/web               — Next.js внутренний интерфейс    │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
 ┌────────────────────────────────────────────────────────────┐
@@ -21,17 +24,40 @@
 │ Domain Layer                                               │
 │   src/domain/profile.py — FitnessProfile + вложенные модели│
 │   src/domain/consents.py— ConsentRecord                    │
+│   src/domain/exercise.py— Exercise                         │
 │   src/domain/enums.py   — все enum предметной области      │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
 ┌────────────────────────────────────────────────────────────┐
 │ Infrastructure Layer                                       │
-│   src/infrastructure/persistence — ProfileRepository (File)│
+│   src/infrastructure/persistence — ProfileRepository       │
+│       (File / Postgres), ExerciseRepository, Alembic       │
 │   src/infrastructure/files       — FileStorage (Local)     │
 │   src/infrastructure/telegram    — TelegramAdminSender     │
 │   src/infrastructure/config.py, logging_setup.py           │
 └────────────────────────────────────────────────────────────┘
 ```
+
+## Хранилище данных
+
+Основное хранилище — **PostgreSQL** (SQLAlchemy 2.0 async + asyncpg + Alembic).
+Таблицы: `users`, `profiles` (JSONB), `consents`, `exercises`.
+
+- Профиль проходит Pydantic-валидацию перед записью и после чтения:
+  `Pydantic Model → Validation → PostgreSQL JSONB`. БД не является
+  хранилищем произвольного JSON.
+- `ProfileRepository` — интерфейс; `PostgresProfileRepository` (основной)
+  и `FileProfileRepository` (dev/test, когда `DATABASE_URL` не задан).
+- Миграции: `alembic upgrade head`.
+- Каталог упражнений: 873 записи из `leszavr/workout`, идемпотентный
+  импорт по ключу `(external_id, source)` — `scripts/import_exercises.py`.
+
+## Внутренний веб-интерфейс
+
+Next.js (App Router, TypeScript), `apps/web`. Страницы: Dashboard,
+Profiles (+ карточка с Structured View / Raw JSON), Exercises (+ карточка).
+Авторизация: admin login + JWT (`/api/v1/auth/login`), учётные данные
+только из переменных окружения.
 
 ## Ключевые решения
 
@@ -84,15 +110,29 @@ user_id, profile_id, event, status, error_class. Содержимое ответ
 ## Запуск
 
 ```bash
+# PostgreSQL (контейнер)
+docker compose -f docker/docker-compose.yml --env-file .env up -d postgres
+
+# Миграции
+alembic upgrade head
+
+# Импорт каталога упражнений (один раз)
+python -m scripts.import_exercises /path/to/workout --source-version <commit>
+
 # Telegram-бот
 python -m apps.telegram_gateway.main
 
 # Backend
 uvicorn apps.backend.main:app --host 0.0.0.0 --port 8000
 
+# Frontend (http://localhost:3000)
+cd apps/web && npm install && npm run dev
+
 # Тесты
 pytest
 ```
+
+Если `DATABASE_URL` не задан — используется файловое хранилище (dev/test).
 
 ## Будущее разделение контуров
 Telegram-специфичный код изолирован в `apps/telegram_gateway` и

@@ -95,14 +95,14 @@ class TestIdGeneration:
         assert len(profile.profile_id) == 32
         int(profile.profile_id, 16)  # валидный hex
 
-    def test_display_number_format(self, repository):
-        number = repository.next_display_number()
+    async def test_display_number_format(self, repository):
+        number = await repository.next_display_number()
         assert number.startswith("REQ-")
         assert number.endswith("-00001")
 
-    def test_display_number_increments(self, repository):
-        first = repository.next_display_number()
-        second = repository.next_display_number()
+    async def test_display_number_increments(self, repository):
+        first = await repository.next_display_number()
+        second = await repository.next_display_number()
         assert int(first.rsplit("-", 1)[1]) + 1 == int(second.rsplit("-", 1)[1])
 
 
@@ -111,47 +111,47 @@ class TestIdempotentFinalization:
         profile = service.start_profile("123", "user")
         return profile
 
-    def test_first_finalize_saves(self, service, repository):
+    async def test_first_finalize_saves(self, service, repository):
         profile = self._filled_profile(service)
         finalization = ProfileFinalizationService(repository)
-        result = finalization.finalize(profile)
+        result = await finalization.finalize(profile)
         assert result.already_finalized is False
-        assert repository.exists(profile.profile_id)
+        assert await repository.exists(profile.profile_id)
         assert profile.display_number is not None
 
-    def test_second_finalize_is_idempotent(self, service, repository):
+    async def test_second_finalize_is_idempotent(self, service, repository):
         profile = self._filled_profile(service)
         finalization = ProfileFinalizationService(repository)
-        first = finalization.finalize(profile)
-        second = finalization.finalize(profile)
+        first = await finalization.finalize(profile)
+        second = await finalization.finalize(profile)
         assert second.already_finalized is True
         assert second.profile.profile_id == first.profile.profile_id
         assert second.profile.display_number == first.profile.display_number
 
-    def test_consents_recorded_with_metadata(self, service, repository):
+    async def test_consents_recorded_with_metadata(self, service, repository):
         profile = self._filled_profile(service)
-        ProfileFinalizationService(repository).finalize(profile)
+        await ProfileFinalizationService(repository).finalize(profile)
         assert len(profile.consents) == 3
         for consent in profile.consents:
             assert consent.granted_at is not None
             assert consent.document_version == "1.0"
             assert consent.source == "telegram_review_confirm"
 
-    def test_no_duplicate_consents_on_repeat(self, service, repository):
+    async def test_no_duplicate_consents_on_repeat(self, service, repository):
         profile = self._filled_profile(service)
         finalization = ProfileFinalizationService(repository)
-        finalization.finalize(profile)
-        finalization.finalize(profile)
+        await finalization.finalize(profile)
+        await finalization.finalize(profile)
         assert len(profile.consents) == 3
 
 
 class TestNormalization:
-    def test_roundtrip_preserves_data(self, service, repository):
+    async def test_roundtrip_preserves_data(self, service, repository):
         profile = service.start_profile("123", "user")
         profile.client.name = "Иван"
         profile.client.age_years = 30
-        ProfileFinalizationService(repository).finalize(profile)
-        loaded = repository.get(profile.profile_id)
+        await ProfileFinalizationService(repository).finalize(profile)
+        loaded = await repository.get(profile.profile_id)
         assert loaded is not None
         assert loaded.client.name == "Иван"
         assert loaded.client.age_years == 30

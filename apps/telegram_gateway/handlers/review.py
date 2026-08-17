@@ -65,7 +65,7 @@ async def final_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         return
     services = get_services()
     try:
-        result = services.finalization.finalize(profile)
+        result = await services.finalization.finalize(profile)
     except ProfilePersistenceError:
         logger.exception("profile_persistence_failed", extra={"profile_id": profile.profile_id})
         await callback.answer(

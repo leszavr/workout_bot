@@ -36,15 +36,15 @@ class AdminNotificationService:
                 extra={"profile_id": profile.profile_id, "event": "admin_notification"},
             )
             profile.admin_notification_status = "failed"
-            self._persist_status(profile)
+            await self._persist_status(profile)
             return False
         profile.admin_notification_status = "sent"
-        self._persist_status(profile)
+        await self._persist_status(profile)
         return True
 
-    def _persist_status(self, profile: FitnessProfile) -> None:
+    async def _persist_status(self, profile: FitnessProfile) -> None:
         try:
-            self._repository.save(profile)
+            await self._repository.save(profile)
         except Exception:  # noqa: BLE001 — статус доставки не должен ронять сценарий
             logger.error(
                 "admin_notification_status_persist_failed",

@@ -1,0 +1,300 @@
+"""API v1: auth, dashboard, profiles, users, exercises.
+
+Внутренний интерфейс: чтение данных из PostgreSQL. Все endpoint'ы,
+кроме /auth/login, защищены JWT (require_admin).
+"""
+from __future__ import annotations
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, select
+
+from apps.backend.auth import (
+    LoginRequest,
+    TokenResponse,
+    issue_token,
+    require_admin,
+    verify_credentials,
+)
+from src.infrastructure.persistence.postgres.db import get_session_factory
+from src.infrastructure.persistence.postgres.models import (
+    ConsentRow,
+    ExerciseRow,
+    ProfileRow,
+    UserRow,
+)
+
+router = APIRouter(prefix="/api/v1")
+
+# --- Auth ---------------------------------------------------------------------
+
+@router.post(
+    "/auth/login",
+    responses={401: {"description": "Invalid credentials"}},
+)
+async def login(body: LoginRequest) -> TokenResponse:
+    if not verify_credentials(body.login, body.password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return TokenResponse(access_token=issue_token(body.login))
+
+
+# --- Dashboard ----------------------------------------------------------------
+
+@router.get("/dashboard")
+async def dashboard(_: Annotated[str, Depends(require_admin)]) -> dict:
+    async with get_session_factory()() as session:
+        users_total = (await session.execute(select(func.count()).select_from(UserRow))).scalar_one()
+        profiles_total = (await session.execute(select(func.count()).select_from(ProfileRow))).scalar_one()
+        profiles_today = (
+            await session.execute(
+                select(func.count()).select_from(ProfileRow).where(
+                    func.date(ProfileRow.created_at) == func.current_date()
+                )
+            )
+        ).scalar_one()
+        exercises_total = (
+            await session.execute(
+                select(func.count()).select_from(ExerciseRow).where(ExerciseRow.is_active.is_(True))
+            )
+        ).scalar_one()
+    return {
+        "users_total": users_total,
+        "profiles_total": profiles_total,
+        "profiles_today": profiles_today,
+        "exercises_total": exercises_total,
+        # Программ тренировок пока нет — фиктивную статистику не показываем.
+        "programs_total": None,
+    }
+
+
+# --- Profiles -----------------------------------------------------------------
+
+@router.get("/profiles")
+async def list_profiles(
+    _: Annotated[str, Depends(require_admin)],
+    search: Annotated[str | None, Query(max_length=100)] = None,
+    status: Annotated[str | None, Query(max_length=32)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    stmt = select(ProfileRow)
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(
+            ProfileRow.profile_id.ilike(like)
+            | ProfileRow.display_number.ilike(like)
+            | ProfileRow.data["client"]["name"].astext.ilike(like)
+        )
+    if status:
+        stmt = stmt.where(ProfileRow.status == status)
+
+    async with get_session_factory()() as session:
+        total = (
+            await session.execute(select(func.count()).select_from(stmt.subquery()))
+        ).scalar_one()
+        rows = (
+            (await session.execute(stmt.order_by(ProfileRow.created_at.desc()).limit(limit).offset(offset)))
+            .scalars()
+            .all()
+        )
+
+    items = []
+    for row in rows:
+        data = row.data or {}
+        client = data.get("client", {})
+        goals = data.get("goals", {})
+        items.append(
+            {
+                "profile_id": row.profile_id,
+                "display_number": row.display_number,
+                "name": client.get("name"),
+                "age": client.get("age_years"),
+                "primary_goal": goals.get("primary"),
+                "status": row.status,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+        )
+    return {"total": total, "items": items}
+
+
+@router.get(
+    "/profiles/{profile_id}",
+    responses={404: {"description": "Profile not found"}},
+)
+async def get_profile(profile_id: str, _: Annotated[str, Depends(require_admin)]) -> dict:
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(select(ProfileRow).where(ProfileRow.profile_id == profile_id))
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        consents = []
+        if row.user_id is not None:
+            consent_rows = (
+                (await session.execute(select(ConsentRow).where(ConsentRow.user_id == row.user_id)))
+                .scalars()
+                .all()
+            )
+            consents = [
+                {
+                    "consent_type": c.consent_type,
+                    "consent_version": c.consent_version,
+                    "granted": c.granted,
+                    "granted_at": c.granted_at.isoformat() if c.granted_at else None,
+                    "source": c.source,
+                }
+                for c in consent_rows
+            ]
+    return {
+        "profile_id": row.profile_id,
+        "display_number": row.display_number,
+        "status": row.status,
+        "profile_version": row.profile_version,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "data": row.data,
+        "consents": consents,
+    }
+
+
+# --- Users --------------------------------------------------------------------
+
+@router.get("/users")
+async def list_users(
+    _: Annotated[str, Depends(require_admin)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    async with get_session_factory()() as session:
+        total = (await session.execute(select(func.count()).select_from(UserRow))).scalar_one()
+        rows = (
+            (await session.execute(select(UserRow).order_by(UserRow.created_at.desc()).limit(limit).offset(offset)))
+            .scalars()
+            .all()
+        )
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": r.id,
+                "telegram_user_id": r.telegram_user_id,
+                "telegram_username": r.telegram_username,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get(
+    "/users/{user_id}",
+    responses={404: {"description": "User not found"}},
+)
+async def get_user(user_id: int, _: Annotated[str, Depends(require_admin)]) -> dict:
+    async with get_session_factory()() as session:
+        row = (await session.execute(select(UserRow).where(UserRow.id == user_id))).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        profiles = (
+            (await session.execute(select(ProfileRow).where(ProfileRow.user_id == user_id)))
+            .scalars()
+            .all()
+        )
+    return {
+        "id": row.id,
+        "telegram_user_id": row.telegram_user_id,
+        "telegram_username": row.telegram_username,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "profiles": [
+            {"profile_id": p.profile_id, "display_number": p.display_number, "status": p.status}
+            for p in profiles
+        ],
+    }
+
+
+# --- Exercises ----------------------------------------------------------------
+
+@router.get("/exercises")
+async def list_exercises(
+    _: Annotated[str, Depends(require_admin)],
+    search: Annotated[str | None, Query(max_length=100)] = None,
+    exercise_type: Annotated[str | None, Query(max_length=64)] = None,
+    difficulty: Annotated[str | None, Query(max_length=32)] = None,
+    equipment: Annotated[str | None, Query(max_length=64)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    stmt = select(ExerciseRow).where(ExerciseRow.is_active.is_(True))
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(ExerciseRow.name.ilike(like) | ExerciseRow.name_ru.ilike(like))
+    if exercise_type:
+        stmt = stmt.where(ExerciseRow.exercise_type == exercise_type)
+    if difficulty:
+        stmt = stmt.where(ExerciseRow.difficulty == difficulty)
+    if equipment:
+        stmt = stmt.where(ExerciseRow.equipment.contains([equipment]))
+
+    async with get_session_factory()() as session:
+        total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+        rows = (
+            (await session.execute(stmt.order_by(ExerciseRow.name).limit(limit).offset(offset)))
+            .scalars()
+            .all()
+        )
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": r.id,
+                "external_id": r.external_id,
+                "name": r.name,
+                "name_ru": r.name_ru,
+                "equipment": r.equipment or [],
+                "primary_muscles": r.primary_muscles or [],
+                "difficulty": r.difficulty,
+                "exercise_type": r.exercise_type,
+                "source": r.source,
+                "is_active": r.is_active,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get(
+    "/exercises/{exercise_id}",
+    responses={404: {"description": "Exercise not found"}},
+)
+async def get_exercise(exercise_id: int, _: Annotated[str, Depends(require_admin)]) -> dict:
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(select(ExerciseRow).where(ExerciseRow.id == exercise_id))
+        ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Exercise not found")
+    return {
+        "id": row.id,
+        "external_id": row.external_id,
+        "source": row.source,
+        "source_version": row.source_version,
+        "name": row.name,
+        "name_ru": row.name_ru,
+        "aliases": row.aliases or [],
+        "description": row.description,
+        "technique": row.technique,
+        "technique_ru": row.technique_ru,
+        "common_mistakes": row.common_mistakes,
+        "primary_muscles": row.primary_muscles or [],
+        "secondary_muscles": row.secondary_muscles or [],
+        "equipment": row.equipment or [],
+        "exercise_type": row.exercise_type,
+        "difficulty": row.difficulty,
+        "force": row.force,
+        "mechanic": row.mechanic,
+        "contraindications": row.contraindications or [],
+        "limitations": row.limitations or [],
+        "images": row.images or [],
+        "is_active": row.is_active,
+    }

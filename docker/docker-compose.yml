@@ -8,34 +8,61 @@ services:
       - ../.env
     environment:
       WORKOUT_DATA_DIR: /app/data
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-workout_bot}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:-workout_bot}
     volumes:
       - bot-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   backend:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
     environment:
       WORKOUT_DATA_DIR: /app/data
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-workout_bot}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:-workout_bot}
+      CORS_ORIGINS: http://localhost:3000
     volumes:
       - bot-data:/app/data
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
-  # PostgreSQL подготовлен, но пока не используется в runtime.
-  # Подключение — на следующем этапе (см. REFACTORING_REPORT.md).
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # PostgreSQL — основное хранилище данных (users, profiles, consents, exercises).
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-workout_bot}
       POSTGRES_USER: ${POSTGRES_USER:-workout_bot}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
-    profiles:
-      - with-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-workout_bot} -d ${POSTGRES_DB:-workout_bot}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
 volumes:

@@ -10,8 +10,16 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY src ./src
 COPY apps ./apps
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY scripts ./scripts
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . \
+    # Запуск от непривилегированного пользователя (data/ доступна для записи боту).
+    && useradd --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app
+USER appuser
 
 # По умолчанию запускается backend; для бота переопределяется в compose.
 CMD ["uvicorn", "apps.backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

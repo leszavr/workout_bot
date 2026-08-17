@@ -24,19 +24,19 @@ class ProfileFinalizationService:
     def __init__(self, repository: ProfileRepository) -> None:
         self._repository = repository
 
-    def finalize(self, profile: FitnessProfile) -> FinalizationResult:
+    async def finalize(self, profile: FitnessProfile) -> FinalizationResult:
         # Идемпотентность: уже подтверждён и сохранён → вернуть существующий.
         if (
             profile.profile_id
             and profile.questionnaire.completion_status is CompletionStatus.CONFIRMED
-            and self._repository.exists(profile.profile_id)
+            and await self._repository.exists(profile.profile_id)
         ):
             return FinalizationResult(profile=profile, already_finalized=True)
 
         if not profile.profile_id:
             profile.profile_id = uuid.uuid4().hex
         if not profile.display_number:
-            profile.display_number = self._repository.next_display_number()
+            profile.display_number = await self._repository.next_display_number()
 
         profile.questionnaire.completed = True
         profile.questionnaire.completion_status = CompletionStatus.CONFIRMED
@@ -55,5 +55,5 @@ class ProfileFinalizationService:
                 )
 
         profile.touch()
-        self._repository.save(profile)
+        await self._repository.save(profile)
         return FinalizationResult(profile=profile, already_finalized=False)

@@ -108,27 +108,27 @@ def run_questionnaire(service: QuestionnaireService, overrides: dict | None = No
     return profile
 
 
-def finalize(service, repository, profile) -> FitnessProfile:
-    result = ProfileFinalizationService(repository).finalize(profile)
+async def finalize(service, repository, profile) -> FitnessProfile:
+    result = await ProfileFinalizationService(repository).finalize(profile)
     return result.profile
 
 
 class TestFullScenarioGymNoLimitations:
-    def test_scenario(self, service, repository):
+    async def test_scenario(self, service, repository):
         profile = run_questionnaire(service)
         # review
         html = render_review_html(profile)
         assert "Иван Петров" in html
         # confirm
-        profile = finalize(service, repository, profile)
+        profile = await finalize(service, repository, profile)
         assert profile.questionnaire.completion_status is CompletionStatus.CONFIRMED
-        assert repository.exists(profile.profile_id)
+        assert await repository.exists(profile.profile_id)
         assert profile.display_number is not None
         assert len(profile.consents) == 3
 
 
 class TestFullScenarioHomeWithLimitations:
-    def test_scenario(self, service, repository):
+    async def test_scenario(self, service, repository):
         overrides = {
             "q16_location": "loc_home",
             "q24_has_limitations": "limit_yes",
@@ -139,27 +139,27 @@ class TestFullScenarioHomeWithLimitations:
         assert profile.health_and_limitations.has_limitations is True
         assert profile.health_and_limitations.medical_clearance_required is True
         assert profile.health_and_limitations.doctor_recommendations is not None
-        profile = finalize(service, repository, profile)
-        assert repository.exists(profile.profile_id)
+        profile = await finalize(service, repository, profile)
+        assert await repository.exists(profile.profile_id)
 
 
 class TestBranchNotTraining:
-    def test_skips_current_training_questions(self, service, repository):
+    async def test_skips_current_training_questions(self, service, repository):
         overrides = {"q12_current_frequency": "freq_none"}
         profile = run_questionnaire(service, overrides)
         assert profile.training_background.current_frequency_per_week == 0
         assert profile.training_background.current_activity_description is None
-        profile = finalize(service, repository, profile)
-        assert repository.exists(profile.profile_id)
+        profile = await finalize(service, repository, profile)
+        assert await repository.exists(profile.profile_id)
 
 
 class TestBranchNoDoctorRecommendations:
-    def test_no_recommendations(self, service, repository):
+    async def test_no_recommendations(self, service, repository):
         overrides = {"q28_medical_clearance": "med_clear_no_recommendations"}
         profile = run_questionnaire(service, overrides)
         assert profile.health_and_limitations.doctor_recommendations is None
-        profile = finalize(service, repository, profile)
-        assert repository.exists(profile.profile_id)
+        profile = await finalize(service, repository, profile)
+        assert await repository.exists(profile.profile_id)
 
 
 class TestReviewRendering:

@@ -16,6 +16,7 @@ from src.application.questionnaire.questions import QUESTIONS_BY_ID
 from src.application.questionnaire.service import QuestionPrompt, QuestionnaireService
 from src.domain.profile import FitnessProfile
 from src.infrastructure.config import (
+    DATABASE_URL,
     DATA_DIR,
     MAX_PHOTOS,
     MAX_PHOTO_SIZE_MB,
@@ -23,19 +24,34 @@ from src.infrastructure.config import (
     PROFILES_DIR,
 )
 from src.infrastructure.files.storage import LocalFileStorage
-from src.infrastructure.persistence.profile_repository import FileProfileRepository
+from src.infrastructure.persistence.profile_repository import (
+    FileProfileRepository,
+    ProfileRepository,
+)
+
+
+def create_profile_repository() -> ProfileRepository:
+    """PostgreSQL, если задан DATABASE_URL; иначе файловое хранилище (dev/test)."""
+    if DATABASE_URL:
+        from src.infrastructure.persistence.postgres.db import get_session_factory
+        from src.infrastructure.persistence.postgres.profile_repository import (
+            PostgresProfileRepository,
+        )
+
+        return PostgresProfileRepository(get_session_factory())
+    return FileProfileRepository(PROFILES_DIR, DATA_DIR / "counter.json")
 
 
 @dataclass(frozen=True)
 class Services:
     questionnaire: QuestionnaireService
     finalization: ProfileFinalizationService
-    repository: FileProfileRepository
+    repository: ProfileRepository
 
 
 @lru_cache
 def get_services() -> Services:
-    repository = FileProfileRepository(PROFILES_DIR, DATA_DIR / "counter.json")
+    repository = create_profile_repository()
     file_storage = LocalFileStorage(PHOTOS_DIR, max_files=MAX_PHOTOS, max_size_mb=MAX_PHOTO_SIZE_MB)
     return Services(
         questionnaire=QuestionnaireService(file_storage),
@@ -44,7 +60,7 @@ def get_services() -> Services:
     )
 
 
-def get_admin_notification_service(repository: FileProfileRepository, sender) -> AdminNotificationService:
+def get_admin_notification_service(repository: ProfileRepository, sender) -> AdminNotificationService:
     return AdminNotificationService(repository, sender)
 
 
