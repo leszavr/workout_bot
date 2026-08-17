@@ -5,15 +5,7 @@ import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
 import { api, getToken, ListResponse, ProgramListItem } from "@/lib/api";
-
-const STATUS_LABELS: Record<string, string> = {
-  draft: "draft",
-  generated: "generated",
-  validated: "validated",
-  active: "active",
-  archived: "archived",
-  failed: "failed",
-};
+import { generationSourceLabel, statusLabel } from "@/lib/labels";
 
 export default function ProgramsPage() {
   const [data, setData] = useState<ListResponse<ProgramListItem> | null>(null);
@@ -42,7 +34,7 @@ export default function ProgramsPage() {
             <p className="muted">Всего: {data.total}</p>
             {data.items.length === 0 ? (
               <p className="muted">
-                Программ пока нет. Откройте профиль и нажмите «Generate Program».
+                Программ пока нет. Откройте профиль и нажмите «Сгенерировать программу».
               </p>
             ) : (
               <table>
@@ -68,8 +60,8 @@ export default function ProgramsPage() {
                         <Link href={`/profiles/${p.profile_id}`}>{p.profile_id}</Link>
                       </td>
                       <td>v{p.version}</td>
-                      <td>{STATUS_LABELS[p.status] ?? p.status}</td>
-                      <td>{p.generation_source}</td>
+                      <td>{statusLabel(p.status)}</td>
+                      <td>{generationSourceLabel(p.generation_source)}</td>
                       <td>{p.training_days_per_week}</td>
                       <td>{p.duration_weeks}</td>
                       <td className="muted">

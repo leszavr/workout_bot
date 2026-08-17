@@ -5,6 +5,12 @@ import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
 import { api, ExerciseDetail, getToken } from "@/lib/api";
+import {
+  DIFFICULTY_LABELS,
+  EXERCISE_TYPE_LABELS,
+  FORCE_LABELS,
+  MECHANIC_LABELS,
+} from "@/lib/labels";
 
 function List({ items }: { readonly items: string[] }) {
   if (!items.length) return <span className="muted">—</span>;
@@ -65,11 +71,14 @@ export default function ExerciseDetailPage() {
             <div className="k">Дополнительные мышцы</div>
             <div><List items={exercise.secondary_muscles} /></div>
             <div className="k">Категория</div>
-            <div>{exercise.exercise_type || "—"}</div>
+            <div>{exercise.exercise_type ? EXERCISE_TYPE_LABELS[exercise.exercise_type] ?? exercise.exercise_type : "—"}</div>
             <div className="k">Сложность</div>
-            <div>{exercise.difficulty || "—"}</div>
+            <div>{exercise.difficulty ? DIFFICULTY_LABELS[exercise.difficulty] ?? exercise.difficulty : "—"}</div>
             <div className="k">Тип усилия / механика</div>
-            <div>{exercise.force || "—"} / {exercise.mechanic || "—"}</div>
+            <div>
+              {exercise.force ? FORCE_LABELS[exercise.force] ?? exercise.force : "—"} /{" "}
+              {exercise.mechanic ? MECHANIC_LABELS[exercise.mechanic] ?? exercise.mechanic : "—"}
+            </div>
           </div>
         </div>
 
@@ -115,7 +124,7 @@ export default function ExerciseDetailPage() {
             <div><List items={exercise.limitations} /></div>
           </div>
           <p className="muted" style={{ marginTop: 10 }}>
-            Противопоказания будут заполнены на этапе Safety Rules.
+            Противопоказания заполняются на этапе правил безопасности.
           </p>
         </div>
 

@@ -13,6 +13,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from apps.backend.api.v1.ai_routes import router as ai_admin_router
 from apps.backend.api.v1.routes import router as api_v1_router
 from src.infrastructure.config import DATABASE_URL, PROFILES_DIR
 
@@ -53,6 +54,7 @@ def create_app() -> FastAPI:
         return {"status": "ok" if storage_ok else "degraded", "storage": storage_ok}
 
     app.include_router(api_v1_router)
+    app.include_router(ai_admin_router)
     return app
 
 

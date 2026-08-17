@@ -5,12 +5,7 @@ import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
 import { api, ExerciseListItem, getToken, ListResponse } from "@/lib/api";
-
-const DIFFICULTY_LABELS: Record<string, string> = {
-  beginner: "Начальный",
-  intermediate: "Средний",
-  expert: "Продвинутый",
-};
+import { DIFFICULTY_LABELS, EXERCISE_TYPE_LABELS } from "@/lib/labels";
 
 export default function ExercisesPage() {
   const [data, setData] = useState<ListResponse<ExerciseListItem> | null>(null);
@@ -61,13 +56,11 @@ export default function ExercisesPage() {
           </select>
           <select value={exerciseType} onChange={(e) => setExerciseType(e.target.value)}>
             <option value="">Все категории</option>
-            <option value="strength">strength</option>
-            <option value="stretching">stretching</option>
-            <option value="plyometrics">plyometrics</option>
-            <option value="powerlifting">powerlifting</option>
-            <option value="olympic weightlifting">olympic weightlifting</option>
-            <option value="strongman">strongman</option>
-            <option value="cardio">cardio</option>
+            {Object.entries(EXERCISE_TYPE_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
           </select>
           <button
             type="button"
@@ -109,7 +102,7 @@ export default function ExercisesPage() {
                     <td className="muted">{ex.source}</td>
                     <td>
                       <span className={`badge ${ex.is_active ? "confirmed" : "draft"}`}>
-                        {ex.is_active ? "active" : "inactive"}
+                        {ex.is_active ? "активно" : "отключено"}
                       </span>
                     </td>
                   </tr>

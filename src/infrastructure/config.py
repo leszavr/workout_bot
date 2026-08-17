@@ -29,6 +29,10 @@ ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 
+# Ключ шифрования AI-секретов at rest (Fernet). Если не задан — выводится
+# из JWT_SECRET (dev-режим); в production задайте отдельный AI_SECRETS_KEY.
+AI_SECRETS_KEY = os.getenv("AI_SECRETS_KEY", "")
+
 DEFAULT_TIMEZONE = "UTC"
 MAX_TEXT_LENGTH = 2000
 MAX_PHOTOS = 10

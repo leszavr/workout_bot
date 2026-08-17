@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
 import { api, getToken, ProfileDetail, ProgramListItem } from "@/lib/api";
+import { generationSourceLabel, statusLabel } from "@/lib/labels";
 
 function Section({
   title,
@@ -142,14 +143,14 @@ export default function ProfileDetailPage() {
             className={view === "structured" ? "active" : ""}
             onClick={() => setView("structured")}
           >
-            Structured View
+            Структурированный вид
           </button>
           <button
             type="button"
             className={view === "raw" ? "active" : ""}
             onClick={() => setView("raw")}
           >
-            Raw JSON
+            JSON целиком
           </button>
         </div>
 
@@ -259,7 +260,7 @@ export default function ProfileDetailPage() {
                 </table>
               )}
             </Section>
-            <Section title="Workout Programs">
+            <Section title="Программы тренировок">
               {generateError && <div className="error">{generateError}</div>}
               <div style={{ marginBottom: 12 }}>
                 <button
@@ -268,7 +269,7 @@ export default function ProfileDetailPage() {
                   disabled={generating}
                   onClick={onGenerate}
                 >
-                  {generating ? "Генерация..." : "Generate Program"}
+                  {generating ? "Генерация..." : "Сгенерировать программу"}
                 </button>
               </div>
               {programs.length === 0 ? (
@@ -288,8 +289,8 @@ export default function ProfileDetailPage() {
                     {programs.map((p) => (
                       <tr key={`${p.program_id}-v${p.version}`}>
                         <td>v{p.version}</td>
-                        <td>{p.status}</td>
-                        <td>{p.generation_source}</td>
+                        <td>{statusLabel(p.status)}</td>
+                        <td>{generationSourceLabel(p.generation_source)}</td>
                         <td>
                           <Link href={`/programs/${p.program_id}`}>{p.title}</Link>
                         </td>

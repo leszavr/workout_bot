@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
 import { api, getToken, ListResponse, ProfileListItem } from "@/lib/api";
+import { statusLabel } from "@/lib/labels";
 
 const GOAL_LABELS: Record<string, string> = {
   weight_loss: "Снижение веса",
@@ -53,9 +54,9 @@ export default function ProfilesPage() {
           />
           <select value={status} onChange={(e) => setStatus(e.target.value)}>
             <option value="">Все статусы</option>
-            <option value="confirmed">confirmed</option>
-            <option value="draft">draft</option>
-            <option value="in_progress">in_progress</option>
+            <option value="confirmed">Подтверждён</option>
+            <option value="draft">Черновик</option>
+            <option value="in_progress">В работе</option>
           </select>
           <button type="button" className="primary" onClick={() => load(search, status)}>
             Найти
@@ -88,7 +89,7 @@ export default function ProfilesPage() {
                     <td>{p.age ?? "—"}</td>
                     <td>{p.primary_goal ? GOAL_LABELS[p.primary_goal] || p.primary_goal : "—"}</td>
                     <td>
-                      <span className={`badge ${p.status}`}>{p.status}</span>
+                      <span className={`badge ${p.status}`}>{statusLabel(p.status)}</span>
                     </td>
                     <td className="muted">
                       {p.created_at ? new Date(p.created_at).toLocaleString("ru-RU") : "—"}

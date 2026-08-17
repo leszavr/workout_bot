@@ -4,10 +4,11 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const NAV = [
-  { href: "/", label: "Dashboard" },
+  { href: "/", label: "Панель" },
   { href: "/profiles", label: "Профили" },
   { href: "/programs", label: "Программы" },
   { href: "/exercises", label: "Упражнения" },
+  { href: "/ai", label: "AI-конфигурация" },
 ];
 
 export default function AppNav() {

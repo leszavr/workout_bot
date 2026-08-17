@@ -208,6 +208,145 @@ export interface GenerateResponse {
   };
 }
 
+// --- AI Configuration (этап 3B) -------------------------------------------------
+
+export interface AIProviderItem {
+  id: number;
+  name: string;
+  slug: string;
+  protocol: string;
+  enabled: boolean;
+  priority: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AIEndpointItem {
+  id: number;
+  provider_id: number;
+  name: string;
+  base_url: string;
+  timeout_seconds: number;
+  max_retries: number;
+  enabled: boolean;
+  priority: number;
+  has_api_key: boolean;
+  masked_api_key: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AIModelItem {
+  id: number;
+  endpoint_id: number;
+  model_id: string;
+  display_name: string;
+  enabled: boolean;
+  priority: number;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  supports_structured_output: boolean;
+  supports_json_schema: boolean;
+  supports_streaming: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AITaskBinding {
+  id: number;
+  task_config_id: number;
+  model_id: number;
+  priority: number;
+  is_primary: boolean;
+}
+
+export interface AITaskItem {
+  id: number | null;
+  task_type: string;
+  enabled: boolean;
+  temperature: number;
+  max_tokens: number | null;
+  timeout_seconds: number;
+  prompt_version: number | null;
+  bindings: AITaskBinding[];
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AIEndpointTestResult {
+  success: boolean;
+  latency_ms: number;
+  provider: string;
+  endpoint: string;
+  model: string;
+  message?: string;
+  error_type?: string;
+}
+
+export const aiApi = {
+  providers: () =>
+    request<ListResponse<AIProviderItem>>("/api/v1/admin/ai/providers"),
+  createProvider: (body: Record<string, unknown>) =>
+    request<AIProviderItem>("/api/v1/admin/ai/providers", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  patchProvider: (id: number, body: Record<string, unknown>) =>
+    request<AIProviderItem>(`/api/v1/admin/ai/providers/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteProvider: (id: number) =>
+    request<void>(`/api/v1/admin/ai/providers/${id}`, { method: "DELETE" }),
+  endpoints: (providerId: number) =>
+    request<ListResponse<AIEndpointItem>>(
+      `/api/v1/admin/ai/providers/${providerId}/endpoints`
+    ),
+  createEndpoint: (providerId: number, body: Record<string, unknown>) =>
+    request<AIEndpointItem>(
+      `/api/v1/admin/ai/providers/${providerId}/endpoints`,
+      { method: "POST", body: JSON.stringify(body) }
+    ),
+  patchEndpoint: (id: number, body: Record<string, unknown>) =>
+    request<AIEndpointItem>(`/api/v1/admin/ai/endpoints/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteEndpoint: (id: number) =>
+    request<void>(`/api/v1/admin/ai/endpoints/${id}`, { method: "DELETE" }),
+  setEndpointSecret: (id: number, apiKey: string) =>
+    request<{ has_api_key: boolean; masked_api_key: string | null }>(
+      `/api/v1/admin/ai/endpoints/${id}/secret`,
+      { method: "PUT", body: JSON.stringify({ api_key: apiKey }) }
+    ),
+  testEndpoint: (id: number) =>
+    request<AIEndpointTestResult>(`/api/v1/admin/ai/endpoints/${id}/test`, {
+      method: "POST",
+    }),
+  models: (endpointId: number) =>
+    request<ListResponse<AIModelItem>>(
+      `/api/v1/admin/ai/endpoints/${endpointId}/models`
+    ),
+  createModel: (endpointId: number, body: Record<string, unknown>) =>
+    request<AIModelItem>(`/api/v1/admin/ai/endpoints/${endpointId}/models`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  patchModel: (id: number, body: Record<string, unknown>) =>
+    request<AIModelItem>(`/api/v1/admin/ai/models/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteModel: (id: number) =>
+    request<void>(`/api/v1/admin/ai/models/${id}`, { method: "DELETE" }),
+  tasks: () => request<ListResponse<AITaskItem>>("/api/v1/admin/ai/tasks"),
+  putTask: (taskType: string, body: Record<string, unknown>) =>
+    request<AITaskItem>(`/api/v1/admin/ai/tasks/${taskType}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+};
+
 export const api = {
   dashboard: () => request<Dashboard>("/api/v1/dashboard"),
   profiles: (params?: { search?: string; status?: string; limit?: number; offset?: number }) => {

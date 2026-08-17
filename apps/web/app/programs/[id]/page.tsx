@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import AppNav from "@/components/AppNav";
 import ExerciseLink from "@/components/ExerciseLink";
 import { api, getToken, ProgramResponse } from "@/lib/api";
+import { generationSourceLabel, statusLabel } from "@/lib/labels";
 
 export default function ProgramDetailPage() {
   const params = useParams<{ id: string }>();
@@ -67,10 +68,10 @@ export default function ProgramDetailPage() {
             <div className="k">Версия</div>
             <div>v{program.version}</div>
             <div className="k">Статус</div>
-            <div>{program.status}</div>
+            <div>{statusLabel(program.status)}</div>
             <div className="k">Источник генерации</div>
             <div>
-              {program.generation.source} ({program.generation.generator_version})
+              {generationSourceLabel(program.generation.source)} ({program.generation.generator_version})
             </div>
             <div className="k">Тренировок в неделю</div>
             <div>{program.training_days_per_week}</div>
@@ -95,7 +96,7 @@ export default function ProgramDetailPage() {
                   className={v.version === program.version ? "active" : ""}
                   onClick={() => router.push(`/programs/${params.id}?version=${v.version}`)}
                 >
-                  v{v.version} ({v.status})
+                  v{v.version} ({statusLabel(v.status)})
                 </button>
               ))}
             </div>
@@ -157,7 +158,7 @@ export default function ProgramDetailPage() {
         )}
 
         <div className="card">
-          <div className="section-title">Safety notes</div>
+          <div className="section-title">Примечания по безопасности</div>
           {program.safety_notes.length === 0 ? (
             <p className="muted">Нет</p>
           ) : (
@@ -168,7 +169,7 @@ export default function ProgramDetailPage() {
             </ul>
           )}
           <p className="muted" style={{ marginTop: 10 }}>
-            Safety Rules — технические правила отбора движений, а не медицинская
+            Правила безопасности — это технические правила отбора движений, а не медицинская
             диагностика или рекомендация.
           </p>
         </div>

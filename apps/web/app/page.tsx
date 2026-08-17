@@ -24,7 +24,7 @@ export default function DashboardPage() {
     <div className="app-shell">
       <AppNav />
       <main className="main">
-        <h1 className="page-title">Dashboard</h1>
+        <h1 className="page-title">Панель управления</h1>
         {error && <div className="error">{error}</div>}
         {!data && !error && <div className="loading">Загрузка...</div>}
         {data && (
