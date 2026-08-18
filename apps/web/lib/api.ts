@@ -155,6 +155,9 @@ export interface ProgramDetail {
     generator_version: string;
     safe_pool_size: number | null;
     candidate_pool_total: number | null;
+    provider: string | null;
+    model: string | null;
+    prompt_version: number | null;
   };
   title: string;
   description: string | null;
@@ -347,6 +350,21 @@ export const aiApi = {
     }),
 };
 
+// --- AI Providers для UI (публичный API) ----------------------------------------
+
+export interface AIProviderForUI {
+  provider_id: number;
+  slug: string;
+  display_name: string;
+  type: string;
+  enabled: boolean;
+  available_models: Array<{
+    model_id: string;
+    display_name: string;
+    endpoint_id: number;
+  }>;
+}
+
 export const api = {
   dashboard: () => request<Dashboard>("/api/v1/dashboard"),
   profiles: (params?: { search?: string; status?: string; limit?: number; offset?: number }) => {
@@ -390,8 +408,11 @@ export const api = {
   },
   profilePrograms: (profileId: string) =>
     request<ListResponse<ProgramListItem>>(`/api/v1/profiles/${profileId}/programs`),
-  generateProgram: (profileId: string) =>
+  generateProgram: (profileId: string, generator: "deterministic" | "ai" = "deterministic") =>
     request<GenerateResponse>(`/api/v1/profiles/${profileId}/programs/generate`, {
       method: "POST",
+      body: JSON.stringify({ generator }),
     }),
+  aiProviders: () =>
+    request<ListResponse<AIProviderForUI>>("/api/v1/ai/providers"),
 };

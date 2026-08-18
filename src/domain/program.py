@@ -59,7 +59,7 @@ class TrainingDay(BaseModel):
 
 
 class GenerationInfo(BaseModel):
-    """Метаданные генерации: источник и версия генератора."""
+    """Метаданные генерации: источник, версия генератора и AI-параметры."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -67,6 +67,10 @@ class GenerationInfo(BaseModel):
     generator_version: str = Field(default=GENERATOR_VERSION, max_length=64)
     safe_pool_size: int | None = Field(default=None, ge=0)
     candidate_pool_total: int | None = Field(default=None, ge=0)
+    # AI-метаданные (заполняются только при source=ai)
+    provider: str | None = Field(default=None, max_length=64)
+    model: str | None = Field(default=None, max_length=200)
+    prompt_version: int | None = Field(default=None, ge=1)
 
 
 class ProgressionPlan(BaseModel):

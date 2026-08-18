@@ -73,6 +73,16 @@ export default function ProgramDetailPage() {
             <div>
               {generationSourceLabel(program.generation.source)} ({program.generation.generator_version})
             </div>
+            {program.generation.source === "ai" && (
+              <>
+                <div className="k">AI Provider</div>
+                <div>{program.generation.provider ?? "Not available"}</div>
+                <div className="k">AI Model</div>
+                <div>{program.generation.model ?? "Not available"}</div>
+                <div className="k">Prompt version</div>
+                <div>{program.generation.prompt_version ? `v${program.generation.prompt_version}` : "Not available"}</div>
+              </>
+            )}
             <div className="k">Тренировок в неделю</div>
             <div>{program.training_days_per_week}</div>
             <div className="k">Длительность</div>

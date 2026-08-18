@@ -74,6 +74,7 @@ export default function ProfileDetailPage() {
   const [programs, setPrograms] = useState<ProgramListItem[]>([]);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState("");
+  const [generatorType, setGeneratorType] = useState<"deterministic" | "ai">("deterministic");
 
   const loadPrograms = useCallback(() => {
     api
@@ -98,7 +99,7 @@ export default function ProfileDetailPage() {
     setGenerating(true);
     setGenerateError("");
     try {
-      await api.generateProgram(params.id);
+      await api.generateProgram(params.id, generatorType);
       loadPrograms();
     } catch (e) {
       setGenerateError(e instanceof Error ? e.message : "Ошибка генерации");
@@ -262,7 +263,27 @@ export default function ProfileDetailPage() {
             </Section>
             <Section title="Программы тренировок">
               {generateError && <div className="error">{generateError}</div>}
-              <div style={{ marginBottom: 12 }}>
+              <div style={{ marginBottom: 12, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <input
+                    type="radio"
+                    name="generator"
+                    value="deterministic"
+                    checked={generatorType === "deterministic"}
+                    onChange={() => setGeneratorType("deterministic")}
+                  />
+                  Deterministic
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <input
+                    type="radio"
+                    name="generator"
+                    value="ai"
+                    checked={generatorType === "ai"}
+                    onChange={() => setGeneratorType("ai")}
+                  />
+                  AI
+                </label>
                 <button
                   type="button"
                   className="primary"
