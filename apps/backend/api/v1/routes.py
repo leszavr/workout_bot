@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from apps.backend.api.v1.dependencies import build_program_service
@@ -414,6 +415,63 @@ async def list_profile_programs(
     return {"total": len(programs), "items": [_program_summary(p) for p in programs]}
 
 
+class GenerateProgramRequest(BaseModel):
+    """Запрос генерации программы с выбором генератора."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    generator: str = Field(default="deterministic", pattern=r"^(deterministic|ai)$")
+    prompt_version: int | None = Field(default=None, ge=1)
+
+
+# --- AI Providers (публичный API для UI) ----------------------------------------
+
+
+@router.get("/ai/providers")
+async def list_ai_providers(_: Annotated[str, Depends(require_admin)]) -> dict:
+    """Список AI-провайдеров для UI (без секретов).
+
+    Возвращает только безопасную информацию:
+    provider_id, display_name, type, enabled, available_models.
+    """
+    from apps.backend.api.v1.ai_dependencies import build_ai_components
+
+    components = build_ai_components()
+    providers = await components.providers.list()
+
+    items = []
+    for provider in providers:
+        if not provider.enabled:
+            continue
+        # Получаем модели провайдера через endpoints
+        endpoints = await components.endpoints.list_for_provider(provider.id or 0)
+        models = []
+        for endpoint in endpoints:
+            if not endpoint.enabled:
+                continue
+            endpoint_models = await components.models.list_for_endpoint(endpoint.id or 0)
+            models.extend(
+                {
+                    "model_id": m.model_id,
+                    "display_name": m.display_name,
+                    "endpoint_id": endpoint.id,
+                }
+                for m in endpoint_models
+                if m.enabled
+            )
+        items.append(
+            {
+                "provider_id": provider.id,
+                "slug": provider.slug,
+                "display_name": provider.name,
+                "type": provider.protocol.value,
+                "enabled": provider.enabled,
+                "available_models": models,
+            }
+        )
+    return {"total": len(items), "items": items}
+
+
 @router.post(
     "/profiles/{profile_id}/programs/generate",
     responses={
@@ -422,10 +480,13 @@ async def list_profile_programs(
     },
 )
 async def generate_program(
-    profile_id: str, _: Annotated[str, Depends(require_admin)]
+    profile_id: str,
+    _: Annotated[str, Depends(require_admin)],
+    body: GenerateProgramRequest | None = None,
 ) -> dict:
-    """Запуск детерминированной генерации программы (без AI)."""
-    service = build_program_service()
+    """Запуск генерации программы (deterministic или AI)."""
+    request = body or GenerateProgramRequest()
+    service = build_program_service(generator_type=request.generator)
     try:
         result = await service.generate(profile_id)
     except ProgramGenerationError as exc:
