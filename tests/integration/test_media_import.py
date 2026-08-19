@@ -17,7 +17,9 @@ from src.infrastructure.config import DATABASE_URL
 
 pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="DATABASE_URL is not set")
 
-TEST_EX_ID = "Barbell_Full_Squat"
+# Уникальный ID, отсутствующий в реальном каталоге: тест не должен
+# затрагивать production-записи exercise_media.
+TEST_EX_ID = "TestMediaImport_Exercise"
 
 
 def _jpg(width: int = 60, height: int = 40) -> bytes:
@@ -47,14 +49,32 @@ def local_storage(tmp_path: Path, monkeypatch):
     return storage
 
 
+@pytest.fixture
+async def test_exercise_in_catalog():
+    """Временное тестовое упражнение в каталоге (импортёр сверяется с ним)."""
+    from src.infrastructure.persistence.postgres.db import get_session_factory
+    from src.infrastructure.persistence.postgres.models import ExerciseRow
+
+    async with get_session_factory()() as session:
+        async with session.begin():
+            session.add(
+                ExerciseRow(
+                    external_id=TEST_EX_ID,
+                    source=SOURCE,
+                    name="Test Media Import Exercise",
+                )
+            )
+    yield
+
+
 @pytest.fixture(autouse=True)
 async def cleanup():
-    """Удаляет медиа тестового упражнения после теста."""
+    """Удаляет медиа и тестовое упражнение после теста."""
     yield
     from sqlalchemy import delete
 
     from src.infrastructure.persistence.postgres.db import dispose_engine, get_session_factory
-    from src.infrastructure.persistence.postgres.models import ExerciseMediaRow
+    from src.infrastructure.persistence.postgres.models import ExerciseMediaRow, ExerciseRow
 
     async with get_session_factory()() as session:
         async with session.begin():
@@ -62,6 +82,9 @@ async def cleanup():
                 delete(ExerciseMediaRow).where(
                     ExerciseMediaRow.exercise_external_id == TEST_EX_ID
                 )
+            )
+            await session.execute(
+                delete(ExerciseRow).where(ExerciseRow.external_id == TEST_EX_ID)
             )
     await dispose_engine()
 
@@ -83,7 +106,9 @@ def test_collect_image_files_limits(tmp_path: Path):
     assert [f.name for f in files] == ["0.jpg", "1.jpg"]
 
 
-async def test_import_creates_media_and_skips_unchanged(repo_root: Path, local_storage):
+async def test_import_creates_media_and_skips_unchanged(
+    repo_root: Path, local_storage, test_exercise_in_catalog
+):
     """Полный импорт: конверсия WebP → storage → БД; повторный запуск идемпотентен."""
     from src.infrastructure.persistence.postgres.db import get_session_factory
     from src.infrastructure.persistence.postgres.exercise_media_repository import (
