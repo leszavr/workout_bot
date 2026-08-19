@@ -136,6 +136,69 @@ class WorkoutProgramRow(Base):
     )
 
 
+class ExerciseMediaRow(Base):
+    """Метаданные медиа-ассетов упражнений (Stage 5).
+
+    Файлы хранятся в object storage (MinIO); здесь — metadata:
+    storage_key, размеры, checksum, источник и лицензия.
+    """
+
+    __tablename__ = "exercise_media"
+    __table_args__ = (
+        UniqueConstraint(
+            "exercise_external_id",
+            "exercise_source",
+            "sequence",
+            name="uq_exercise_media_external_source_sequence",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exercise_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    exercise_source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
+    media_type: Mapped[str] = mapped_column(String(32), default="image")
+    sequence: Mapped[int] = mapped_column(Integer)
+    storage_key: Mapped[str] = mapped_column(String(300))
+    mime_type: Mapped[str] = mapped_column(String(100), default="image/webp")
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    source: Mapped[str | None] = mapped_column(String(64))
+    source_url: Mapped[str | None] = mapped_column(String(500))
+    license: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ProgramDeliveryRow(Base):
+    """Жизненный цикл доставки HTML-программы пользователю.
+
+    Delivery retry независим от generation retry: после успешной генерации
+    повторные попытки доставки не запускают новую генерацию.
+    """
+
+    __tablename__ = "program_deliveries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    program_id: Mapped[str] = mapped_column(String(64), index=True)
+    profile_id: Mapped[str] = mapped_column(String(64), index=True)
+    chat_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    filename: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(500))
+    sent_message_id: Mapped[int | None] = mapped_column(Integer)
+    source_media_mode: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 # --- AI Configuration (этап 3B) -------------------------------------------------
 
 

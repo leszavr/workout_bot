@@ -33,6 +33,32 @@ JWT_SECRET = os.getenv("JWT_SECRET", "")
 # из JWT_SECRET (dev-режим); в production задайте отдельный AI_SECRETS_KEY.
 AI_SECRETS_KEY = os.getenv("AI_SECRETS_KEY", "")
 
+# MinIO (S3-compatible object storage) для медиа упражнений.
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
+MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() in ("1", "true", "yes")
+MEDIA_BUCKET = os.getenv("MEDIA_BUCKET", "workout-media")
+# Публичный базовый URL backend для абсолютных ссылок в HTML (url-режим).
+# Пример: http://localhost:8000
+MEDIA_PUBLIC_BASE_URL = os.getenv("MEDIA_PUBLIC_BASE_URL", "")
+
+# Media pipeline.
+# Максимум медиа-ассетов на одно упражнение (лимит импорта/вывода,
+# не ограничение схемы БД).
+EXERCISE_MEDIA_MAX_PER_EXERCISE = int(os.getenv("EXERCISE_MEDIA_MAX_PER_EXERCISE", "5"))
+# html (base64 data-URI в HTML) | url (абсолютные URL media endpoint).
+PROGRAM_HTML_MEDIA_MODE = os.getenv("PROGRAM_HTML_MEDIA_MODE", "html")
+
+# Генерация программ (Stage 5).
+# primary_generator / fallback_generator: ai | deterministic.
+PROGRAM_PRIMARY_GENERATOR = os.getenv("PROGRAM_PRIMARY_GENERATOR", "ai")
+PROGRAM_FALLBACK_GENERATOR = os.getenv("PROGRAM_FALLBACK_GENERATOR", "deterministic")
+# Автоматическая генерация после финализации анкеты.
+AUTO_GENERATE_PROGRAM_AFTER_FINALIZE = (
+    os.getenv("AUTO_GENERATE_PROGRAM_AFTER_FINALIZE", "true").lower() in ("1", "true", "yes")
+)
+
 DEFAULT_TIMEZONE = "UTC"
 MAX_TEXT_LENGTH = 2000
 MAX_PHOTOS = 10

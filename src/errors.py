@@ -44,3 +44,15 @@ class ProgramValidationError(WorkoutBotError):
 
 class ProgramPersistenceError(WorkoutBotError):
     """Не удалось сохранить/прочитать программу в хранилище."""
+
+
+class MediaStorageError(WorkoutBotError):
+    """Ошибка object storage / работы с медиа-ассетами упражнений."""
+
+
+class ProgramDeliveryError(WorkoutBotError):
+    """Не удалось доставить программу пользователю."""
+
+
+class HtmlRenderError(WorkoutBotError):
+    """Не удалось выполнить рендеринг HTML программы."""

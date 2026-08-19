@@ -113,6 +113,15 @@ class GenerationSource(StrEnum):
     AI = "ai"
 
 
+class ProgramDeliveryStatus(StrEnum):
+    """Жизненный цикл доставки программы пользователю (Stage 5)."""
+
+    PENDING = "pending"
+    SENDING = "sending"
+    SENT = "sent"
+    FAILED = "failed"
+
+
 class SafetyDecision(StrEnum):
     """Решение safety-правила по упражнению."""
 

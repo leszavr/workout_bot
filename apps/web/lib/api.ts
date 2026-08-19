@@ -104,6 +104,17 @@ export interface ExerciseListItem {
   is_active: boolean;
 }
 
+export interface ExerciseMediaItem {
+  sequence: number;
+  mime_type: string;
+  width: number;
+  height: number;
+  size_bytes: number;
+  source: string | null;
+  license: string | null;
+  url: string;
+}
+
 export interface ExerciseDetail extends ExerciseListItem {
   source_version: string | null;
   aliases: string[];
@@ -117,6 +128,7 @@ export interface ExerciseDetail extends ExerciseListItem {
   contraindications: string[];
   limitations: string[];
   images: string[];
+  media?: ExerciseMediaItem[];
 }
 
 export interface ListResponse<T> {

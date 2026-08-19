@@ -270,6 +270,60 @@ async def list_exercises(
     }
 
 
+def _serialize_exercise(row: ExerciseRow, media_items: list[dict] | None = None) -> dict:
+    return {
+        "id": row.id,
+        "external_id": row.external_id,
+        "source": row.source,
+        "source_version": row.source_version,
+        "name": row.name,
+        "name_ru": row.name_ru,
+        "aliases": row.aliases or [],
+        "description": row.description,
+        "technique": row.technique,
+        "technique_ru": row.technique_ru,
+        "common_mistakes": row.common_mistakes,
+        "primary_muscles": row.primary_muscles or [],
+        "secondary_muscles": row.secondary_muscles or [],
+        "equipment": row.equipment or [],
+        "exercise_type": row.exercise_type,
+        "difficulty": row.difficulty,
+        "force": row.force,
+        "mechanic": row.mechanic,
+        "contraindications": row.contraindications or [],
+        "limitations": row.limitations or [],
+        "images": row.images or [],
+        "is_active": row.is_active,
+        "media": media_items or [],
+    }
+
+
+async def _media_items_for(row: ExerciseRow) -> list[dict]:
+    from apps.backend.api.v1.dependencies import build_exercise_media_service
+    from src.infrastructure.config import EXERCISE_MEDIA_MAX_PER_EXERCISE
+
+    service = build_exercise_media_service()
+    try:
+        assets = await service.list_for_exercise(
+            row.external_id, row.source, limit=EXERCISE_MEDIA_MAX_PER_EXERCISE
+        )
+    except Exception:  # noqa: BLE001 — media недоступны → пустой список
+        return []
+    return [
+        {
+            "sequence": a.sequence,
+            "mime_type": a.mime_type,
+            "width": a.width,
+            "height": a.height,
+            "size_bytes": a.size_bytes,
+            "source": a.source,
+            "license": a.license,
+            "url": f"/api/v1/media/exercises/{a.exercise_external_id}/{a.sequence}?source={a.exercise_source}",
+        }
+        for a in assets
+    ]
+
+
 @router.get(
     "/exercises/external/{external_id}",
     responses={404: {"description": "Exercise not found"}},
@@ -291,30 +345,7 @@ async def get_exercise_by_external_id(
         row = (await session.execute(stmt.limit(1))).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="Exercise not found")
-    return {
-        "id": row.id,
-        "external_id": row.external_id,
-        "source": row.source,
-        "source_version": row.source_version,
-        "name": row.name,
-        "name_ru": row.name_ru,
-        "aliases": row.aliases or [],
-        "description": row.description,
-        "technique": row.technique,
-        "technique_ru": row.technique_ru,
-        "common_mistakes": row.common_mistakes,
-        "primary_muscles": row.primary_muscles or [],
-        "secondary_muscles": row.secondary_muscles or [],
-        "equipment": row.equipment or [],
-        "exercise_type": row.exercise_type,
-        "difficulty": row.difficulty,
-        "force": row.force,
-        "mechanic": row.mechanic,
-        "contraindications": row.contraindications or [],
-        "limitations": row.limitations or [],
-        "images": row.images or [],
-        "is_active": row.is_active,
-    }
+    return _serialize_exercise(row, await _media_items_for(row))
 
 
 @router.get(
@@ -328,30 +359,7 @@ async def get_exercise(exercise_id: int, _: Annotated[str, Depends(require_admin
         ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="Exercise not found")
-    return {
-        "id": row.id,
-        "external_id": row.external_id,
-        "source": row.source,
-        "source_version": row.source_version,
-        "name": row.name,
-        "name_ru": row.name_ru,
-        "aliases": row.aliases or [],
-        "description": row.description,
-        "technique": row.technique,
-        "technique_ru": row.technique_ru,
-        "common_mistakes": row.common_mistakes,
-        "primary_muscles": row.primary_muscles or [],
-        "secondary_muscles": row.secondary_muscles or [],
-        "equipment": row.equipment or [],
-        "exercise_type": row.exercise_type,
-        "difficulty": row.difficulty,
-        "force": row.force,
-        "mechanic": row.mechanic,
-        "contraindications": row.contraindications or [],
-        "limitations": row.limitations or [],
-        "images": row.images or [],
-        "is_active": row.is_active,
-    }
+    return _serialize_exercise(row, await _media_items_for(row))
 
 
 # --- Programs -----------------------------------------------------------------

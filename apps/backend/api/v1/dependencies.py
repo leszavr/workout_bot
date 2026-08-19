@@ -7,12 +7,17 @@ from __future__ import annotations
 import httpx
 
 from src.application.ai.program_generator import AIProgramGenerator, PromptLoader
+from src.application.media.service import ExerciseMediaService
 from src.application.programs.filtering import ExerciseFilter
 from src.application.programs.generator import DeterministicProgramGenerator
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.service import ProgramService
 from src.application.programs.validator import ProgramValidator
+from src.infrastructure.media.object_storage import create_object_storage
 from src.infrastructure.persistence.postgres.db import get_session_factory
+from src.infrastructure.persistence.postgres.exercise_media_repository import (
+    ExerciseMediaRepository,
+)
 from src.infrastructure.persistence.postgres.exercise_repository import (
     ExerciseRepository,
 )
@@ -45,6 +50,14 @@ def build_program_service(generator_type: str = "deterministic") -> ProgramServi
         exercise_filter=ExerciseFilter(),
         safety_engine=SafetyEngine(),
         validator=ProgramValidator(),
+    )
+
+
+def build_exercise_media_service() -> ExerciseMediaService:
+    session_factory = get_session_factory()
+    return ExerciseMediaService(
+        repository=ExerciseMediaRepository(session_factory),
+        storage=create_object_storage(),
     )
 
 

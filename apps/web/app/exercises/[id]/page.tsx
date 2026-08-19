@@ -4,7 +4,7 @@ import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
-import { api, ExerciseDetail, getToken } from "@/lib/api";
+import { API_BASE, api, ExerciseDetail, getToken } from "@/lib/api";
 import {
   DIFFICULTY_LABELS,
   EXERCISE_TYPE_LABELS,
@@ -102,7 +102,30 @@ export default function ExerciseDetailPage() {
 
         <div className="card">
           <div className="section-title">Изображения</div>
-          {exercise.images.length === 0 ? (
+          {exercise.media && exercise.media.length > 0 ? (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {exercise.media.map((item) => (
+                <a
+                  key={item.sequence}
+                  href={`${API_BASE}${item.url}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={`${API_BASE}${item.url}`}
+                    alt={`${exercise.name_ru || exercise.name} — фото ${item.sequence}`}
+                    style={{
+                      height: 140,
+                      width: "auto",
+                      borderRadius: 8,
+                      border: "1px solid var(--border, #444)",
+                    }}
+                  />
+                </a>
+              ))}
+            </div>
+          ) : exercise.images.length === 0 ? (
             <p className="muted">Изображения отсутствуют</p>
           ) : (
             <ul>
@@ -112,6 +135,11 @@ export default function ExerciseDetailPage() {
                 </li>
               ))}
             </ul>
+          )}
+          {exercise.media && exercise.media.length > 0 && exercise.media[0].license && (
+            <p className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+              Источник: {exercise.media[0].source || exercise.source} · {exercise.media[0].license}
+            </p>
           )}
         </div>
 
