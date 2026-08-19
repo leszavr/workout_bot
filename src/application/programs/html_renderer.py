@@ -246,6 +246,19 @@ def render_program_html(
   <p>{duration_line}</p>
 </div>
 
+<div class="timer-wrap">
+  <div class="timer-lbl">&#x23F1; Таймер отдыха</div>
+  <div class="timer-disp" id="timerDisp">1:30</div>
+  <div class="timer-btns">
+    <button class="btn-t" onclick="setTimer(60,this)">60 сек</button>
+    <button class="btn-t act" onclick="setTimer(90,this)">1:30</button>
+    <button class="btn-t" onclick="setTimer(120,this)">2:00</button>
+    <button class="btn-t" onclick="setTimer(180,this)">3:00</button>
+    <button class="btn-go" onclick="startTimer()">&#x25BA; Старт</button>
+    <button class="btn-rst" onclick="resetTimer()">&#x21BA; Сброс</button>
+  </div>
+</div>
+
 <div class="principles">
   <div class="principles-hdr open" onclick="togglePrinciples(this)">
     <span>&#x1F4CB; О программе</span>
@@ -290,6 +303,24 @@ body{font-family:var(--ff);background:var(--bg);color:var(--text);font-size:16px
   padding:3px 12px;font-size:11px;color:var(--accent);margin-bottom:8px;font-weight:600}
 .header h1{font-size:20px;font-weight:700;color:#fff;margin-bottom:4px}
 .header p{font-size:12px;color:var(--text2)}
+.timer-wrap{background:var(--surface2);border:1px solid var(--border);
+  border-radius:var(--r-lg);padding:12px 14px;margin:14px 14px 0;text-align:center}
+.timer-lbl{font-size:11px;text-transform:uppercase;letter-spacing:.9px;
+  color:var(--text2);margin-bottom:6px;font-weight:600}
+.timer-disp{font-size:38px;font-weight:700;color:var(--accent);
+  font-variant-numeric:tabular-nums;margin-bottom:8px;letter-spacing:-1px;
+  transition:color .3s}
+.timer-btns{display:flex;gap:6px;justify-content:center;flex-wrap:wrap}
+.btn-t{background:var(--surface);border:1px solid var(--border);color:var(--text);
+  border-radius:8px;padding:8px 12px;font-size:13px;cursor:pointer;
+  font-family:var(--ff);-webkit-tap-highlight-color:transparent;transition:all .15s}
+.btn-t.act{background:var(--accent);border-color:var(--accent);color:#0d1117;font-weight:700}
+.btn-go{background:var(--green);border:none;color:#0d1117;
+  border-radius:8px;padding:8px 18px;font-size:13px;font-weight:700;
+  cursor:pointer;font-family:var(--ff);-webkit-tap-highlight-color:transparent}
+.btn-rst{background:var(--surface2);border:1px solid var(--border);color:var(--text2);
+  border-radius:8px;padding:8px 18px;font-size:13px;font-weight:700;
+  cursor:pointer;font-family:var(--ff);-webkit-tap-highlight-color:transparent}
 .principles{margin:14px 14px 0;background:var(--surface);
   border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden}
 .principles-hdr{display:flex;align-items:center;justify-content:space-between;
@@ -366,7 +397,7 @@ body{font-family:var(--ff);background:var(--bg);color:var(--text);font-size:16px
   padding:8px 12px;font-size:12px;color:var(--gold);margin-top:6px}
 .ex-tip.warning{background:#1c0e0e;border-color:var(--red);color:var(--red)}
 @media print{
-  .days-nav{display:none}
+  .days-nav,.timer-wrap{display:none}
   body{background:#fff;color:#000;padding:0;font-size:11pt}
   .day-section{display:block!important;padding:0}
   .day-section::before{content:attr(data-title);
@@ -397,5 +428,53 @@ function toggleEx(hdr) {
   var open = det.classList.contains('open');
   det.classList.toggle('open', !open);
   hdr.classList.toggle('open', !open);
+}
+var tSec = 90, tSet = 90, tRunning = false, tInt = null, tAutoReset = null;
+function _cancelAutoReset() {
+  if (tAutoReset) { clearTimeout(tAutoReset); tAutoReset = null; }
+}
+function setTimer(s, btn) {
+  tSet = s; tSec = s;
+  if (tRunning) { clearInterval(tInt); tRunning = false; }
+  _cancelAutoReset();
+  document.querySelector('.btn-go').textContent = '\\u25BA Старт';
+  updTimer();
+  document.querySelectorAll('.btn-t').forEach(function(b){ b.classList.remove('act'); });
+  if (btn) btn.classList.add('act');
+}
+function updTimer() {
+  var m = Math.floor(tSec / 60), s = tSec % 60;
+  var el = document.getElementById('timerDisp');
+  el.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+  el.style.color = tSec === 0 ? 'var(--green)' : tSec <= 10 ? 'var(--red)' : 'var(--accent)';
+}
+function startTimer() {
+  var btn = document.querySelector('.btn-go');
+  if (tRunning) {
+    clearInterval(tInt); tRunning = false;
+    btn.textContent = '\\u25BA Старт';
+    return;
+  }
+  _cancelAutoReset();
+  if (tSec === 0) { tSec = tSet; }
+  tRunning = true;
+  btn.textContent = '\\u23F8 Пауза';
+  tInt = setInterval(function() {
+    if (tSec > 0) { tSec--; updTimer(); }
+    if (tSec === 0) {
+      clearInterval(tInt); tRunning = false;
+      btn.textContent = '\\u25BA Старт';
+      if ('vibrate' in navigator) navigator.vibrate([300, 100, 300]);
+      tAutoReset = setTimeout(function() {
+        tAutoReset = null; tSec = tSet; updTimer();
+      }, 1000);
+    }
+  }, 1000);
+}
+function resetTimer() {
+  clearInterval(tInt); tRunning = false;
+  _cancelAutoReset(); tSec = tSet;
+  document.querySelector('.btn-go').textContent = '\\u25BA Старт';
+  updTimer();
 }
 showDay(1);"""

@@ -169,3 +169,36 @@ class TestHtmlImages:
         media = [ExerciseMediaItem("Other_Exercise", 1, "data:image/webp;base64,xxx")]
         html = render_program_html(_program(), exercise_info=_info(), media=media)
         assert "data:image/webp" not in html
+
+
+class TestHtmlTimer:
+    def test_timer_block_rendered(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        assert 'class="timer-wrap"' in html
+        assert 'id="timerDisp"' in html
+        assert "Таймер отдыха" in html
+
+    def test_timer_presets(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        for preset in ("setTimer(60,this)", "setTimer(90,this)", "setTimer(120,this)", "setTimer(180,this)"):
+            assert preset in html
+        assert 'class="btn-t act" onclick="setTimer(90,this)"' in html
+
+    def test_timer_controls(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        assert 'class="btn-go" onclick="startTimer()"' in html
+        assert 'class="btn-rst" onclick="resetTimer()"' in html
+        assert "Старт" in html
+        assert "Сброс" in html
+
+    def test_timer_js_auto_reset(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        assert "function startTimer()" in html
+        assert "function resetTimer()" in html
+        # по истечении — автоматический возврат к исходному значению
+        assert "tAutoReset = setTimeout" in html
+        assert "tSec = tSet; updTimer();" in html
+
+    def test_timer_hidden_in_print(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        assert ".days-nav,.timer-wrap{display:none}" in html
