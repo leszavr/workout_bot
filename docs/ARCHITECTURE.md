@@ -8,7 +8,8 @@
 │   apps/telegram_gateway  — aiogram handlers/keyboards/FSM  │
 │   apps/backend           — FastAPI (/health, /ready,       │
 │                            /api/v1: auth, profiles, users, │
-│                            exercises, dashboard)           │
+│                            exercises, programs, media,     │
+│                            dashboard)                      │
 │   apps/web               — Next.js внутренний интерфейс    │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
@@ -19,7 +20,10 @@
 │   src/application/profiles      — финализация (идемпотент.)│
 │   src/application/notifications — уведомление админа       │
 │   src/application/programs      — pipeline генерации:      │
-│       filtering, safety, generator, validator, service     │
+│       filtering, safety, generator, validator, service,    │
+│       orchestrator (primary/fallback), html_renderer,      │
+│       html_service, telegram_delivery, pipeline            │
+│   src/application/media         — ExerciseMediaService     │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
 ┌────────────────────────────────────────────────────────────┐
@@ -28,6 +32,7 @@
 │   src/domain/consents.py— ConsentRecord                    │
 │   src/domain/exercise.py— Exercise                         │
 │   src/domain/program.py — WorkoutProgram + TrainingDay     │
+│   src/domain/media.py   — ExerciseMedia                    │
 │   src/domain/pools.py   — CandidatePool / SafeExercisePool │
 │   src/domain/safety.py  — ExerciseCharacteristics          │
 │   src/domain/enums.py   — все enum предметной области      │
@@ -36,9 +41,12 @@
 ┌────────────────────────────────────────────────────────────┐
 │ Infrastructure Layer                                       │
 │   src/infrastructure/persistence — ProfileRepository       │
-│       (File / Postgres), ProgramRepository, Alembic        │
+│       (File / Postgres), ProgramRepository,                │
+│       ExerciseMediaRepository, DeliveryRepository, Alembic │
 │   src/infrastructure/files       — FileStorage (Local)     │
-│   src/infrastructure/telegram    — TelegramAdminSender     │
+│   src/infrastructure/media       — ObjectStorage (MinIO/S3)│
+│   src/infrastructure/telegram    — TelegramAdminSender,    │
+│       ProgramSender (документы), AlertSender               │
 │   src/infrastructure/config.py, logging_setup.py           │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -46,7 +54,9 @@
 ## Хранилище данных
 
 Основное хранилище — **PostgreSQL** (SQLAlchemy 2.0 async + asyncpg + Alembic).
-Таблицы: `users`, `profiles` (JSONB), `consents`, `exercises`.
+Таблицы: `users`, `profiles` (JSONB), `consents`, `exercises`,
+`workout_programs`, `exercise_media`, `program_deliveries`, `ai_*`
+(конфигурация AI-провайдеров).
 
 - Профиль проходит Pydantic-валидацию перед записью и после чтения:
   `Pydantic Model → Validation → PostgreSQL JSONB`. БД не является
@@ -56,6 +66,11 @@
 - Миграции: `alembic upgrade head`.
 - Каталог упражнений: 873 записи из `leszavr/workout`, идемпотентный
   импорт по ключу `(external_id, source)` — `scripts/import_exercises.py`.
+- Бинарные медиаобъекты (WebP-фото упражнений) хранятся в **MinIO**
+  (S3-compatible object storage), PostgreSQL хранит только метаданные
+  (`exercise_media`: storage_key, checksum, размеры, лицензия, источник).
+  MinIO не является частью Git; воспроизводимость обеспечивается
+  импортёром `scripts/import_exercise_media.py` + исходным репозиторием.
 
 ## Внутренний веб-интерфейс
 
@@ -153,15 +168,16 @@ Restriction (свободный текст) → Normalization → MovementRestri
   профиль просит избегать. Нераспознанные ограничения → REQUIRES_REVIEW.
 
 ### ProgramGenerator (`generator.py`)
-`ProgramGenerator` — Protocol (контракт). Реализация —
-`DeterministicProgramGenerator`: без случайности, только из SafeExercisePool.
+`ProgramGenerator` — Protocol (контракт). Реализации:
+`DeterministicProgramGenerator` (без случайности, только из SafeExercisePool)
+и `AIProgramGenerator` (этап 4, через универсальный AI-шлюз).
 - цель → параметры нагрузки (подходы/повторения/отдых), длительность,
   приоритет ролей; опыт → объём тренировки;
 - 1–2 тренировки/нед → full body; 3+ → сплит (ноги+жим / тяга+корпус) + full body;
 - упражнения группируются по двигательной роли (legs/push/pull/core/cardio),
   compound-упражнения ранжируются выше.
-В будущем `AIProgramGenerator` реализует тот же контракт; профиль, каталог,
-репозиторий, API, валидаторы и safety-слой не изменятся.
+Оба генератора реализуют один контракт; профиль, каталог,
+репозиторий, API, валидаторы и safety-слой от выбора генератора не зависят.
 
 ### Program Validator (`validator.py`)
 Независимый слой проверки (будущий AI-вывод пройдёт через него же):
@@ -190,17 +206,115 @@ JSONB (`data`), денормализованные колонки для спи�
 Упражнения кликабельны (ExerciseLink резолвит external_id → внутренний id).
 Страница профиля: блок «Workout Programs» + кнопка «Generate Program».
 
+## Оркестрация генерации и доставка HTML-программы (этап 5)
+
+Полная цепочка после подтверждения анкеты:
+
+```
+Telegram Gateway (review_confirm)
+        ↓
+Profile Finalization (идемпотентная)
+        ↓
+ProgramGenerationOrchestrator
+        ↓
+Primary Generator (ai | deterministic)
+        ↓ failure
+Fallback Generator (строго один, без циклов)
+        ↓
+ProgramValidator → WorkoutProgram
+        ↓
+PostgreSQL (workout_programs, версия)
+        ↓
+HTML Renderer (программа + N фото упражнений)
+        ↓
+HTML-файл
+        ↓
+Telegram Delivery (document, ограниченные retry)
+        ↓ ошибка доставки после retry
+Уведомление администратору (программа уже сохранена)
+```
+
+### ProgramGenerationOrchestrator (`orchestrator.py`)
+Соединяет фильтр, safety, генераторы, валидатор и репозиторий:
+- конфигурация primary/fallback симметрична (`PROGRAM_PRIMARY_GENERATOR`,
+  `PROGRAM_FALLBACK_GENERATOR`): ai→deterministic по умолчанию,
+  обратный порядок тоже поддерживается;
+- строго один fallback: primary → fallback → final failure, никаких циклов;
+- `GenerationInfo` в программе фиксирует запрошенный и фактический
+  генератор, `fallback_used` и причину fallback;
+- пользователь не получает техническую ошибку AI, если fallback сработал;
+- идемпотентность: повторный вызов после успешной генерации возвращает
+  существующую валидную программу (`reused_existing=True`), новая версия
+  создаётся только явным запросом или после failure.
+
+### Generation ≠ Delivery
+Ошибка Telegram-доставки не приводит к повторной генерации: программа уже
+сохранена в PostgreSQL, доставка повторяется только на уровне
+`ProgramDeliveryService`. Статусы доставки хранятся в `program_deliveries`
+(pending/sending/sent/failed + число попыток).
+
+### HTML Renderer (`html_renderer.py`, `html_service.py`)
+Mobile-first HTML-файл программы (вкладки дней, карточки упражнений,
+подходы/повторения/отдых, техника, безопасность, прогрессия).
+- Поддерживает **произвольное число изображений** у упражнения
+  (0/1/N); лимит `EXERCISE_MEDIA_MAX_PER_EXERCISE` — конфигурация
+  сценария, не ограничение ядра рендерера, БД или storage.
+- Упражнение без фото рендерится без изображения (описание и техника),
+  placeholder-заглушки не используются.
+- Два режима медиа (`PROGRAM_HTML_MEDIA_MODE`):
+  `html` — изображения встраиваются как data-URI (файл автономен);
+  `url` — абсолютные ссылки на media endpoint (`MEDIA_PUBLIC_BASE_URL`).
+- Пользовательский текст без технической информации о генераторах.
+
+### Telegram Delivery (`telegram_delivery.py`)
+HTML отправляется как document (`workout_program_{profile_id}.html`,
+MIME `text/html`) через `ProgramSender`. Ограниченные retry с backoff
+(не бесконечные); после исчерпания попыток — нейтральное сообщение
+пользователю и технический алерт администратору (`AlertSender`,
+`ProgramAlertService`): stage, генератор, fallback, тип исключения,
+correlation id. Stack trace пользователю не отправляется.
+
+## Медиа упражнений (этап 5)
+
+```
+Exercise Catalog (leszavr/workout)
+        ↓
+scripts/import_exercise_media.py (Pillow → WebP, checksum, идемпотентность)
+        ↓
+ExerciseMediaRepository → PostgreSQL (exercise_media: метаданные)
+        ↓
+ObjectStorage → MinIO (бинарные WebP-объекты)
+        ↓
+Admin UI / HTML Renderer / GET /api/v1/media/exercises/...
+```
+
+- `ExerciseMedia` (domain): упражнение может иметь несколько изображений,
+  порядок задаётся `sequence`, первое изображение — primary. Уникальность
+  по `(exercise_external_id, source, sequence)`.
+- Импортёр идемпотентен: повторный импорт без изменений исходников
+  не создаёт дубликатов (сравнение по checksum); изменение исходного
+  файла приводит к перечитыванию. Для каждого файла сохраняются
+  provenance-данные: источник (`leszavr/workout`), лицензия
+  (`Unlicense`, public domain), исходный путь, checksum.
+- Media endpoint `GET /api/v1/media/exercises/{external_id}/{sequence}`
+  отдаёт WebP из MinIO с `Cache-Control: public, max-age=86400, immutable`;
+  несуществующее упражнение/изображение → 404.
+- Admin UI показывает фото упражнений на карточке упражнения.
+
 ## Запуск
 
 ```bash
-# PostgreSQL (контейнер)
-docker compose -f docker/docker-compose.yml --env-file .env up -d postgres
+# PostgreSQL + MinIO (контейнеры)
+docker compose -f docker/docker-compose.yml --env-file .env up -d postgres minio
 
 # Миграции
 alembic upgrade head
 
 # Импорт каталога упражнений (один раз)
 python -m scripts.import_exercises /path/to/workout --source-version <commit>
+
+# Импорт фото упражнений в MinIO (идемпотентный, можно повторять)
+python -m scripts.import_exercise_media /path/to/workout --source-version <commit>
 
 # Telegram-бот
 python -m apps.telegram_gateway.main
