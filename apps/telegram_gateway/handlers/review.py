@@ -2,12 +2,18 @@
 
 Финализация идемпотентна: повторное нажатие «Подтвердить» не создаёт дубликат.
 Уведомление администратору имеет явный статус доставки (pending/sent/failed).
+
+После успешной финализации автоматически запускается program pipeline
+(Stage 5): генерация → HTML → доставка. Ошибки pipeline не ломают
+сохранённый профиль. Идемпотентность: при повторном finalize существующая
+валидная программа переиспользуется, дубликаты не создаются.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
@@ -32,6 +38,10 @@ from src.infrastructure.telegram.admin_sender import TelegramAdminSender
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+# Сильные ссылки на фоновые задачи pipeline: event loop хранит только
+# слабые ссылки, без этого set задача может быть собрана GC mid-execution.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
 async def render_review(message: Message, state: FSMContext) -> None:
@@ -84,10 +94,72 @@ async def final_confirm(callback: CallbackQuery, state: FSMContext) -> None:
 
     number = result.profile.display_number or result.profile.profile_id or "—"
     await callback.message.edit_text(
-        f"✅ Спасибо! Ваша анкета принята. Номер: {number}\n\n"
-        "Тренер свяжется с вами в течение 24 часов."
+        f"✅ Спасибо! Ваша анкета принята. Номер: {number}"
     )
     await callback.answer("Анкета сохранена")
+
+    # Автогенерация программы после успешного сохранения профиля.
+    # Ошибки pipeline не ломают сохранённый профиль; задача выполняется
+    # в фоне, чтобы не блокировать handler.
+    from apps.telegram_gateway.pipeline import (
+        build_program_pipeline,
+        is_auto_generation_enabled,
+    )
+
+    if is_auto_generation_enabled() and result.profile.profile_id:
+        task = asyncio.create_task(
+            run_program_pipeline(
+                bot=callback.bot,
+                chat_id=str(callback.from_user.id),
+                profile_id=result.profile.profile_id,
+                already_finalized=result.already_finalized,
+            )
+        )
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def run_program_pipeline(
+    *,
+    bot: Bot,
+    chat_id: str,
+    profile_id: str,
+    already_finalized: bool,
+) -> None:
+    """Генерация + HTML + доставка. Все ошибки приводятся к user-facing сообщению."""
+    try:
+        pipeline = build_program_pipeline(bot)
+    except Exception:  # noqa: BLE001 — сборка pipeline не должна падать молча
+        logger.exception("program_pipeline_build_failed", extra={"profile_id": profile_id})
+        try:
+            await bot.send_message(
+                chat_id,
+                "Не удалось автоматически сформировать программу. "
+                "Мы получили уведомление об ошибке.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("user_message_send_failed", extra={"profile_id": profile_id})
+        return
+
+    if not already_finalized:
+        try:
+            await bot.send_message(chat_id, "⏳ Формируем вашу персональную программу...")
+        except Exception:  # noqa: BLE001
+            logger.exception("user_message_send_failed", extra={"profile_id": profile_id})
+
+    try:
+        result = await pipeline.run_for_user(
+            profile_id=profile_id, chat_id=chat_id, reuse_existing=True
+        )
+    except Exception:  # noqa: BLE001 — pipeline уже ловит типовые ошибки; защита от непредвиденных
+        logger.exception("program_pipeline_unhandled_error", extra={"profile_id": profile_id})
+        return
+
+    if result.user_message:
+        try:
+            await bot.send_message(chat_id, result.user_message)
+        except Exception:  # noqa: BLE001
+            logger.exception("user_message_send_failed", extra={"profile_id": profile_id})
 
 
 @router.callback_query(F.data == "return_to_questionnaire")

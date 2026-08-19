@@ -71,6 +71,12 @@ class GenerationInfo(BaseModel):
     provider: str | None = Field(default=None, max_length=64)
     model: str | None = Field(default=None, max_length=200)
     prompt_version: int | None = Field(default=None, ge=1)
+    # Метаданные оркестрации (Stage 5): какой генератор запрашивали,
+    # какой реально сработал, был ли fallback и почему.
+    requested_generator: GenerationSource | None = None
+    actual_generator: GenerationSource | None = None
+    fallback_used: bool = False
+    fallback_reason: str | None = Field(default=None, max_length=500)
 
 
 class ProgressionPlan(BaseModel):
