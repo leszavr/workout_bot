@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import AIFallbackEvents from "@/components/AIFallbackEvents";
+import AIInfrastructureHealthPanel from "@/components/AIInfrastructureHealthPanel";
 import AIObservability from "@/components/AIObservability";
 import AIQuickSetup from "@/components/AIQuickSetup";
 import AIReadinessPanel from "@/components/AIReadinessPanel";
@@ -16,11 +18,35 @@ import {
   AIReadinessReport,
   AITaskItem,
   AIUsageItem,
+  ApiError,
   getToken,
 } from "@/lib/api";
 import { aiProtocolLabel, aiTaskLabel } from "@/lib/labels";
 
 const MAIN_TASK_TYPE = "workout_generation";
+
+// Удаление конфигурации: подтверждение + расшифровка блокеров из 409.
+// Одна функция на три сущности, чтобы объяснение причины не расходилось.
+async function runDelete(
+  label: string,
+  action: () => Promise<void>,
+  onChanged: (message: string) => void,
+  onError: (message: string) => void
+): Promise<void> {
+  if (!window.confirm(`Удалить ${label}? Действие необратимо.`)) return;
+  try {
+    await action();
+    onChanged(`Удалено: ${label}`);
+  } catch (e) {
+    const error = e as ApiError;
+    const blockers = error.blockers?.map((b) => b.detail).join("; ");
+    onError(
+      blockers
+        ? `${error.message} Зависимости: ${blockers}`
+        : error.message
+    );
+  }
+}
 
 export default function AIConfigPage() {
   const [providers, setProviders] = useState<AIProviderItem[]>([]);
@@ -35,6 +61,9 @@ export default function AIConfigPage() {
   const [notice, setNotice] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [testResults, setTestResults] = useState<Record<number, AIEndpointTestResult>>({});
+  // Растёт после каждой CRUD-операции: health-дашборд и журнал fallback
+  // синхронизируются с backend, а не показывают устаревшее состояние.
+  const [reloadKey, setReloadKey] = useState(0);
 
   const flash = (message: string) => {
     setNotice(message);
@@ -103,6 +132,7 @@ export default function AIConfigPage() {
 
   const onChanged = (message: string) => {
     flash(message);
+    setReloadKey((value) => value + 1);
     reloadAll().catch((e) => setError(e.message));
   };
 
@@ -119,6 +149,8 @@ export default function AIConfigPage() {
           refreshing={refreshing}
           onRefresh={() => reloadAll().catch((e) => setError(e.message))}
         />
+
+        <AIInfrastructureHealthPanel reloadKey={reloadKey} onError={setError} />
 
         <AIQuickSetup
           taskType={MAIN_TASK_TYPE}
@@ -148,6 +180,8 @@ export default function AIConfigPage() {
           onChanged={onChanged}
           onError={setError}
         />
+
+        <AIFallbackEvents reloadKey={reloadKey} onError={setError} />
 
         <AIObservability
           usage={usage}
@@ -184,15 +218,6 @@ function ProvidersSection(props: Readonly<{
       setName("");
       setSlug("");
       props.onChanged("Провайдер создан");
-    } catch (e) {
-      props.onError((e as Error).message);
-    }
-  };
-
-  const toggleProvider = async (provider: AIProviderItem) => {
-    try {
-      await aiApi.patchProvider(provider.id, { enabled: !provider.enabled });
-      props.onChanged(provider.enabled ? "Провайдер отключён" : "Провайдер включён");
     } catch (e) {
       props.onError((e as Error).message);
     }
@@ -248,20 +273,13 @@ function ProvidersSection(props: Readonly<{
       ) : (
         props.providers.map((provider) => (
           <div key={provider.id} style={{ marginBottom: 24 }}>
-            <div className="toolbar" style={{ alignItems: "center" }}>
-              <strong>{provider.name}</strong>
-              <span className="badge">{aiProtocolLabel(provider.protocol)}</span>
-              {unsupported.has(provider.protocol) && (
-                <span className="badge draft">адаптера нет: вызовы упадут</span>
-              )}
-              <span className="muted">slug: {provider.slug}</span>
-              <span className={provider.enabled ? "badge confirmed" : "badge draft"}>
-                {provider.enabled ? "включён" : "отключён"}
-              </span>
-              <button type="button" onClick={() => toggleProvider(provider)}>
-                {provider.enabled ? "Отключить" : "Включить"}
-              </button>
-            </div>
+            <ProviderRow
+              provider={provider}
+              unsupported={unsupported.has(provider.protocol)}
+              protocols={props.protocols}
+              onChanged={props.onChanged}
+              onError={props.onError}
+            />
             <EndpointsBlock
               provider={provider}
               endpoints={props.endpoints[provider.id] ?? []}
@@ -275,6 +293,124 @@ function ProvidersSection(props: Readonly<{
         ))
       )}
     </div>
+  );
+}
+
+function ProviderRow(props: Readonly<{
+  provider: AIProviderItem;
+  unsupported: boolean;
+  protocols: Array<{ value: string; supported: boolean }>;
+  onChanged: (message: string) => void;
+  onError: (message: string) => void;
+}>) {
+  const { provider } = props;
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(provider.name);
+  const [slug, setSlug] = useState(provider.slug);
+  const [protocol, setProtocol] = useState(provider.protocol);
+  const [priority, setPriority] = useState(provider.priority);
+
+  const toggle = async () => {
+    try {
+      await aiApi.patchProvider(provider.id, { enabled: !provider.enabled });
+      props.onChanged(provider.enabled ? "Провайдер отключён" : "Провайдер включён");
+    } catch (e) {
+      props.onError((e as Error).message);
+    }
+  };
+
+  const save = async () => {
+    try {
+      await aiApi.patchProvider(provider.id, {
+        name,
+        slug,
+        protocol,
+        priority,
+      });
+      setEditing(false);
+      props.onChanged("Провайдер изменён");
+    } catch (e) {
+      props.onError((e as Error).message);
+    }
+  };
+
+  return (
+    <>
+      <div className="toolbar" style={{ alignItems: "center" }}>
+        <strong>{provider.name}</strong>
+        <span className="badge">{aiProtocolLabel(provider.protocol)}</span>
+        {props.unsupported && (
+          <span className="badge draft">адаптера нет: вызовы упадут</span>
+        )}
+        <span className="muted">slug: {provider.slug}</span>
+        <span className={provider.enabled ? "badge confirmed" : "badge draft"}>
+          {provider.enabled ? "включён" : "отключён"}
+        </span>
+        <button type="button" onClick={toggle}>
+          {provider.enabled ? "Отключить" : "Включить"}
+        </button>
+        <button type="button" onClick={() => setEditing(!editing)}>
+          {editing ? "Отменить" : "Изменить"}
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            runDelete(
+              `провайдера «${provider.name}»`,
+              () => aiApi.deleteProvider(provider.id),
+              props.onChanged,
+              props.onError
+            )
+          }
+        >
+          Удалить
+        </button>
+      </div>
+
+      {editing && (
+        <div className="toolbar">
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            aria-label="Название провайдера"
+          />
+          <input
+            type="text"
+            value={slug}
+            onChange={(e) => setSlug(e.target.value)}
+            aria-label="Slug провайдера"
+          />
+          <select
+            value={protocol}
+            onChange={(e) => setProtocol(e.target.value)}
+            aria-label="Протокол провайдера"
+          >
+            {props.protocols.map((p) => (
+              <option key={p.value} value={p.value} disabled={!p.supported}>
+                {aiProtocolLabel(p.value)}
+                {p.supported ? "" : " — адаптер не реализован"}
+              </option>
+            ))}
+          </select>
+          <label>
+            Приоритет{" "}
+            <input
+              type="number"
+              min={0}
+              max={1000}
+              value={priority}
+              onChange={(e) => setPriority(Number(e.target.value) || 0)}
+              aria-label="Приоритет провайдера"
+              style={{ minWidth: 90 }}
+            />
+          </label>
+          <button type="button" className="primary" onClick={save}>
+            Сохранить провайдера
+          </button>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -412,6 +548,26 @@ function EndpointRow(props: Readonly<{
   const { endpoint } = props;
   const [newKey, setNewKey] = useState("");
   const [testing, setTesting] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(endpoint.name);
+  const [baseUrl, setBaseUrl] = useState(endpoint.base_url);
+  const [timeoutSeconds, setTimeoutSeconds] = useState(endpoint.timeout_seconds);
+  const [maxRetries, setMaxRetries] = useState(endpoint.max_retries);
+
+  const saveEndpoint = async () => {
+    try {
+      await aiApi.patchEndpoint(endpoint.id, {
+        name,
+        base_url: baseUrl,
+        timeout_seconds: timeoutSeconds,
+        max_retries: maxRetries,
+      });
+      setEditing(false);
+      props.onChanged("Эндпоинт изменён");
+    } catch (e) {
+      props.onError((e as Error).message);
+    }
+  };
 
   const rotateKey = async () => {
     if (!newKey) return;
@@ -470,7 +626,68 @@ function EndpointRow(props: Readonly<{
         <button type="button" onClick={runTest} disabled={testing}>
           {testing ? "Проверка..." : "Проверить подключение"}
         </button>
+        <button type="button" onClick={() => setEditing(!editing)}>
+          {editing ? "Отменить" : "Изменить"}
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            runDelete(
+              `эндпоинт «${endpoint.name}»`,
+              () => aiApi.deleteEndpoint(endpoint.id),
+              props.onChanged,
+              props.onError
+            )
+          }
+        >
+          Удалить
+        </button>
       </div>
+
+      {editing && (
+        <div className="toolbar">
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            aria-label="Название эндпоинта"
+          />
+          <input
+            type="text"
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            aria-label="Базовый URL эндпоинта"
+            style={{ minWidth: 280 }}
+          />
+          <label>
+            Таймаут, с{" "}
+            <input
+              type="number"
+              min={1}
+              max={600}
+              value={timeoutSeconds}
+              onChange={(e) => setTimeoutSeconds(Number(e.target.value) || 60)}
+              aria-label="Таймаут эндпоинта"
+              style={{ minWidth: 90 }}
+            />
+          </label>
+          <label>
+            Повторы{" "}
+            <input
+              type="number"
+              min={0}
+              max={5}
+              value={maxRetries}
+              onChange={(e) => setMaxRetries(Number(e.target.value) || 0)}
+              aria-label="Повторные попытки эндпоинта"
+              style={{ minWidth: 80 }}
+            />
+          </label>
+          <button type="button" className="primary" onClick={saveEndpoint}>
+            Сохранить эндпоинт
+          </button>
+        </div>
+      )}
 
       {props.testResult && (
         <p className={props.testResult.success ? "muted" : "error"}>
@@ -625,36 +842,140 @@ function ModelsBlock(props: Readonly<{
           </thead>
           <tbody>
             {props.models.map((model) => (
-              <tr key={model.id}>
-                <td>{model.model_id}</td>
-                <td>{model.display_name}</td>
-                <td>{model.context_window ?? "—"}</td>
-                <td>{model.max_output_tokens ?? "—"}</td>
-                <td className="muted">
-                  {[
-                    model.supports_json_schema && "JSON-схема",
-                    model.supports_structured_output && "структурный вывод",
-                    model.supports_streaming && "поток",
-                  ]
-                    .filter(Boolean)
-                    .join(", ") || "—"}
-                </td>
-                <td>
-                  <span className={model.enabled ? "badge confirmed" : "badge draft"}>
-                    {model.enabled ? "включена" : "отключена"}
-                  </span>
-                </td>
-                <td>
-                  <button type="button" onClick={() => toggleModel(model)}>
-                    {model.enabled ? "Отключить" : "Включить"}
-                  </button>
-                </td>
-              </tr>
+              <ModelRow
+                key={model.id}
+                model={model}
+                onToggle={toggleModel}
+                onChanged={props.onChanged}
+                onError={props.onError}
+              />
             ))}
           </tbody>
         </table>
       )}
     </div>
+  );
+}
+
+function ModelRow(props: Readonly<{
+  model: AIModelItem;
+  onToggle: (model: AIModelItem) => void;
+  onChanged: (message: string) => void;
+  onError: (message: string) => void;
+}>) {
+  const { model } = props;
+  const [editing, setEditing] = useState(false);
+  const [modelId, setModelId] = useState(model.model_id);
+  const [displayName, setDisplayName] = useState(model.display_name);
+  const [contextWindow, setContextWindow] = useState(
+    model.context_window ? String(model.context_window) : ""
+  );
+  const [maxOutputTokens, setMaxOutputTokens] = useState(
+    model.max_output_tokens ? String(model.max_output_tokens) : ""
+  );
+
+  const save = async () => {
+    try {
+      await aiApi.patchModel(model.id, {
+        model_id: modelId,
+        display_name: displayName,
+        context_window: contextWindow ? Number(contextWindow) : null,
+        max_output_tokens: maxOutputTokens ? Number(maxOutputTokens) : null,
+      });
+      setEditing(false);
+      props.onChanged("Модель изменена");
+    } catch (e) {
+      props.onError((e as Error).message);
+    }
+  };
+
+  if (editing) {
+    return (
+      <tr>
+        <td colSpan={7}>
+          <div className="toolbar">
+            <input
+              type="text"
+              value={modelId}
+              onChange={(e) => setModelId(e.target.value)}
+              aria-label="Идентификатор модели"
+            />
+            <input
+              type="text"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              aria-label="Отображаемое имя модели"
+            />
+            <input
+              type="text"
+              value={contextWindow}
+              onChange={(e) => setContextWindow(e.target.value)}
+              placeholder="Контекстное окно"
+              aria-label="Контекстное окно модели"
+              style={{ minWidth: 120 }}
+            />
+            <input
+              type="text"
+              value={maxOutputTokens}
+              onChange={(e) => setMaxOutputTokens(e.target.value)}
+              placeholder="Макс. токенов ответа"
+              aria-label="Максимум токенов ответа модели"
+              style={{ minWidth: 130 }}
+            />
+            <button type="button" className="primary" onClick={save}>
+              Сохранить модель
+            </button>
+            <button type="button" onClick={() => setEditing(false)}>
+              Отменить
+            </button>
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
+  return (
+    <tr>
+      <td>{model.model_id}</td>
+      <td>{model.display_name}</td>
+      <td>{model.context_window ?? "—"}</td>
+      <td>{model.max_output_tokens ?? "—"}</td>
+      <td className="muted">
+        {[
+          model.supports_json_schema && "JSON-схема",
+          model.supports_structured_output && "структурный вывод",
+          model.supports_streaming && "поток",
+        ]
+          .filter(Boolean)
+          .join(", ") || "—"}
+      </td>
+      <td>
+        <span className={model.enabled ? "badge confirmed" : "badge draft"}>
+          {model.enabled ? "включена" : "отключена"}
+        </span>
+      </td>
+      <td>
+        <button type="button" onClick={() => props.onToggle(model)}>
+          {model.enabled ? "Отключить" : "Включить"}
+        </button>{" "}
+        <button type="button" onClick={() => setEditing(true)}>
+          Изменить
+        </button>{" "}
+        <button
+          type="button"
+          onClick={() =>
+            runDelete(
+              `модель «${model.display_name}»`,
+              () => aiApi.deleteModel(model.id),
+              props.onChanged,
+              props.onError
+            )
+          }
+        >
+          Удалить
+        </button>
+      </td>
+    </tr>
   );
 }
 
