@@ -111,6 +111,20 @@ class FakeRepo:
         return [m for m in self._items.values() if getattr(m, "endpoint_id", None) == endpoint_id]
 
 
+class FakeEndpointsRepo(FakeRepo):
+    """Репозиторий эндпоинтов, запоминающий результаты connection test."""
+
+    def __init__(self, items: dict[int, object]) -> None:
+        super().__init__(items)
+        self.test_results: list[tuple[int, bool, str | None]] = []
+
+    async def record_test_result(
+        self, endpoint_id: int, *, success: bool, error_type: str | None = None
+    ):
+        self.test_results.append((endpoint_id, success, error_type))
+        return self._items.get(endpoint_id)
+
+
 class ScriptedAdapter(AIProviderAdapter):
     """Адаптер со сценарием: список результатов/ошибок по попыткам."""
 
@@ -259,3 +273,99 @@ async def test_gateway_no_candidates_raises_configuration_error():
     request = _request()
     with pytest.raises(AIConfigurationError):
         await gateway.generate(request)
+
+
+# --- Connection test -----------------------------------------------------------------
+
+
+def _test_gateway(adapter, endpoint: AIEndpoint) -> tuple[AIGateway, FakeEndpointsRepo]:
+    """Gateway для проверки подключения (endpoint/provider доступны репозиториям)."""
+    endpoints = FakeEndpointsRepo({10: endpoint})
+    providers = FakeRepo(
+        {1: AIProvider(id=1, name="P", slug="p1", protocol=AIProtocol.OPENAI_COMPATIBLE)}
+    )
+    models = FakeRepo({1: AIModel(id=1, endpoint_id=10, model_id="model-a", display_name="A")})
+    registry = ProviderAdapterRegistry()
+    registry.register(AIProtocol.OPENAI_COMPATIBLE, adapter)
+    config = AITaskConfig(id=100, task_type=AITaskType.WORKOUT_GENERATION, enabled=True)
+    tasks = FakeTasksRepo(config, [])
+    gateway = AIGateway(
+        selector=ModelSelector(
+            task_repository=tasks,
+            model_repository=models,
+            endpoint_repository=endpoints,
+            provider_repository=providers,
+        ),
+        adapter_registry=registry,
+        secret_store=InMemorySecretStore(),
+        task_repository=tasks,
+        usage_repository=FakeUsageRepo(),
+        endpoint_repository=endpoints,
+        provider_repository=providers,
+        model_repository=models,
+    )
+    return gateway, endpoints
+
+
+async def test_connection_test_success_is_persisted():
+    endpoint = AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    adapter = ScriptedAdapter([AdapterResult(content="pong", model="model-a")])
+    gateway, endpoints = _test_gateway(adapter, endpoint)
+
+    result = await gateway.test_endpoint(10)
+
+    assert result["success"] is True
+    assert result["model"] == "model-a"
+    assert endpoints.test_results == [(10, True, None)]
+
+
+async def test_connection_test_failure_persists_error_type():
+    endpoint = AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    adapter = ScriptedAdapter([AIProviderError("unauthorized", status_code=401)])
+    gateway, endpoints = _test_gateway(adapter, endpoint)
+
+    result = await gateway.test_endpoint(10)
+
+    assert result["success"] is False
+    assert result["error_type"] == "AIProviderError"
+    assert endpoints.test_results == [(10, False, "AIProviderError")]
+
+
+async def test_connection_test_unsupported_protocol_is_persisted_as_failure():
+    """Протокол без адаптера — тоже неудачная проверка, а не исключение наружу."""
+    endpoint = AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    endpoints = FakeEndpointsRepo({10: endpoint})
+    providers = FakeRepo(
+        {1: AIProvider(id=1, name="P", slug="p1", protocol=AIProtocol.ANTHROPIC)}
+    )
+    models = FakeRepo({})
+    config = AITaskConfig(id=100, task_type=AITaskType.WORKOUT_GENERATION, enabled=True)
+    tasks = FakeTasksRepo(config, [])
+    gateway = AIGateway(
+        selector=ModelSelector(
+            task_repository=tasks,
+            model_repository=models,
+            endpoint_repository=endpoints,
+            provider_repository=providers,
+        ),
+        adapter_registry=ProviderAdapterRegistry(),
+        secret_store=InMemorySecretStore(),
+        task_repository=tasks,
+        usage_repository=FakeUsageRepo(),
+        endpoint_repository=endpoints,
+        provider_repository=providers,
+        model_repository=models,
+    )
+
+    result = await gateway.test_endpoint(10)
+
+    assert result["success"] is False
+    assert result["error_type"] == "AIUnsupportedProtocolError"
+    assert endpoints.test_results == [(10, False, "AIUnsupportedProtocolError")]
+
+
+async def test_connection_test_unknown_endpoint_raises():
+    adapter = ScriptedAdapter([])
+    gateway, _, _ = _gateway(adapter)
+    with pytest.raises(AIConfigurationError):
+        await gateway.test_endpoint(999)

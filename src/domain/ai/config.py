@@ -32,6 +32,8 @@ class AIEndpoint(BaseModel):
     """Техническая точка подключения провайдера.
 
     Секрет хранится отдельно (SecretStore); здесь — только ссылка на него.
+    Результат последней проверки подключения — часть состояния эндпоинта:
+    без него нельзя честно сказать, проверялась ли конфигурация вообще.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -47,6 +49,9 @@ class AIEndpoint(BaseModel):
     max_retries: int = Field(default=2, ge=0, le=5)
     enabled: bool = True
     priority: int = Field(default=100, ge=0, le=1000)
+    last_test_at: datetime | None = None
+    last_test_status: str | None = Field(default=None, max_length=16)
+    last_test_error_type: str | None = Field(default=None, max_length=100)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
