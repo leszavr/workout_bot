@@ -247,6 +247,9 @@ export interface AIEndpointItem {
   priority: number;
   has_api_key: boolean;
   masked_api_key: string | null;
+  last_test_at: string | null;
+  last_test_status: string | null;
+  last_test_error_type: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -296,6 +299,75 @@ export interface AIEndpointTestResult {
   model: string;
   message?: string;
   error_type?: string;
+}
+
+// --- Готовность AI-конфигурации (Phase 1.1) --------------------------------------
+
+export interface AIReadinessCheck {
+  key: string;
+  title: string;
+  status: string;
+  detail: string;
+  action: string | null;
+  blocking: boolean;
+}
+
+export interface AIReadinessChainEntry {
+  priority: number;
+  is_primary: boolean;
+  provider: string;
+  endpoint: string;
+  model_id: string;
+  model_display_name: string;
+  model_pk: number | null;
+}
+
+export interface AIReadinessReport {
+  task_type: string;
+  ready: boolean;
+  checks: AIReadinessCheck[];
+  chain: AIReadinessChainEntry[];
+  protocols: Array<{ value: string; supported: boolean }>;
+  generation: {
+    primary_generator: string;
+    fallback_generator: string;
+    auto_generate_after_finalize: boolean;
+    ai_in_strategy: boolean;
+  };
+}
+
+export interface AIUsageItem {
+  id: number;
+  task_type: string;
+  provider_id: number | null;
+  endpoint_id: number | null;
+  model_id: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+  latency_ms: number | null;
+  status: string;
+  error_type: string | null;
+  created_at: string | null;
+}
+
+export interface AIAuditItem {
+  id: number;
+  event_type: string;
+  actor: string | null;
+  entity_type: string | null;
+  entity_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+}
+
+export interface AIPromptItem {
+  id: number;
+  task_type: string;
+  version: number;
+  name: string;
+  enabled: boolean;
+  created_at: string | null;
 }
 
 export const aiApi = {
@@ -360,6 +432,16 @@ export const aiApi = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+  readiness: (taskType = "workout_generation") =>
+    request<AIReadinessReport>(
+      `/api/v1/admin/ai/readiness?task_type=${taskType}`
+    ),
+  usage: () => request<ListResponse<AIUsageItem>>("/api/v1/admin/ai/usage"),
+  audit: () => request<ListResponse<AIAuditItem>>("/api/v1/admin/ai/audit"),
+  prompts: (taskType = "workout_generation") =>
+    request<ListResponse<AIPromptItem> & { next_version: number }>(
+      `/api/v1/admin/ai/prompts/${taskType}`
+    ),
 };
 
 // --- AI Providers для UI (публичный API) ----------------------------------------

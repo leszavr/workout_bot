@@ -2,32 +2,43 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import AIObservability from "@/components/AIObservability";
+import AIQuickSetup from "@/components/AIQuickSetup";
+import AIReadinessPanel from "@/components/AIReadinessPanel";
 import AppNav from "@/components/AppNav";
 import {
   aiApi,
+  AIAuditItem,
   AIEndpointItem,
   AIEndpointTestResult,
   AIModelItem,
   AIProviderItem,
+  AIReadinessReport,
   AITaskItem,
+  AIUsageItem,
   getToken,
 } from "@/lib/api";
 import { aiProtocolLabel, aiTaskLabel } from "@/lib/labels";
 
-const PROTOCOLS = ["openai_compatible", "anthropic", "custom"];
+const MAIN_TASK_TYPE = "workout_generation";
 
 export default function AIConfigPage() {
   const [providers, setProviders] = useState<AIProviderItem[]>([]);
   const [endpoints, setEndpoints] = useState<Record<number, AIEndpointItem[]>>({});
   const [models, setModels] = useState<Record<number, AIModelItem[]>>({});
   const [tasks, setTasks] = useState<AITaskItem[]>([]);
+  const [readiness, setReadiness] = useState<AIReadinessReport | null>(null);
+  const [usage, setUsage] = useState<AIUsageItem[]>([]);
+  const [audit, setAudit] = useState<AIAuditItem[]>([]);
+  const [promptVersions, setPromptVersions] = useState<number[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
   const [testResults, setTestResults] = useState<Record<number, AIEndpointTestResult>>({});
 
   const flash = (message: string) => {
     setNotice(message);
-    window.setTimeout(() => setNotice(""), 4000);
+    window.setTimeout(() => setNotice(""), 6000);
   };
 
   const loadProviders = useCallback(async () => {
@@ -52,15 +63,48 @@ export default function AIConfigPage() {
     setTasks(data.items);
   }, []);
 
+  const loadStatus = useCallback(async () => {
+    const [report, usageData, auditData, prompts] = await Promise.all([
+      aiApi.readiness(MAIN_TASK_TYPE),
+      aiApi.usage(),
+      aiApi.audit(),
+      aiApi.prompts(MAIN_TASK_TYPE),
+    ]);
+    setReadiness(report);
+    setUsage(usageData.items);
+    setAudit(auditData.items);
+    setPromptVersions(prompts.items.filter((p) => p.enabled).map((p) => p.version));
+  }, []);
+
+  const reloadAll = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([loadProviders(), loadTasks(), loadStatus()]);
+      setError("");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadProviders, loadTasks, loadStatus]);
+
   useEffect(() => {
     if (!getToken()) {
       window.location.href = "/login";
       return;
     }
-    Promise.all([loadProviders(), loadTasks()]).catch((e) => setError(e.message));
-  }, [loadProviders, loadTasks]);
+    reloadAll().catch((e) => setError(e.message));
+  }, [reloadAll]);
 
   const allModels: AIModelItem[] = Object.values(models).flat();
+  const supportedProtocols = readiness?.protocols ?? [
+    { value: "openai_compatible", supported: true },
+  ];
+
+  const onChanged = (message: string) => {
+    flash(message);
+    reloadAll().catch((e) => setError(e.message));
+  };
 
   return (
     <div className="app-shell">
@@ -70,15 +114,25 @@ export default function AIConfigPage() {
         {error && <div className="error">{error}</div>}
         {notice && <div className="badge confirmed">{notice}</div>}
 
+        <AIReadinessPanel
+          report={readiness}
+          refreshing={refreshing}
+          onRefresh={() => reloadAll().catch((e) => setError(e.message))}
+        />
+
+        <AIQuickSetup
+          taskType={MAIN_TASK_TYPE}
+          onFinished={onChanged}
+          onError={setError}
+        />
+
         <ProvidersSection
           providers={providers}
           endpoints={endpoints}
           models={models}
+          protocols={supportedProtocols}
           testResults={testResults}
-          onChanged={(message) => {
-            flash(message);
-            loadProviders().catch((e) => setError(e.message));
-          }}
+          onChanged={onChanged}
           onError={setError}
           onTestResult={(endpointId, result) =>
             setTestResults((prev) => ({ ...prev, [endpointId]: result }))
@@ -88,11 +142,20 @@ export default function AIConfigPage() {
         <TasksSection
           tasks={tasks}
           allModels={allModels}
-          onChanged={(message) => {
-            flash(message);
-            loadTasks().catch((e) => setError(e.message));
-          }}
+          endpoints={endpoints}
+          providers={providers}
+          promptVersions={promptVersions}
+          onChanged={onChanged}
           onError={setError}
+        />
+
+        <AIObservability
+          usage={usage}
+          audit={audit}
+          models={allModels}
+          providers={providers}
+          refreshing={refreshing}
+          onRefresh={() => reloadAll().catch((e) => setError(e.message))}
         />
       </main>
     </div>
@@ -105,6 +168,7 @@ function ProvidersSection(props: Readonly<{
   providers: AIProviderItem[];
   endpoints: Record<number, AIEndpointItem[]>;
   models: Record<number, AIModelItem[]>;
+  protocols: Array<{ value: string; supported: boolean }>;
   testResults: Record<number, AIEndpointTestResult>;
   onChanged: (message: string) => void;
   onError: (message: string) => void;
@@ -134,9 +198,19 @@ function ProvidersSection(props: Readonly<{
     }
   };
 
+  const unsupported = new Set(
+    props.protocols.filter((p) => !p.supported).map((p) => p.value)
+  );
+
   return (
     <div className="card">
-      <h2 className="section-title">Провайдеры</h2>
+      <h2 className="section-title" style={{ marginTop: 0 }}>
+        Провайдеры (экспертный режим)
+      </h2>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Провайдер — группировка эндпоинтов с общим протоколом. Сам по себе он
+        ничего не делает: нужны эндпоинт с ключом и модель.
+      </p>
       <div className="toolbar">
         <input
           type="text"
@@ -157,9 +231,10 @@ function ProvidersSection(props: Readonly<{
           onChange={(e) => setProtocol(e.target.value)}
           aria-label="Протокол"
         >
-          {PROTOCOLS.map((p) => (
-            <option key={p} value={p}>
-              {aiProtocolLabel(p)}
+          {props.protocols.map((p) => (
+            <option key={p.value} value={p.value} disabled={!p.supported}>
+              {aiProtocolLabel(p.value)}
+              {p.supported ? "" : " — адаптер не реализован"}
             </option>
           ))}
         </select>
@@ -176,7 +251,13 @@ function ProvidersSection(props: Readonly<{
             <div className="toolbar" style={{ alignItems: "center" }}>
               <strong>{provider.name}</strong>
               <span className="badge">{aiProtocolLabel(provider.protocol)}</span>
+              {unsupported.has(provider.protocol) && (
+                <span className="badge draft">адаптера нет: вызовы упадут</span>
+              )}
               <span className="muted">slug: {provider.slug}</span>
+              <span className={provider.enabled ? "badge confirmed" : "badge draft"}>
+                {provider.enabled ? "включён" : "отключён"}
+              </span>
               <button type="button" onClick={() => toggleProvider(provider)}>
                 {provider.enabled ? "Отключить" : "Включить"}
               </button>
@@ -236,7 +317,7 @@ function EndpointsBlock(props: Readonly<{
       <div className="toolbar">
         <input
           type="text"
-          placeholder="Название эндпоинта"
+          placeholder="Понятное имя (например, основной)"
           value={name}
           onChange={(e) => setName(e.target.value)}
           aria-label="Название эндпоинта"
@@ -256,22 +337,30 @@ function EndpointsBlock(props: Readonly<{
           onChange={(e) => setApiKey(e.target.value)}
           aria-label="API-ключ"
         />
-        <input
-          type="text"
-          placeholder="Таймаут, с"
-          value={timeoutSeconds}
-          onChange={(e) => setTimeoutSeconds(Number(e.target.value) || 60)}
-          aria-label="Таймаут"
-          style={{ minWidth: 90 }}
-        />
-        <input
-          type="text"
-          placeholder="Повторные попытки"
-          value={maxRetries}
-          onChange={(e) => setMaxRetries(Number(e.target.value) || 0)}
-          aria-label="Повторные попытки"
-          style={{ minWidth: 80 }}
-        />
+        <label>
+          Таймаут, с{" "}
+          <input
+            type="number"
+            min={1}
+            max={600}
+            value={timeoutSeconds}
+            onChange={(e) => setTimeoutSeconds(Number(e.target.value) || 60)}
+            aria-label="Таймаут"
+            style={{ minWidth: 90 }}
+          />
+        </label>
+        <label>
+          Повторы{" "}
+          <input
+            type="number"
+            min={0}
+            max={5}
+            value={maxRetries}
+            onChange={(e) => setMaxRetries(Number(e.target.value) || 0)}
+            aria-label="Повторные попытки"
+            style={{ minWidth: 80 }}
+          />
+        </label>
         <button type="button" className="primary" onClick={createEndpoint}>
           Создать эндпоинт
         </button>
@@ -293,6 +382,22 @@ function EndpointsBlock(props: Readonly<{
         ))
       )}
     </div>
+  );
+}
+
+function ConnectionBadge(props: Readonly<{ endpoint: AIEndpointItem }>) {
+  const { last_test_status: status, last_test_at: at } = props.endpoint;
+  if (!status) {
+    return <span className="badge draft">подключение не проверялось</span>;
+  }
+  const when = at ? new Date(at).toLocaleString("ru-RU") : "";
+  if (status === "success") {
+    return <span className="badge confirmed">подключение: ✓ {when}</span>;
+  }
+  return (
+    <span className="badge draft">
+      подключение: ✗ {props.endpoint.last_test_error_type ?? "ошибка"}
+    </span>
   );
 }
 
@@ -324,6 +429,11 @@ function EndpointRow(props: Readonly<{
     try {
       const result = await aiApi.testEndpoint(endpoint.id);
       props.onTestResult(endpoint.id, result);
+      props.onChanged(
+        result.success
+          ? `Подключение «${endpoint.name}» успешно (${result.latency_ms} мс)`
+          : `Подключение «${endpoint.name}» не удалось: ${result.error_type ?? "ошибка"}`
+      );
     } catch (e) {
       props.onError((e as Error).message);
     } finally {
@@ -353,6 +463,7 @@ function EndpointRow(props: Readonly<{
         ) : (
           <span className="badge draft">ключ не задан</span>
         )}
+        <ConnectionBadge endpoint={endpoint} />
         <button type="button" onClick={toggleEndpoint}>
           {endpoint.enabled ? "Отключить" : "Включить"}
         </button>
@@ -552,12 +663,34 @@ function ModelsBlock(props: Readonly<{
 function TasksSection(props: Readonly<{
   tasks: AITaskItem[];
   allModels: AIModelItem[];
+  endpoints: Record<number, AIEndpointItem[]>;
+  providers: AIProviderItem[];
+  promptVersions: number[];
   onChanged: (message: string) => void;
   onError: (message: string) => void;
 }>) {
+  // Модель понятна только вместе с её эндпоинтом и провайдером.
+  const modelLabel = (pk: number) => {
+    const model = props.allModels.find((m) => m.id === pk);
+    if (!model) return `#${pk}`;
+    const endpoint = Object.values(props.endpoints)
+      .flat()
+      .find((e) => e.id === model.endpoint_id);
+    const provider = props.providers.find((p) => p.id === endpoint?.provider_id);
+    const context = [endpoint?.name, provider?.name].filter(Boolean).join(" · ");
+    const suffix = model.enabled ? "" : " · отключена";
+    return `${model.display_name} (${model.model_id})${context ? ` — ${context}` : ""}${suffix}`;
+  };
+
   return (
     <div className="card">
-      <h2 className="section-title">AI-задачи</h2>
+      <h2 className="section-title" style={{ marginTop: 0 }}>
+        AI-задачи
+      </h2>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Реально вызывается только «Генерация программы тренировок». Остальные
+        задачи — задел на будущее: их настройка ни на что не влияет.
+      </p>
       {props.tasks.length === 0 ? (
         <p className="muted">Загрузка...</p>
       ) : (
@@ -566,6 +699,8 @@ function TasksSection(props: Readonly<{
             key={task.task_type}
             task={task}
             allModels={props.allModels}
+            modelLabel={modelLabel}
+            promptVersions={props.promptVersions}
             onChanged={props.onChanged}
             onError={props.onError}
           />
@@ -578,6 +713,8 @@ function TasksSection(props: Readonly<{
 function TaskRow(props: Readonly<{
   task: AITaskItem;
   allModels: AIModelItem[];
+  modelLabel: (pk: number) => string;
+  promptVersions: number[];
   onChanged: (message: string) => void;
   onError: (message: string) => void;
 }>) {
@@ -585,15 +722,18 @@ function TaskRow(props: Readonly<{
   const [enabled, setEnabled] = useState(task.enabled);
   const [temperature, setTemperature] = useState(task.temperature);
   const [maxTokens, setMaxTokens] = useState(task.max_tokens ?? 0);
+  const [timeoutSeconds, setTimeoutSeconds] = useState(task.timeout_seconds);
   const [promptVersion, setPromptVersion] = useState(task.prompt_version ?? 0);
   const [selectedModels, setSelectedModels] = useState<number[]>(
     task.bindings.map((b) => b.model_id)
   );
+  const isActiveTask = task.task_type === MAIN_TASK_TYPE;
 
   useEffect(() => {
     setEnabled(task.enabled);
     setTemperature(task.temperature);
     setMaxTokens(task.max_tokens ?? 0);
+    setTimeoutSeconds(task.timeout_seconds);
     setPromptVersion(task.prompt_version ?? 0);
     setSelectedModels(task.bindings.map((b) => b.model_id));
   }, [task]);
@@ -604,6 +744,9 @@ function TaskRow(props: Readonly<{
         enabled,
         temperature,
         max_tokens: maxTokens > 0 ? maxTokens : null,
+        // Без этого поля backend молча сбрасывал таймаут задачи на значение
+        // по умолчанию при каждом сохранении.
+        timeout_seconds: timeoutSeconds,
         prompt_version: promptVersion > 0 ? promptVersion : null,
         model_ids: selectedModels,
       });
@@ -621,16 +764,16 @@ function TaskRow(props: Readonly<{
     setSelectedModels(next);
   };
 
-  const modelName = (pk: number) => {
-    const model = props.allModels.find((m) => m.id === pk);
-    return model ? `${model.display_name} (${model.model_id})` : `#${pk}`;
-  };
-
   return (
     <div className="card" style={{ padding: 14 }}>
       <div className="toolbar" style={{ alignItems: "center" }}>
         <strong>{aiTaskLabel(task.task_type)}</strong>
         <span className="muted">({task.task_type})</span>
+        {isActiveTask ? (
+          <span className="badge">используется системой</span>
+        ) : (
+          <span className="badge draft">не вызывается кодом</span>
+        )}
         <label>
           <input
             type="checkbox"
@@ -645,34 +788,61 @@ function TaskRow(props: Readonly<{
         <label>
           Температура{" "}
           <input
-            type="text"
+            type="number"
+            min={0}
+            max={2}
+            step={0.1}
             value={temperature}
             onChange={(e) => setTemperature(Number(e.target.value) || 0)}
             aria-label="Температура"
-            style={{ minWidth: 70 }}
+            style={{ minWidth: 90 }}
           />
         </label>
         <label>
           Макс. токенов{" "}
           <input
-            type="text"
+            type="number"
+            min={0}
             value={maxTokens}
             onChange={(e) => setMaxTokens(Number(e.target.value) || 0)}
             aria-label="Максимум токенов"
+            style={{ minWidth: 110 }}
+          />
+        </label>
+        <label>
+          Таймаут, с{" "}
+          <input
+            type="number"
+            min={1}
+            max={600}
+            value={timeoutSeconds}
+            onChange={(e) => setTimeoutSeconds(Number(e.target.value) || 120)}
+            aria-label="Таймаут задачи"
             style={{ minWidth: 90 }}
           />
         </label>
         <label>
           Версия промпта{" "}
           <input
-            type="text"
+            type="number"
+            min={0}
             value={promptVersion}
             onChange={(e) => setPromptVersion(Number(e.target.value) || 0)}
             aria-label="Версия промпта"
-            style={{ minWidth: 70 }}
+            style={{ minWidth: 90 }}
           />
         </label>
       </div>
+      {isActiveTask && (
+        <p className="muted" style={{ marginTop: 0 }}>
+          {props.promptVersions.length > 0
+            ? `Версии промпта в базе: ${props.promptVersions
+                .map((v) => `v${v}`)
+                .join(", ")}. `
+            : "Версий промпта в базе нет: используется файловый промпт проекта. "}
+          0 — версия по умолчанию. Несуществующую версию сервер не примет.
+        </p>
+      )}
 
       <div className="section-title">Модели (порядок: основная → резервные)</div>
       {selectedModels.length === 0 ? (
@@ -682,7 +852,7 @@ function TaskRow(props: Readonly<{
           {selectedModels.map((pk, index) => (
             <li key={pk}>
               {index === 0 ? "Основная: " : `Резервная ${index}: `}
-              {modelName(pk)}{" "}
+              {props.modelLabel(pk)}{" "}
               <button type="button" onClick={() => moveModel(index, -1)}>
                 ↑
               </button>{" "}
@@ -719,7 +889,7 @@ function TaskRow(props: Readonly<{
           </option>
           {props.allModels.map((model) => (
             <option key={model.id} value={model.id}>
-              {model.display_name} ({model.model_id})
+              {props.modelLabel(model.id)}
             </option>
           ))}
         </select>
