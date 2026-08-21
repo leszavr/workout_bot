@@ -10,6 +10,7 @@ request/response DTO; database-модели наружу не возвращаю
 """
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -113,6 +114,9 @@ class EndpointOut(BaseModel):
     priority: int
     has_api_key: bool = False
     masked_api_key: str | None = None
+    last_test_at: str | None = None
+    last_test_status: str | None = None
+    last_test_error_type: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -254,6 +258,9 @@ async def _endpoint_out(components, endpoint: AIEndpoint) -> EndpointOut:
         priority=endpoint.priority,
         has_api_key=has_key,
         masked_api_key=masked,
+        last_test_at=_iso(endpoint.last_test_at),
+        last_test_status=endpoint.last_test_status,
+        last_test_error_type=endpoint.last_test_error_type,
         created_at=_iso(endpoint.created_at),
         updated_at=_iso(endpoint.updated_at),
     )
@@ -612,6 +619,10 @@ async def put_task(
         prompt_version=body.prompt_version,
     )
     try:
+        # Включение задачи в заведомо нерабочем состоянии запрещено на сервере,
+        # а не только в UI.
+        if config.enabled:
+            await components.readiness.validate_enable(config, body.model_ids)
         saved, bindings = await components.admin.configure_task(
             config, model_pks=body.model_ids, actor=admin
         )
@@ -698,6 +709,21 @@ async def create_prompt(
 
 
 # --- Observability ----------------------------------------------------------------
+
+
+@router.get("/readiness")
+async def task_readiness(
+    _: Annotated[str, Depends(require_admin)],
+    task_type: AITaskType = AITaskType.WORKOUT_GENERATION,
+) -> dict:
+    """Сводная готовность AI-задачи: чек-лист, эффективная цепочка, стратегия.
+
+    Живых запросов к провайдеру не выполняет: используется сохранённый
+    результат последней проверки подключения.
+    """
+    components = build_ai_components()
+    report = await components.readiness.report(task_type)
+    return asdict(report)
 
 
 @router.get("/usage")

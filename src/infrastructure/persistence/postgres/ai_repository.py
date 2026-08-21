@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -19,7 +21,7 @@ from src.domain.ai.config import (
     AIUsageRecord,
     PromptTemplate,
 )
-from src.domain.ai.enums import AITaskType
+from src.domain.ai.enums import AITaskType, AIUsageStatus
 from src.errors import ProfilePersistenceError
 from src.infrastructure.persistence.postgres.models import (
     AIAuditEventRow,
@@ -177,6 +179,9 @@ class AIEndpointRepository:
             max_retries=row.max_retries,
             enabled=row.enabled,
             priority=row.priority,
+            last_test_at=row.last_test_at,
+            last_test_status=row.last_test_status,
+            last_test_error_type=row.last_test_error_type,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -268,6 +273,23 @@ class AIEndpointRepository:
             ) from exc
         except SQLAlchemyError as exc:
             raise _persistence_error(exc, "Не удалось удалить эндпоинт") from exc
+
+    async def record_test_result(
+        self, endpoint_id: int, *, success: bool, error_type: str | None = None
+    ) -> AIEndpoint | None:
+        """Сохраняет результат проверки подключения.
+
+        Пишется только технический результат: время, статус и класс ошибки.
+        Ни ключ, ни текст ответа провайдера здесь не сохраняются.
+        """
+        return await self.update(
+            endpoint_id,
+            last_test_at=datetime.now(timezone.utc),
+            last_test_status=(
+                AIUsageStatus.SUCCESS.value if success else AIUsageStatus.ERROR.value
+            ),
+            last_test_error_type=None if success else (error_type or "UnknownError")[:100],
+        )
 
 
 # --- Models --------------------------------------------------------------------

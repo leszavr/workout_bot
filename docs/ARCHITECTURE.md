@@ -24,6 +24,9 @@
 │       orchestrator (primary/fallback), html_renderer,      │
 │       html_service, telegram_delivery, pipeline            │
 │   src/application/media         — ExerciseMediaService     │
+│   src/application/ai            — AI Gateway, ModelSelector,│
+│       AIConfigurationService, AIReadinessService,           │
+│       AIProgramGenerator, PromptLoader                     │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
 ┌────────────────────────────────────────────────────────────┐
@@ -71,6 +74,11 @@
   (`exercise_media`: storage_key, checksum, размеры, лицензия, источник).
   MinIO не является частью Git; воспроизводимость обеспечивается
   импортёром `scripts/import_exercise_media.py` + исходным репозиторием.
+- `ai_endpoints` хранит результат последней проверки подключения
+  (`last_test_at`, `last_test_status`, `last_test_error_type`) — только время,
+  статус и класс ошибки, без ключей и тела ответа провайдера. Это состояние,
+  а не конфигурация: без него нельзя отличить «не проверялось» от
+  «проверка провалилась».
 
 ## Внутренний веб-интерфейс
 
@@ -300,6 +308,43 @@ Admin UI / HTML Renderer / GET /api/v1/media/exercises/...
   отдаёт WebP из MinIO с `Cache-Control: public, max-age=86400, immutable`;
   несуществующее упражнение/изображение → 404.
 - Admin UI показывает фото упражнений на карточке упражнения.
+
+## Готовность AI-конфигурации (Phase 1.1)
+
+```
+AIProviderRepository / AIEndpointRepository / AIModelRepository
+AITaskConfigRepository / PromptTemplateRepository / ModelSelector
+ProviderAdapterRegistry / generation strategy (env)
+                    ↓
+            AIReadinessService
+                    ↓
+   report()  →  чек-лист + эффективная цепочка + стратегия
+   validate_enable()  →  запрет включения нерабочей задачи
+```
+
+`AIReadinessService` (`src/application/ai/readiness.py`) — единственное место,
+где определено, что значит «AI готов». Оно же используется как guard при
+включении задачи, поэтому UI и сервер не могут разойтись в трактовке.
+
+- Отчёт не выполняет запросов к провайдеру: читается конфигурация и
+  сохранённый результат последней проверки подключения.
+- Эффективная цепочка строится `ModelSelector`, но дополнительно
+  отфильтровывается по наличию адаптера протокола: селектор о реестре
+  адаптеров не знает, а невызываемый кандидат не должен выглядеть рабочим.
+- Список поддерживаемых протоколов берётся из `ProviderAdapterRegistry`,
+  а не из константы в UI.
+- Стратегия генерации (`PROGRAM_PRIMARY_GENERATOR`,
+  `PROGRAM_FALLBACK_GENERATOR`, `AUTO_GENERATE_PROGRAM_AFTER_FINALIZE`)
+  инжектируется фабрикой зависимостей: application-слой не читает
+  конфигурацию напрямую.
+- `PUT /api/v1/admin/ai/tasks/{task_type}` с `enabled=true` проходит
+  `validate_enable` → 422 при отсутствии работоспособной модели, протоколе
+  без адаптера или несуществующей версии промпта.
+- `AIGateway.test_endpoint` сохраняет результат проверки через
+  `AIEndpointRepository.record_test_result`; сбой записи не ломает сам тест.
+
+Endpoint: `GET /api/v1/admin/ai/readiness?task_type=...` (admin-only).
+Подробности и осознанные ограничения — `AI.md`.
 
 ## Запуск
 

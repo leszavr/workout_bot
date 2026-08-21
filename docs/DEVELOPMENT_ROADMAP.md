@@ -10,20 +10,33 @@
 - [x] описать эксплуатацию и AI;
 - [x] ввести правила поддержания документации.
 
-## Phase 1 — Production readiness: NEXT
+## Phase 1 — Production readiness: IN PROGRESS
 
-### 1.1 AI configuration UX
-- [ ] guided setup для `workout_generation`;
-- [ ] показывать только реально поддерживаемые протоколы или явно маркировать ограничения;
-- [ ] configuration health/status;
-- [ ] тест подключения до включения задачи;
-- [ ] usage/error visibility.
+### 1.1 AI configuration UX: DONE
+- [x] guided setup для `workout_generation` (мастер «Быстрое подключение AI»);
+- [x] протоколы без адаптера помечены и недоступны для выбора; сервер
+      отклоняет включение задачи на таком протоколе;
+- [x] configuration health/status (`GET /api/v1/admin/ai/readiness` + панель
+      готовности на `/ai`);
+- [x] тест подключения до включения задачи: результат проверки хранится на
+      эндпоинте, мастер включает задачу только после успешной проверки,
+      непроверенное подключение делает конфигурацию «не готовой»;
+- [x] usage/error visibility (журнал вызовов и журнал изменений конфигурации
+      в UI).
+
+**Осознанное ограничение:** прямой `PUT /tasks/{task_type}` (экспертный путь)
+не требует успешного connection test — синтетический ping может дать ложный
+негатив у части провайдеров и заблокировать рабочую настройку. Требование
+проверки закрыто мастером и статусом готовности, а сервер жёстко отклоняет
+только детерминированно нерабочие конфигурации.
 
 ### 1.2 Reliability
 - [ ] заменить MemoryStorage на устойчивое production storage;
 - [ ] проверить restart/recovery сценарии;
 - [ ] формализовать generation/delivery status model;
-- [ ] E2E idempotency и retry acceptance.
+- [ ] E2E idempotency и retry acceptance;
+- [ ] единая точка генерации: веб-кнопка «Generate Program» должна идти через
+      `ProgramGenerationOrchestrator`, а не через отдельный путь без fallback.
 
 ### 1.3 Operations and security
 - [ ] structured logging и correlation IDs;

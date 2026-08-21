@@ -34,7 +34,9 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - token accounting и audit events;
 - Admin API/UI.
 
-**Важно:** рабочая AI-конфигурация должна быть создана отдельно. Последний UI/UX аудит зафиксировал, что текущая админка делает этот процесс неудобным и может позволить создать нерабочую конфигурацию.
+**Важно:** рабочая AI-конфигурация должна быть создана отдельно. С Phase 1.1
+интерфейс `/ai` показывает, чего именно не хватает, и не даёт включить задачу
+в заведомо нерабочем состоянии.
 
 ### Этап 4 — AI Program Generator: ГОТОВО
 - минимизированный generation context без Telegram ID, имени и profile ID;
@@ -55,13 +57,29 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - ограниченные retry и admin alert;
 - rest timer в HTML.
 
+### Phase 1.1 — AI configuration UX: ГОТОВО
+- отчёт готовности AI-задачи (`GET /api/v1/admin/ai/readiness`): чек-лист
+  шагов, эффективная цепочка моделей, фактическая стратегия генерации;
+- панель готовности на `/ai` (видно, будет ли AI реально вызван);
+- мастер «Быстрое подключение AI»: провайдер → эндпоинт с ключом → модель →
+  проверка подключения → включение задачи;
+- результат connection test сохраняется (`ai_endpoints.last_test_*`):
+  «не проверялось» и «проверка провалилась» — разные состояния;
+- серверный запрет включения задачи без работоспособной модели, с протоколом
+  без адаптера или с несуществующей версией промпта;
+- журнал вызовов AI (токены, задержка, ошибки) и журнал изменений
+  конфигурации в UI;
+- протоколы без адаптера помечены и недоступны для выбора.
+
 ## Открытые проблемы и риски
 
 ### P0 — до реального production
-1. AI UI/UX: onboarding, проверка поддерживаемых протоколов, status/config health, usage/observability.
-2. Production hardening: Redis/устойчивое FSM storage, централизованные логи, error tracking/metrics, backup/restore, rate limits и эксплуатационные процедуры.
-3. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа, AI primary, deterministic fallback, delivery failure/retry.
-4. Проверка безопасности production-конфигурации и секретов.
+1. Production hardening: Redis/устойчивое FSM storage, централизованные логи, error tracking/metrics, backup/restore, rate limits и эксплуатационные процедуры.
+2. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа, AI primary, deterministic fallback, delivery failure/retry.
+3. Проверка безопасности production-конфигурации и секретов.
+4. Три пути генерации программы: Telegram идёт через оркестратор с fallback,
+   веб-кнопка «Generate Program» — по отдельному пути без fallback. Требуется
+   единая точка генерации (Phase 1.2).
 
 ### P1 — продуктовый цикл
 - повторная/явная генерация и удобный статус программы;
@@ -87,4 +105,7 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 ## Следующий приоритет
 
-Сначала устранить P0 и провести clean-environment E2E acceptance. Затем развивать пользовательский feedback/progress loop. Подробный порядок — `DEVELOPMENT_ROADMAP.md`.
+Phase 1.1 (AI configuration UX) закрыта. Далее — Phase 1.2 (reliability:
+устойчивое FSM storage, restart/recovery, единая точка генерации) и Phase 1.3
+(operations/security), затем clean-environment E2E acceptance. Подробный
+порядок — `DEVELOPMENT_ROADMAP.md`.

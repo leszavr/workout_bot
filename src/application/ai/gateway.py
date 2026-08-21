@@ -194,7 +194,11 @@ class AIGateway:
             logger.exception("Не удалось сохранить AI usage record")
 
     async def test_endpoint(self, endpoint_id: int) -> dict:
-        """Connection test: минимальный нейтральный запрос без персональных данных."""
+        """Connection test: минимальный нейтральный запрос без персональных данных.
+
+        Результат сохраняется на эндпоинте: отчёт готовности AI должен
+        отличать «подключение не проверялось» от «проверка провалилась».
+        """
         endpoint = await self._endpoints.get(endpoint_id)
         if endpoint is None:
             raise AIConfigurationError("Эндпоинт не найден")
@@ -204,41 +208,52 @@ class AIGateway:
 
         models = await self._models.list_for_endpoint(endpoint_id)
         model_id = models[0].model_id if models else "ping"
+        base = {"provider": provider.slug, "endpoint": endpoint.name, "model": model_id}
 
-        adapter = self._registry.get(provider.protocol)
-        api_key = None
-        if endpoint.secret_reference:
-            api_key = await self._secrets.get(endpoint.secret_reference)
-
-        connection = EndpointConnection(
-            base_url=endpoint.base_url,
-            api_key=api_key,
-            timeout_seconds=min(endpoint.timeout_seconds, 15),
-            max_retries=0,  # тест не должен повторять запросы
-        )
-        ping = AdapterRequest(
-            messages=[AIMessage(role="user", content="ping")],
-            temperature=0.0,
-            max_tokens=1,
-        )
         started = time.monotonic()
         try:
+            adapter = self._registry.get(provider.protocol)
+            api_key = None
+            if endpoint.secret_reference:
+                api_key = await self._secrets.get(endpoint.secret_reference)
+            connection = EndpointConnection(
+                base_url=endpoint.base_url,
+                api_key=api_key,
+                timeout_seconds=min(endpoint.timeout_seconds, 15),
+                max_retries=0,  # тест не должен повторять запросы
+            )
+            ping = AdapterRequest(
+                messages=[AIMessage(role="user", content="ping")],
+                temperature=0.0,
+                max_tokens=1,
+            )
             await adapter.generate(ping, connection, model_id)
         except AIError as exc:
+            await self._record_test_result(
+                endpoint_id, success=False, error_type=exc.__class__.__name__
+            )
             return {
+                **base,
                 "success": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
-                "provider": provider.slug,
-                "endpoint": endpoint.name,
-                "model": model_id,
                 "error_type": exc.__class__.__name__,
                 "message": str(exc),
             }
+        await self._record_test_result(endpoint_id, success=True)
         return {
+            **base,
             "success": True,
             "latency_ms": int((time.monotonic() - started) * 1000),
-            "provider": provider.slug,
-            "endpoint": endpoint.name,
-            "model": model_id,
             "message": "Connection successful",
         }
+
+    async def _record_test_result(
+        self, endpoint_id: int, *, success: bool, error_type: str | None = None
+    ) -> None:
+        """Сохранение результата не должно ломать сам тест."""
+        try:
+            await self._endpoints.record_test_result(
+                endpoint_id, success=success, error_type=error_type
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось сохранить результат проверки подключения")
