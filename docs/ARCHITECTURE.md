@@ -248,12 +248,20 @@ Telegram Delivery (document, ограниченные retry)
   `PROGRAM_FALLBACK_GENERATOR`): ai→deterministic по умолчанию,
   обратный порядок тоже поддерживается;
 - строго один fallback: primary → fallback → final failure, никаких циклов;
+- перед AI-попыткой спрашивает readiness gate (Phase 1.1.1, ниже): заведомо
+  нерабочая конфигурация не приводит к AI-запросу;
 - `GenerationInfo` в программе фиксирует запрошенный и фактический
-  генератор, `fallback_used` и причину fallback;
+  генератор, `fallback_used`, человекочитаемую причину и машиночитаемый
+  `fallback_reason_code`;
 - пользователь не получает техническую ошибку AI, если fallback сработал;
 - идемпотентность: повторный вызов после успешной генерации возвращает
   существующую валидную программу (`reused_existing=True`), новая версия
   создаётся только явным запросом или после failure.
+
+Оркестратор принимает gate и журнал fallback как две необязательные функции
+(`ai_readiness_gate`, `fallback_recorder`), а не конкретный AI-сервис. Поэтому
+он не зависит от AI-инфраструктуры и тестируется без неё; связывание
+происходит в `apps/backend/api/v1/dependencies.py`.
 
 ### Generation ≠ Delivery
 Ошибка Telegram-доставки не приводит к повторной генерации: программа уже
@@ -345,6 +353,65 @@ ProviderAdapterRegistry / generation strategy (env)
 
 Endpoint: `GET /api/v1/admin/ai/readiness?task_type=...` (admin-only).
 Подробности и осознанные ограничения — `AI.md`.
+
+## AI-инфраструктура: runtime, health, lifecycle (Phase 1.1.1)
+
+Конфигурация → health → readiness → runtime → fallback → observability
+образуют один контур на существующих компонентах. Параллельной подсистемы
+AI Health нет.
+
+```
+        AI configuration (единый источник истины)
+   ai_providers / ai_endpoints / ai_models / ai_task_configs / bindings
+        + ai_endpoints.last_test_*  + журнал usage
+                    ↓                        ↓
+      AIReadinessService          AIInfrastructureHealthService
+                    ↓                        ↓
+        runtime_gate()            infrastructure-health (дерево)
+                    ↓                        ↓
+   ProgramGenerationOrchestrator        Admin UI /ai
+                    ↓
+      fallback + reason_code → audit (ai_generation_fallback)
+                    ↓
+              fallback-events API → Admin UI
+```
+
+### Readiness влияет на runtime
+`AIReadinessService.runtime_gate(task_type)` возвращает
+`RuntimeGateDecision(allowed, reason, detail)`. Причина берётся из первого
+блокирующего шага того же чек-листа, который показывает `report()`, поэтому
+runtime и админка не могут разойтись. Оркестратор при `allowed=False` не
+делает AI-запрос и сразу переходит к детерминированному генератору.
+
+Сбой самого gate не блокирует генерацию: при неизвестном состоянии попытка
+выполняется, решение остаётся за AI.
+
+### Разделение состояний
+Три независимых измерения (`src/domain/ai/enums.py`):
+`enabled` (configuration state), `AIHealthState` (provider/endpoint),
+`AIModelAvailability` (модель). Причины fallback — `AIFallbackReason`, где
+конфигурационные причины (AI не вызывался) отделены от runtime-причин
+(AI вызывался и не смог).
+
+### AIInfrastructureHealthService (`src/application/ai/health.py`)
+Строит дерево provider → endpoint → model → task bindings динамически из
+конфигурации; собственного реестра не хранит. Health выводится из сохранённого
+connection test и последнего реального AI-вызова, поэтому чтение состояния
+дешёвое и не создаёт запросов к провайдерам. Активная проверка
+(`refresh()`) переиспользует `AIGateway.test_endpoint` — минимальный ping,
+а не генерацию программы.
+
+### Safe delete
+`AIConfigurationService` собирает зависимости до удаления
+(`provider_dependencies`, `endpoint_dependencies`, `model_dependencies`) и
+бросает `AIDependencyError` со списком блокеров → API отдаёт 409 с
+машиночитаемым `blockers`. Hard delete разрешён только без зависимостей;
+иначе применяется disable. Секреты каскадно удаляемых эндпоинтов удаляются
+из SecretStore явно, а usage/audit-история сохраняется (FK `SET NULL`).
+
+Endpoints: `GET /api/v1/admin/ai/infrastructure-health`,
+`POST /api/v1/admin/ai/infrastructure-health/refresh`,
+`GET /api/v1/admin/ai/fallback-events` (admin-only). Детали — `AI.md`.
 
 ## Запуск
 
