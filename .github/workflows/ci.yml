@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+
+jobs:
+  backend:
+    name: Backend (unit + integration)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: workout_ci
+          POSTGRES_PASSWORD: workout_ci
+          POSTGRES_DB: workout_bot_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Интеграционные тесты пропускаются без DATABASE_URL — в CI он задан,
+      # поэтому PostgreSQL-тесты выполняются реально, а не молча скипаются.
+      DATABASE_URL: postgresql+asyncpg://workout_ci:workout_ci@localhost:5432/workout_bot_ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install project
+        run: pip install -e ".[dev]"
+
+      - name: Apply migrations
+        run: alembic upgrade head
+
+      - name: Assert migrations reached head
+        run: alembic current | grep -q '(head)'
+
+      - name: Run tests
+        run: pytest -q
+
+  migrations:
+    name: Database migrations (upgrade/downgrade)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: workout_ci
+          POSTGRES_PASSWORD: workout_ci
+          POSTGRES_DB: workout_migrations_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://workout_ci:workout_ci@localhost:5432/workout_migrations_ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install project
+        run: pip install -e ".[dev]"
+
+      - name: Single alembic head
+        run: |
+          heads=$(alembic heads | grep -c '(head)')
+          test "$heads" -eq 1
+
+      # Проверяются реальные миграции, а не фиктивный create_all:
+      # чистая база → head → base → head.
+      - name: Upgrade to head on a clean database
+        run: alembic upgrade head
+
+      - name: Downgrade to base
+        run: alembic downgrade base
+
+      - name: Upgrade to head again
+        run: alembic upgrade head
+
+  frontend:
+    name: Frontend (lint + typecheck + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Production build
+        run: npm run build
