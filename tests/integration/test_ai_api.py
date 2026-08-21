@@ -349,6 +349,180 @@ def test_connection_test_endpoint_not_found(client: TestClient, auth_headers: di
     assert response.status_code == 404
 
 
+# --- Readiness (Phase 1.1) ----------------------------------------------------------
+
+
+def test_readiness_requires_auth(client: TestClient):
+    assert client.get("/api/v1/admin/ai/readiness").status_code == 401
+
+
+def test_readiness_reports_protocols_and_strategy(client: TestClient, auth_headers: dict):
+    """Отчёт готовности сообщает поддерживаемые протоколы и стратегию генерации."""
+    response = client.get("/api/v1/admin/ai/readiness", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    report = response.json()
+
+    assert report["task_type"] == "workout_generation"
+    assert isinstance(report["ready"], bool)
+    protocols = {p["value"]: p["supported"] for p in report["protocols"]}
+    assert protocols["openai_compatible"] is True
+    # Адаптеров для этих протоколов нет — UI обязан это видеть.
+    assert protocols["anthropic"] is False
+    assert protocols["custom"] is False
+    assert "primary_generator" in report["generation"]
+    keys = {c["key"] for c in report["checks"]}
+    assert {
+        "provider",
+        "endpoint",
+        "api_key",
+        "connection",
+        "model",
+        "task_models",
+        "task_enabled",
+        "prompt",
+        "generation_strategy",
+    } <= keys
+
+
+def test_readiness_without_task_models_is_not_ready(client: TestClient, auth_headers: dict):
+    """Пустая конфигурация задачи → не готова, шаги объясняют причину."""
+    report = client.get("/api/v1/admin/ai/readiness", headers=auth_headers).json()
+    checks = {c["key"]: c for c in report["checks"]}
+
+    assert report["ready"] is False
+    assert checks["task_models"]["status"] == "missing"
+    assert checks["task_enabled"]["status"] == "missing"
+    assert checks["task_models"]["action"]
+    assert report["chain"] == []
+
+
+def test_connection_test_result_is_persisted(client: TestClient, auth_headers: dict):
+    """Результат проверки подключения виден в состоянии эндпоинта и readiness."""
+    provider_id = client.post(
+        "/api/v1/admin/ai/providers",
+        headers=auth_headers,
+        json={"name": "Readiness P", "slug": "apitest-readiness"},
+    ).json()["id"]
+    endpoint = client.post(
+        f"/api/v1/admin/ai/providers/{provider_id}/endpoints",
+        headers=auth_headers,
+        json={
+            "name": "Unreachable",
+            "base_url": "https://unreachable.apitest.invalid/v1",
+            "timeout_seconds": 2,
+        },
+    ).json()
+    assert endpoint["last_test_status"] is None
+
+    result = client.post(
+        f"/api/v1/admin/ai/endpoints/{endpoint['id']}/test", headers=auth_headers
+    ).json()
+    assert result["success"] is False
+
+    endpoints = client.get(
+        f"/api/v1/admin/ai/providers/{provider_id}/endpoints", headers=auth_headers
+    ).json()["items"]
+    stored = next(e for e in endpoints if e["id"] == endpoint["id"])
+    assert stored["last_test_status"] == "error"
+    assert stored["last_test_error_type"]
+    assert stored["last_test_at"]
+
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_task_cannot_be_enabled_without_models(client: TestClient, auth_headers: dict):
+    response = client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": True, "model_ids": []},
+    )
+    assert response.status_code == 422
+    assert "модель" in response.json()["detail"]
+
+
+def test_task_cannot_be_enabled_with_disabled_model(client: TestClient, auth_headers: dict):
+    """UI-ограничение дублируется серверной проверкой."""
+    provider_id = client.post(
+        "/api/v1/admin/ai/providers",
+        headers=auth_headers,
+        json={"name": "Guard P", "slug": "apitest-guard"},
+    ).json()["id"]
+    endpoint_id = client.post(
+        f"/api/v1/admin/ai/providers/{provider_id}/endpoints",
+        headers=auth_headers,
+        json={"name": "EP", "base_url": "https://guard.apitest.example/v1"},
+    ).json()["id"]
+    model_id = client.post(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models",
+        headers=auth_headers,
+        json={"model_id": "apitest/guard", "display_name": "Guard", "enabled": False},
+    ).json()["id"]
+
+    response = client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": True, "model_ids": [model_id]},
+    )
+    assert response.status_code == 422
+    assert "отключена" in response.json()["detail"]
+
+    # Выключенную задачу с той же моделью сохранить можно: это не ложное обещание.
+    response = client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": False, "model_ids": [model_id]},
+    )
+    assert response.status_code == 200
+
+    # После включения модели задача включается и попадает в цепочку.
+    client.patch(
+        f"/api/v1/admin/ai/models/{model_id}", headers=auth_headers, json={"enabled": True}
+    )
+    response = client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": True, "model_ids": [model_id]},
+    )
+    assert response.status_code == 200, response.text
+
+    report = client.get("/api/v1/admin/ai/readiness", headers=auth_headers).json()
+    checks = {c["key"]: c for c in report["checks"]}
+    assert checks["task_enabled"]["status"] == "ok"
+    assert checks["task_models"]["status"] == "ok"
+    assert [entry["model_id"] for entry in report["chain"]] == ["apitest/guard"]
+    # Подключение не проверялось — конфигурация не считается готовой.
+    assert checks["connection"]["status"] == "missing"
+    assert report["ready"] is False
+
+
+def test_task_cannot_be_enabled_with_unknown_prompt_version(
+    client: TestClient, auth_headers: dict
+):
+    provider_id = client.post(
+        "/api/v1/admin/ai/providers",
+        headers=auth_headers,
+        json={"name": "Prompt P", "slug": "apitest-prompt"},
+    ).json()["id"]
+    endpoint_id = client.post(
+        f"/api/v1/admin/ai/providers/{provider_id}/endpoints",
+        headers=auth_headers,
+        json={"name": "EP", "base_url": "https://prompt.apitest.example/v1"},
+    ).json()["id"]
+    model_id = client.post(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models",
+        headers=auth_headers,
+        json={"model_id": "apitest/prompt", "display_name": "Prompt"},
+    ).json()["id"]
+
+    response = client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": True, "model_ids": [model_id], "prompt_version": 99},
+    )
+    assert response.status_code == 422
+    assert "v99" in response.json()["detail"]
+
+
 def test_disabled_provider_not_leaked_in_responses(client: TestClient, auth_headers: dict):
     """Отключённый провайдер остаётся в списке, но помечен disabled."""
     response = client.post(
