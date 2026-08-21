@@ -37,9 +37,22 @@ jobs:
       # Интеграционные тесты пропускаются без DATABASE_URL — в CI он задан,
       # поэтому PostgreSQL-тесты выполняются реально, а не молча скипаются.
       DATABASE_URL: postgresql+asyncpg://workout_ci:workout_ci@localhost:5432/workout_bot_ci
+      # Одноразовые значения только для CI: из них детерминированно выводится
+      # Fernet-ключ шифрования AI-секретов. Это не production-секреты.
+      JWT_SECRET: ci-only-jwt-secret-not-a-production-value
+      AI_SECRETS_KEY: ci-only-ai-secrets-key-not-a-production-value
 
     steps:
       - uses: actions/checkout@v4
+
+      # Каталог упражнений живёт во внешнем публичном репозитории. Без него
+      # часть интеграционных тестов (программы, e2e, dashboard) проверяет
+      # пустую базу и падает, поэтому каталог засевается реальными данными.
+      - name: Checkout exercise catalog
+        uses: actions/checkout@v4
+        with:
+          repository: leszavr/workout
+          path: .exercise-catalog
 
       - uses: actions/setup-python@v5
         with:
@@ -54,6 +67,9 @@ jobs:
 
       - name: Assert migrations reached head
         run: alembic current | grep -q '(head)'
+
+      - name: Import exercise catalog
+        run: python -m scripts.import_exercises .exercise-catalog
 
       - name: Run tests
         run: pytest -q
@@ -134,3 +150,45 @@ jobs:
 
       - name: Production build
         run: npm run build
+
+  report-failure:
+    name: Report CI failure
+    runs-on: ubuntu-latest
+    needs: [backend, migrations, frontend]
+    if: failure() && github.event_name == 'pull_request'
+    permissions:
+      issues: write
+
+    steps:
+      - name: Open an issue with the failing jobs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              backend: '${{ needs.backend.result }}',
+              migrations: '${{ needs.migrations.result }}',
+              frontend: '${{ needs.frontend.result }}',
+            };
+            const failed = Object.entries(results)
+              .filter(([, result]) => result === 'failure')
+              .map(([job]) => job);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+              `/actions/runs/${context.runId}`;
+            const title = `CI failure: ${failed.join(', ') || 'unknown'} (run ${context.runId})`;
+            const body = [
+              `CI упал на ветке \`${context.payload.pull_request.head.ref}\`.`,
+              '',
+              `- Pull Request: #${context.payload.pull_request.number}`,
+              `- Commit: \`${context.payload.pull_request.head.sha}\``,
+              `- Failing jobs: ${failed.map((j) => `\`${j}\``).join(', ') || 'unknown'}`,
+              `- Логи: ${runUrl}`,
+              '',
+              'Полный вывод шага смотреть в логах запуска по ссылке выше.',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['ci-failure'],
+            });
