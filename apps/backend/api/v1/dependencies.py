@@ -11,10 +11,15 @@ from src.application.media.service import ExerciseMediaService
 from src.application.programs.filtering import ExerciseFilter
 from src.application.programs.generator import DeterministicProgramGenerator
 from src.application.programs.html_service import ProgramHtmlService
-from src.application.programs.orchestrator import ProgramGenerationOrchestrator
+from src.application.programs.orchestrator import (
+    FallbackEvent,
+    GateDecision,
+    ProgramGenerationOrchestrator,
+)
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.service import ProgramService
 from src.application.programs.validator import ProgramValidator
+from src.domain.ai.enums import AITaskType
 from src.infrastructure.config import (
     EXERCISE_MEDIA_MAX_PER_EXERCISE,
     MEDIA_PUBLIC_BASE_URL,
@@ -66,7 +71,12 @@ def build_generation_orchestrator(
     primary_generator: str | None = None,
     fallback_generator: str | None = None,
 ) -> ProgramGenerationOrchestrator:
-    """Собирает оркестратор генерации с конфигурируемыми generator'ами."""
+    """Собирает оркестратор генерации с конфигурируемыми generator'ами.
+
+    Оркестратор получает readiness gate и журнал fallback: решение «вызывать
+    ли AI» принимается по фактическому состоянию конфигурации, а причина
+    отказа попадает в журнал администратора.
+    """
     session_factory = get_session_factory()
     return ProgramGenerationOrchestrator(
         profile_repository=PostgresProfileRepository(session_factory),
@@ -79,6 +89,40 @@ def build_generation_orchestrator(
         exercise_filter=ExerciseFilter(),
         safety_engine=SafetyEngine(),
         validator=ProgramValidator(),
+        ai_readiness_gate=_workout_generation_gate,
+        fallback_recorder=_record_generation_fallback,
+    )
+
+
+async def _workout_generation_gate() -> GateDecision:
+    """Актуальное решение readiness для задачи генерации программы.
+
+    Компоненты собираются на каждый вызов намеренно: решение должно
+    отражать конфигурацию на момент генерации, а не на момент старта
+    приложения.
+    """
+    from apps.backend.api.v1.ai_dependencies import build_ai_components
+
+    decision = await build_ai_components().readiness.runtime_gate(
+        AITaskType.WORKOUT_GENERATION
+    )
+    return GateDecision(
+        allowed=decision.allowed,
+        reason=decision.reason,
+        detail=decision.detail,
+    )
+
+
+async def _record_generation_fallback(event: FallbackEvent) -> None:
+    """Кладёт fallback в существующий журнал событий AI-контура."""
+    from apps.backend.api.v1.ai_dependencies import build_ai_components
+
+    await build_ai_components().admin.record_generation_fallback(
+        requested_generator=event.requested_generator,
+        actual_generator=event.actual_generator,
+        reason_code=event.reason_code,
+        detail=event.detail,
+        ai_attempted=event.ai_attempted,
     )
 
 

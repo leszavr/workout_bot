@@ -689,6 +689,39 @@ class AIUsageRepository:
             for r in rows
         ]
 
+    async def latest_by_endpoint(self) -> dict[int, dict]:
+        """Последний AI-вызов по каждому эндпоинту.
+
+        Нужен Infrastructure Health: connection test мог пройти успешно, а
+        реальные вызовы при этом падать. Такой эндпоинт честнее показывать
+        как degraded, и это не требует новых запросов к провайдеру —
+        данные уже есть в журнале вызовов.
+
+        DISTINCT ON — PostgreSQL-специфично; проект работает только на
+        PostgreSQL (asyncpg + JSONB).
+        """
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(AIUsageRecordRow)
+                    .where(AIUsageRecordRow.endpoint_id.is_not(None))
+                    .distinct(AIUsageRecordRow.endpoint_id)
+                    .order_by(
+                        AIUsageRecordRow.endpoint_id,
+                        AIUsageRecordRow.created_at.desc(),
+                    )
+                )
+            ).scalars().all()
+        return {
+            r.endpoint_id: {
+                "status": r.status,
+                "error_type": r.error_type,
+                "created_at": r.created_at,
+            }
+            for r in rows
+            if r.endpoint_id is not None
+        }
+
 
 # --- Audit events ---------------------------------------------------------------
 
@@ -724,14 +757,24 @@ class AIAuditRepository:
             raise _persistence_error(exc, "Не удалось записать audit-событие") from exc
 
     async def list_recent(self, limit: int = 50) -> list[dict]:
+        return await self._list(limit=limit)
+
+    async def list_recent_by_types(
+        self, event_types: list[str], limit: int = 50
+    ) -> list[dict]:
+        """События заданных типов. Используется журналом fallback."""
+        if not event_types:
+            return []
+        return await self._list(limit=limit, event_types=event_types)
+
+    async def _list(
+        self, *, limit: int, event_types: list[str] | None = None
+    ) -> list[dict]:
+        query = select(AIAuditEventRow).order_by(AIAuditEventRow.created_at.desc())
+        if event_types is not None:
+            query = query.where(AIAuditEventRow.event_type.in_(event_types))
         async with self._sessions() as session:
-            rows = (
-                await session.execute(
-                    select(AIAuditEventRow)
-                    .order_by(AIAuditEventRow.created_at.desc())
-                    .limit(limit)
-                )
-            ).scalars().all()
+            rows = (await session.execute(query.limit(limit))).scalars().all()
         return [
             {
                 "id": r.id,

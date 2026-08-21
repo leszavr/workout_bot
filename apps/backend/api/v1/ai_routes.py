@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from apps.backend.api.v1.ai_dependencies import build_ai_components
 from apps.backend.auth import require_admin
+from src.application.ai.admin_service import AIDependencyError
 from src.domain.ai.config import (
     AIEndpoint,
     AIModel,
@@ -227,6 +228,18 @@ def _iso(value) -> str | None:
     return value.isoformat() if value else None
 
 
+def _dependency_conflict(exc: AIDependencyError) -> HTTPException:
+    """409 с машиночитаемым списком блокеров.
+
+    UI должен объяснить, что именно мешает удалению, а не показывать
+    единственную строку текста.
+    """
+    return HTTPException(
+        status_code=409,
+        detail={"message": str(exc), "blockers": exc.blockers},
+    )
+
+
 def _provider_out(provider: AIProvider) -> ProviderOut:
     return ProviderOut(
         id=provider.id or 0,
@@ -348,8 +361,12 @@ async def delete_provider(
     provider_id: int, admin: Annotated[str, Depends(require_admin)]
 ) -> None:
     components = build_ai_components()
+    if await components.providers.get(provider_id) is None:
+        raise HTTPException(status_code=404, detail=_PROVIDER_NOT_FOUND)
     try:
         deleted = await components.admin.delete_provider(provider_id, actor=admin)
+    except AIDependencyError as exc:
+        raise _dependency_conflict(exc) from exc
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not deleted:
@@ -418,8 +435,12 @@ async def delete_endpoint(
     endpoint_id: int, admin: Annotated[str, Depends(require_admin)]
 ) -> None:
     components = build_ai_components()
+    if await components.endpoints.get(endpoint_id) is None:
+        raise HTTPException(status_code=404, detail=_ENDPOINT_NOT_FOUND)
     try:
         deleted = await components.admin.delete_endpoint(endpoint_id, actor=admin)
+    except AIDependencyError as exc:
+        raise _dependency_conflict(exc) from exc
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not deleted:
@@ -516,8 +537,12 @@ async def delete_model(
     model_pk: int, admin: Annotated[str, Depends(require_admin)]
 ) -> None:
     components = build_ai_components()
+    if await components.models.get(model_pk) is None:
+        raise HTTPException(status_code=404, detail=_MODEL_NOT_FOUND)
     try:
         deleted = await components.admin.delete_model(model_pk, actor=admin)
+    except AIDependencyError as exc:
+        raise _dependency_conflict(exc) from exc
     except WorkoutBotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProfilePersistenceError as exc:
@@ -738,3 +763,45 @@ async def recent_audit(_: Annotated[str, Depends(require_admin)]) -> dict:
     components = build_ai_components()
     items = await components.admin.recent_audit(limit=50)
     return {"total": len(items), "items": items}
+
+
+@router.get("/fallback-events")
+async def recent_fallback_events(_: Annotated[str, Depends(require_admin)]) -> dict:
+    """Почему программа сгенерирована не AI.
+
+    Запрошенный и фактический генератор, машиночитаемая причина, время.
+    Персональных данных и содержимого программы здесь нет.
+    """
+    components = build_ai_components()
+    items = await components.admin.recent_fallback_events(limit=50)
+    return {"total": len(items), "items": items}
+
+
+# --- Infrastructure health ---------------------------------------------------------
+
+
+@router.get("/infrastructure-health")
+async def infrastructure_health(_: Annotated[str, Depends(require_admin)]) -> dict:
+    """Дерево provider → endpoint → model → задачи с состояниями.
+
+    Строится динамически из конфигурации: новый провайдер или модель
+    появляются здесь без изменений во frontend. Запросов к провайдерам не
+    делает — используются сохранённый connection test и журнал вызовов.
+    """
+    components = build_ai_components()
+    report = await components.health.report()
+    return asdict(report)
+
+
+@router.post("/infrastructure-health/refresh")
+async def refresh_infrastructure_health(
+    _: Annotated[str, Depends(require_admin)],
+) -> dict:
+    """Активная проверка включённых эндпоинтов и свежее состояние.
+
+    Использует существующий connection test (минимальный ping), а не
+    генерацию программы: health-проверка не должна быть дорогой.
+    """
+    components = build_ai_components()
+    report = await components.health.refresh(components.gateway.test_endpoint)
+    return asdict(report)

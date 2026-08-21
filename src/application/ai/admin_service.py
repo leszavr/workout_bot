@@ -4,12 +4,20 @@
 SecretStore. Гарантии:
 - секреты никогда не возвращаются наружу (только masked/has_api_key);
 - audit-события не содержат секретов;
-- удаление модели, привязанной к задаче, запрещено (soft disable);
 - новая версия промпта вместо изменения существующей.
+
+Safe delete (Phase 1.1.1). Удаление конфигурации не должно оставлять
+битые ссылки. Перед удалением провайдера/эндпоинта/модели сервис сам
+собирает зависимости и объясняет, что именно мешает, вместо того чтобы
+показать администратору общую ошибку целостности из базы. Стратегия:
+объект с зависимостями сначала отключается, hard delete разрешён только
+когда зависимостей нет. Исторические usage/audit-записи при этом не
+удаляются никогда: они нужны для разбора инцидентов.
 """
 from __future__ import annotations
 
 import secrets as pysecrets
+from dataclasses import dataclass, field
 
 from src.domain.ai.config import (
     AIEndpoint,
@@ -32,6 +40,36 @@ from src.infrastructure.persistence.postgres.ai_repository import (
     AIUsageRepository,
     PromptTemplateRepository,
 )
+
+# Тип audit-события для fallback генерации. Отдельной таблицы нет намеренно:
+# журнал событий AI-контура должен быть один.
+FALLBACK_EVENT_TYPE = "ai_generation_fallback"
+
+
+class AIDependencyError(WorkoutBotError):
+    """Удаление заблокировано зависимостями.
+
+    Несёт машиночитаемый список блокеров, чтобы UI мог объяснить причину,
+    а не показывать текст ошибки базы данных.
+    """
+
+    def __init__(self, message: str, blockers: list[dict]) -> None:
+        super().__init__(message)
+        self.blockers = blockers
+
+
+@dataclass
+class DeleteDependencies:
+    """Что мешает удалить объект конфигурации."""
+
+    blockers: list[dict] = field(default_factory=list)
+
+    @property
+    def safe(self) -> bool:
+        return not self.blockers
+
+    def describe(self) -> str:
+        return "; ".join(b["detail"] for b in self.blockers)
 
 
 class AIConfigurationService:
@@ -84,15 +122,46 @@ class AIConfigurationService:
         return updated
 
     async def delete_provider(self, provider_id: int, actor: str | None = None) -> bool:
+        """Hard delete только при отсутствии зависимостей.
+
+        Провайдер удаляется каскадом вместе с эндпоинтами и моделями,
+        поэтому проверяется всё поддерево: модель, привязанная к задаче,
+        блокирует удаление всего провайдера.
+        """
+        dependencies = await self.provider_dependencies(provider_id)
+        if not dependencies.safe:
+            raise AIDependencyError(
+                f"Невозможно удалить провайдера: {dependencies.describe()}. "
+                "Отключите его (enabled=false) или сначала снимите привязки моделей "
+                "в конфигурации задач.",
+                dependencies.blockers,
+            )
+        # Каскад удалит эндпоинты, но не секреты в SecretStore: их нужно
+        # удалить явно, иначе останутся «осиротевшие» шифрованные записи.
+        endpoints = await self._endpoints.list_for_provider(provider_id)
         deleted = await self._providers.delete(provider_id)
         if deleted:
+            for endpoint in endpoints:
+                if endpoint.secret_reference:
+                    await self._secrets.delete(endpoint.secret_reference)
             await self._audit.record(
                 "ai_provider_deleted",
                 actor=actor,
                 entity_type="ai_provider",
                 entity_id=str(provider_id),
+                metadata={"deleted_endpoints": len(endpoints)},
             )
         return deleted
+
+    async def provider_dependencies(self, provider_id: int) -> DeleteDependencies:
+        """Модели провайдера, привязанные к задачам, — блокеры удаления."""
+        dependencies = DeleteDependencies()
+        for endpoint in await self._endpoints.list_for_provider(provider_id):
+            if endpoint.id is None:
+                continue
+            nested = await self.endpoint_dependencies(endpoint.id)
+            dependencies.blockers.extend(nested.blockers)
+        return dependencies
 
     # --- Endpoints -------------------------------------------------------------
 
@@ -153,6 +222,15 @@ class AIConfigurationService:
         return updated
 
     async def delete_endpoint(self, endpoint_id: int, actor: str | None = None) -> bool:
+        """Hard delete только при отсутствии зависимостей у его моделей."""
+        dependencies = await self.endpoint_dependencies(endpoint_id)
+        if not dependencies.safe:
+            raise AIDependencyError(
+                f"Невозможно удалить эндпоинт: {dependencies.describe()}. "
+                "Отключите его (enabled=false) или сначала снимите привязки моделей "
+                "в конфигурации задач.",
+                dependencies.blockers,
+            )
         endpoint = await self._endpoints.get(endpoint_id)
         deleted = await self._endpoints.delete(endpoint_id)
         if deleted:
@@ -165,6 +243,16 @@ class AIConfigurationService:
                 entity_id=str(endpoint_id),
             )
         return deleted
+
+    async def endpoint_dependencies(self, endpoint_id: int) -> DeleteDependencies:
+        """Модели эндпоинта, привязанные к задачам, — блокеры удаления."""
+        dependencies = DeleteDependencies()
+        for model in await self._models.list_for_endpoint(endpoint_id):
+            if model.id is None:
+                continue
+            nested = await self.model_dependencies(model.id)
+            dependencies.blockers.extend(nested.blockers)
+        return dependencies
 
     async def endpoint_secret_view(self, endpoint_id: int) -> dict:
         """Только masked-представление; сам секрет никогда не возвращается."""
@@ -206,11 +294,13 @@ class AIConfigurationService:
         return updated
 
     async def delete_model(self, model_pk: int, actor: str | None = None) -> bool:
-        """Удаление запрещено, если модель привязана к задаче (soft disable)."""
-        if await self._models.is_bound_to_task(model_pk):
-            raise WorkoutBotError(
-                "Модель используется в конфигурации задачи. "
-                "Отключите её (enabled=false) вместо удаления."
+        """Hard delete только если модель не привязана ни к одной задаче."""
+        dependencies = await self.model_dependencies(model_pk)
+        if not dependencies.safe:
+            raise AIDependencyError(
+                f"Невозможно удалить модель: {dependencies.describe()}. "
+                "Отключите её (enabled=false) или уберите из конфигурации задачи.",
+                dependencies.blockers,
             )
         deleted = await self._models.delete(model_pk)
         if deleted:
@@ -221,6 +311,37 @@ class AIConfigurationService:
                 entity_id=str(model_pk),
             )
         return deleted
+
+    async def model_dependencies(self, model_pk: int) -> DeleteDependencies:
+        """Задачи, использующие модель. Только они блокируют удаление.
+
+        Историю вызовов (usage) намеренно не считаем блокером: удалять
+        конфигурацию из-за наличия истории нельзя, а историю удалять ради
+        конфигурации — тем более.
+        """
+        dependencies = DeleteDependencies()
+        model = await self._models.get(model_pk)
+        label = f"«{model.display_name}»" if model else f"pk={model_pk}"
+        for config in await self._tasks.list():
+            if config.id is None:
+                continue
+            for binding in await self._tasks.list_bindings(config.id):
+                if binding.model_id != model_pk:
+                    continue
+                role = "основная" if binding.is_primary else "резервная"
+                dependencies.blockers.append(
+                    {
+                        "type": "ai_task_config",
+                        "task_type": config.task_type.value,
+                        "task_enabled": config.enabled,
+                        "model_id": model_pk,
+                        "detail": (
+                            f"модель {label} используется задачей "
+                            f"«{config.task_type.value}» ({role})"
+                        ),
+                    }
+                )
+        return dependencies
 
     # --- Task configs ------------------------------------------------------------
 
@@ -290,3 +411,40 @@ class AIConfigurationService:
 
     async def recent_audit(self, limit: int = 50) -> list[dict]:
         return await self._audit.list_recent(limit=limit)
+
+    async def record_generation_fallback(
+        self,
+        *,
+        requested_generator: str,
+        actual_generator: str,
+        reason_code: str,
+        detail: str,
+        ai_attempted: bool,
+    ) -> None:
+        """Пишет fallback генерации в существующий журнал событий.
+
+        Отдельной таблицы под это намеренно нет: администратору нужен один
+        журнал событий AI-контура, а не параллельная подсистема.
+
+        В metadata не попадают profile_id, содержимое программы и любые
+        персональные данные — только технические поля.
+        """
+        await self._audit.record(
+            FALLBACK_EVENT_TYPE,
+            actor=None,  # системное событие, не действие администратора
+            entity_type="program_generation",
+            entity_id=None,
+            metadata={
+                "requested_generator": requested_generator,
+                "actual_generator": actual_generator,
+                "reason_code": reason_code,
+                "detail": detail[:500],
+                "ai_attempted": ai_attempted,
+            },
+        )
+
+    async def recent_fallback_events(self, limit: int = 50) -> list[dict]:
+        """Журнал fallback: почему программа не была сгенерирована AI."""
+        return await self._audit.list_recent_by_types(
+            [FALLBACK_EVENT_TYPE], limit=limit
+        )

@@ -77,6 +77,9 @@ class GenerationInfo(BaseModel):
     actual_generator: GenerationSource | None = None
     fallback_used: bool = False
     fallback_reason: str | None = Field(default=None, max_length=500)
+    # Машиночитаемая причина fallback (значение AIFallbackReason). Нужна для
+    # аналитики и админки: человекочитаемый fallback_reason для этого не годится.
+    fallback_reason_code: str | None = Field(default=None, max_length=64)
 
 
 class ProgressionPlan(BaseModel):

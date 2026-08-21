@@ -1,6 +1,6 @@
 """AIReadinessService: сводная готовность AI-контура и защита включения задачи.
 
-Одна и та же логика отвечает на два вопроса:
+Одна и та же логика отвечает на три вопроса:
 
 1. «Готова ли AI-генерация прямо сейчас и что именно мешает?» — `report()`
    строит чек-лист шагов настройки, эффективную цепочку моделей и
@@ -8,6 +8,12 @@
 2. «Можно ли включить AI-задачу?» — `validate_enable()` запрещает включение
    заведомо нерабочей конфигурации (нет моделей, все модели недоступны,
    протокол без адаптера, отсутствующая версия промпта).
+3. «Стоит ли пытаться вызвать AI для этой генерации?» — `runtime_gate()`
+   даёт машиночитаемое решение для ProgramGenerationOrchestrator.
+
+`runtime_gate()` намеренно построен на том же чек-листе, что и `report()`:
+администратор в UI и оркестратор в runtime видят одну и ту же причину, а не
+две независимые реализации, которые со временем разойдутся.
 
 Сервис не выполняет запросов к провайдеру: он читает конфигурацию и
 сохранённый результат последней проверки подключения. Живую проверку
@@ -20,7 +26,12 @@ from dataclasses import dataclass, field
 from src.application.ai.program_generator import PROMPTS_DIR
 from src.application.ai.selection import ModelCandidate, ModelSelector
 from src.domain.ai.config import AIEndpoint, AIModel, AIProvider, AITaskConfig
-from src.domain.ai.enums import AIProtocol, AITaskType, AIUsageStatus
+from src.domain.ai.enums import (
+    AIFallbackReason,
+    AIProtocol,
+    AITaskType,
+    AIUsageStatus,
+)
 from src.domain.ai.errors import AIConfigurationError
 from src.infrastructure.ai.adapters import ProviderAdapterRegistry
 from src.infrastructure.persistence.postgres.ai_repository import (
@@ -46,6 +57,10 @@ class ReadinessCheck:
 
     blocking=False — шаг важен, но не мешает AI работать (например,
     эндпоинт без ключа: часть self-hosted эндпоинтов ключа не требует).
+
+    reason_code — машиночитаемая причина (значение `AIFallbackReason`).
+    Её заполняет сам шаг, потому что только он знает контекст: «провайдера
+    нет» и «провайдер отключён» дают одинаковый статус, но разные причины.
     """
 
     key: str
@@ -54,6 +69,20 @@ class ReadinessCheck:
     detail: str
     action: str | None = None
     blocking: bool = True
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeGateDecision:
+    """Решение о том, выполнять ли AI-вызов для конкретной генерации.
+
+    allowed=False означает, что AI-запрос заведомо бесполезен: оркестратор
+    сразу берёт детерминированный генератор и сохраняет `reason`.
+    """
+
+    allowed: bool
+    reason: AIFallbackReason | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +192,41 @@ class AIReadinessService:
             },
         )
 
+    async def runtime_gate(self, task_type: AITaskType) -> RuntimeGateDecision:
+        """Решает, выполнять ли AI-вызов, и объясняет отказ машиночитаемо.
+
+        Используется ProgramGenerationOrchestrator перед попыткой AI: если
+        конфигурация заведомо нерабочая, дорогой запрос к провайдеру не
+        выполняется вообще.
+
+        Причина берётся из первого блокирующего шага того же чек-листа, что
+        показывает админка: один источник истины на настройку и на runtime.
+        """
+        report = await self.report(task_type)
+        if report.ready:
+            return RuntimeGateDecision(allowed=True)
+
+        blocking = [
+            c for c in report.checks if c.blocking and c.status != STATUS_OK
+        ]
+        if not blocking:
+            # ready=False без блокирующих шагов означать не должно, но падать
+            # из-за этого нельзя: генерация продолжится детерминированно.
+            return RuntimeGateDecision(
+                allowed=False,
+                reason=AIFallbackReason.TASK_NOT_READY,
+                detail="AI-конфигурация не готова",
+            )
+        first = blocking[0]
+        reason = (
+            AIFallbackReason(first.reason_code)
+            if first.reason_code
+            else AIFallbackReason.TASK_NOT_READY
+        )
+        return RuntimeGateDecision(
+            allowed=False, reason=reason, detail=f"{first.title}: {first.detail}"
+        )
+
     async def validate_enable(
         self, config: AITaskConfig, model_pks: list[int] | None
     ) -> None:
@@ -229,6 +293,7 @@ class AIReadinessService:
                 status=STATUS_MISSING,
                 detail="Провайдер не создан",
                 action="Создайте провайдера с поддерживаемым протоколом",
+                reason_code=AIFallbackReason.AI_NOT_CONFIGURED.value,
             )
         unsupported = [p for p in providers if p.protocol not in supported]
         if unsupported and not [p for p in providers if p.protocol in supported]:
@@ -240,6 +305,7 @@ class AIReadinessService:
                 + ", ".join(sorted({p.protocol.value for p in unsupported})),
                 action="Создайте провайдера с протоколом "
                 + ", ".join(sorted(p.value for p in supported)),
+                reason_code=AIFallbackReason.UNSUPPORTED_PROTOCOL.value,
             )
         return ReadinessCheck(
             key="provider",
@@ -247,6 +313,7 @@ class AIReadinessService:
             status=STATUS_MISSING,
             detail="Все подходящие провайдеры отключены",
             action="Включите провайдера",
+            reason_code=AIFallbackReason.PROVIDER_UNAVAILABLE.value,
         )
 
     def _check_endpoint(
@@ -266,6 +333,7 @@ class AIReadinessService:
                 status=STATUS_MISSING,
                 detail="Нет провайдера, к которому можно добавить эндпоинт",
                 action="Сначала создайте провайдера",
+                reason_code=AIFallbackReason.AI_NOT_CONFIGURED.value,
             )
         return ReadinessCheck(
             key="endpoint",
@@ -273,6 +341,7 @@ class AIReadinessService:
             status=STATUS_MISSING,
             detail="Включённого эндпоинта нет",
             action="Создайте или включите эндпоинт с базовым URL провайдера",
+            reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
         )
 
     def _check_api_key(self, endpoint: AIEndpoint | None) -> ReadinessCheck:
@@ -310,6 +379,7 @@ class AIReadinessService:
                 status=STATUS_MISSING,
                 detail="Нет эндпоинта для проверки",
                 action="Создайте эндпоинт",
+                reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
             )
         if endpoint.last_test_status == AIUsageStatus.SUCCESS.value:
             when = endpoint.last_test_at.isoformat() if endpoint.last_test_at else "—"
@@ -327,6 +397,7 @@ class AIReadinessService:
                 detail=f"Последняя проверка эндпоинта «{endpoint.name}» завершилась "
                 f"ошибкой: {endpoint.last_test_error_type or 'неизвестная ошибка'}",
                 action="Исправьте URL/ключ/модель и выполните проверку снова",
+                reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
             )
         return ReadinessCheck(
             key="connection",
@@ -334,6 +405,7 @@ class AIReadinessService:
             status=STATUS_MISSING,
             detail=f"Подключение эндпоинта «{endpoint.name}» ни разу не проверялось",
             action="Нажмите «Проверить подключение» до включения задачи",
+            reason_code=AIFallbackReason.CONNECTION_NOT_TESTED.value,
         )
 
     def _check_models(
@@ -353,6 +425,7 @@ class AIReadinessService:
                 status=STATUS_MISSING,
                 detail="Нет эндпоинта, на котором можно объявить модель",
                 action="Сначала создайте эндпоинт",
+                reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
             )
         return ReadinessCheck(
             key="model",
@@ -360,6 +433,7 @@ class AIReadinessService:
             status=STATUS_MISSING,
             detail="Включённых моделей нет",
             action="Создайте или включите модель с идентификатором провайдера",
+            reason_code=AIFallbackReason.MODEL_UNAVAILABLE.value,
         )
 
     async def _check_task_models(
@@ -390,6 +464,7 @@ class AIReadinessService:
                 detail="Модели привязаны, но ни одна не доступна: отключена модель, "
                 "эндпоинт или провайдер, либо протокол без адаптера",
                 action="Включите нужную модель и её эндпоинт/провайдера",
+                reason_code=AIFallbackReason.MODEL_UNAVAILABLE.value,
             )
         return ReadinessCheck(
             key="task_models",
@@ -397,6 +472,7 @@ class AIReadinessService:
             status=STATUS_MISSING,
             detail=f"Для задачи «{task_type.value}» не выбрана ни одна модель",
             action="Выберите основную модель в карточке задачи",
+            reason_code=AIFallbackReason.MODEL_UNAVAILABLE.value,
         )
 
     def _check_task_enabled(self, config: AITaskConfig | None) -> ReadinessCheck:
@@ -413,6 +489,7 @@ class AIReadinessService:
             status=STATUS_MISSING,
             detail="Задача выключена: AI не будет вызван",
             action="Отметьте «включена» и сохраните задачу",
+            reason_code=AIFallbackReason.TASK_DISABLED.value,
         )
 
     async def _check_prompt(
@@ -433,6 +510,7 @@ class AIReadinessService:
             status=STATUS_FAILED,
             detail=detail,
             action="Укажите существующую версию промпта или создайте новую",
+            reason_code=AIFallbackReason.TASK_NOT_READY.value,
         )
 
     def _check_generation_strategy(self) -> ReadinessCheck:
@@ -446,6 +524,7 @@ class AIReadinessService:
                 status=STATUS_FAILED,
                 detail=f"AI не участвует в генерации программ ({detail})",
                 action="Задайте PROGRAM_PRIMARY_GENERATOR=ai в конфигурации сервера",
+                reason_code=AIFallbackReason.GENERATOR_NOT_CONFIGURED.value,
             )
         if primary != GENERATOR_AI:
             return ReadinessCheck(
