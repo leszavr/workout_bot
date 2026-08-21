@@ -7,8 +7,12 @@ from __future__ import annotations
 import pytest
 
 from src.application.programs.orchestrator import (
+    FallbackEvent,
+    GateDecision,
     ProgramGenerationOrchestrator,
 )
+from src.domain.ai.enums import AIFallbackReason
+from src.domain.ai.errors import AIInvalidResponseError, AITimeoutError
 from src.domain.enums import GenerationSource, ProgramStatus
 from src.domain.exercise import Exercise
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
@@ -171,6 +175,8 @@ def _orchestrator(
     deterministic_generator: FakeGenerator | None = None,
     program_repo: FakeProgramRepository | None = None,
     ai_factory_error: Exception | None = None,
+    gate: GateDecision | Exception | None = None,
+    recorder: list[FallbackEvent] | None = None,
 ) -> tuple[ProgramGenerationOrchestrator, FakeProgramRepository]:
     repo = program_repo or FakeProgramRepository()
 
@@ -178,6 +184,16 @@ def _orchestrator(
         if ai_factory_error is not None:
             raise ai_factory_error
         return ai_generator
+
+    async def ai_gate() -> GateDecision:
+        if isinstance(gate, Exception):
+            raise gate
+        assert gate is not None
+        return gate
+
+    async def fallback_recorder(event: FallbackEvent) -> None:
+        assert recorder is not None
+        recorder.append(event)
 
     orchestrator = ProgramGenerationOrchestrator(
         profile_repository=FakeProfileRepository(_profile()),
@@ -190,6 +206,8 @@ def _orchestrator(
         or (ai_generator if ai_generator and ai_generator.name == "deterministic" else None),
         exercise_filter=FakeFilter(),
         safety_engine=FakeSafety(),
+        ai_readiness_gate=ai_gate if gate is not None else None,
+        fallback_recorder=fallback_recorder if recorder is not None else None,
     )
     return orchestrator, repo
 
@@ -361,3 +379,225 @@ class TestOrchestratorIdempotency:
 
         with pytest.raises(ProgramGenerationError):
             await orchestrator.generate("no-such-profile")
+
+
+class TestReadinessGate:
+    """readiness должен реально влиять на генерацию, а не только на UI."""
+
+    async def test_not_ready_skips_ai_call_entirely(self):
+        ai = FakeGenerator("ai")
+        det = FakeGenerator("deterministic")
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=det,
+            gate=GateDecision(
+                allowed=False,
+                reason=AIFallbackReason.PROVIDER_UNAVAILABLE,
+                detail="Провайдер: все подходящие провайдеры отключены",
+            ),
+        )
+
+        result = await orchestrator.generate("p1")
+
+        # Ключевое: заведомо бесполезный AI-запрос не выполнялся.
+        assert ai.calls == 0
+        assert det.calls == 1
+        assert result.fallback_used is True
+
+    async def test_not_ready_stores_structured_reason(self):
+        orchestrator, _ = _orchestrator(
+            ai_generator=FakeGenerator("ai"),
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(
+                allowed=False,
+                reason=AIFallbackReason.CONNECTION_NOT_TESTED,
+                detail="Проверка подключения: ни разу не проверялось",
+            ),
+        )
+
+        info = (await orchestrator.generate("p1")).program.generation
+
+        assert info.fallback_reason_code == "connection_not_tested"
+        assert info.requested_generator is GenerationSource.AI
+        assert info.actual_generator is GenerationSource.DETERMINISTIC
+        assert "Проверка подключения" in (info.fallback_reason or "")
+
+    async def test_ready_gate_allows_ai_call(self):
+        ai = FakeGenerator("ai")
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        result = await orchestrator.generate("p1")
+
+        assert ai.calls == 1
+        assert result.fallback_used is False
+        assert result.program.generation.fallback_reason_code is None
+
+    async def test_gate_failure_does_not_block_generation(self):
+        """Неизвестное состояние readiness не должно ломать генерацию."""
+        ai = FakeGenerator("ai")
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=RuntimeError("readiness backend down"),
+        )
+
+        result = await orchestrator.generate("p1")
+
+        assert ai.calls == 1
+        assert result.fallback_used is False
+
+    async def test_gate_block_does_not_loop(self):
+        """Запрет AI + падение deterministic → одна ошибка, без циклов."""
+        det = FakeGenerator("deterministic", fail=True)
+        ai = FakeGenerator("ai")
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=det,
+            gate=GateDecision(
+                allowed=False, reason=AIFallbackReason.TASK_DISABLED, detail="выключена"
+            ),
+        )
+
+        with pytest.raises(ProgramGenerationError):
+            await orchestrator.generate("p1")
+
+        assert ai.calls == 0
+        assert det.calls == 1
+
+
+class TestRuntimeFallbackClassification:
+    """AI был готов, попытка сделана — причина должна быть runtime, не конфиг."""
+
+    async def test_timeout_is_classified_as_ai_timeout(self):
+        ai = FakeGenerator("ai", fail=True, fail_exception=AITimeoutError("timeout"))
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate("p1")).program.generation
+
+        assert ai.calls == 1
+        assert info.fallback_reason_code == "ai_timeout"
+
+    async def test_invalid_response_is_classified(self):
+        ai = FakeGenerator(
+            "ai", fail=True, fail_exception=AIInvalidResponseError("broken json")
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate("p1")).program.generation
+
+        assert info.fallback_reason_code == "ai_invalid_response"
+
+    async def test_unknown_error_is_runtime_failure(self):
+        ai = FakeGenerator("ai", fail=True, fail_exception=RuntimeError("boom"))
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate("p1")).program.generation
+
+        assert info.fallback_reason_code == "ai_runtime_failure"
+
+    async def test_validation_failure_is_classified(self):
+        ai = FakeGenerator("ai", invalid=True)
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate("p1")).program.generation
+
+        assert info.fallback_reason_code == "ai_validation_failed"
+
+    async def test_factory_unavailable_is_generator_not_configured(self):
+        orchestrator, _ = _orchestrator(
+            deterministic_generator=FakeGenerator("deterministic"),
+            ai_factory_error=RuntimeError("ai config missing"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate("p1")).program.generation
+
+        assert info.fallback_reason_code == "generator_not_configured"
+
+
+class TestFallbackObservability:
+    async def test_fallback_is_recorded_for_admin(self):
+        events: list[FallbackEvent] = []
+        orchestrator, _ = _orchestrator(
+            ai_generator=FakeGenerator("ai"),
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(
+                allowed=False,
+                reason=AIFallbackReason.MODEL_UNAVAILABLE,
+                detail="Модели задачи: ни одна не доступна",
+            ),
+            recorder=events,
+        )
+
+        await orchestrator.generate("p1")
+
+        assert len(events) == 1
+        event = events[0]
+        assert event.requested_generator == "ai"
+        assert event.actual_generator == "deterministic"
+        assert event.reason_code == "model_unavailable"
+        # AI не вызывался: это configuration fallback, а не runtime.
+        assert event.ai_attempted is False
+
+    async def test_runtime_fallback_marks_ai_as_attempted(self):
+        events: list[FallbackEvent] = []
+        orchestrator, _ = _orchestrator(
+            ai_generator=FakeGenerator("ai", fail=True),
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+            recorder=events,
+        )
+
+        await orchestrator.generate("p1")
+
+        assert events[0].ai_attempted is True
+        assert events[0].reason_code == "ai_runtime_failure"
+
+    async def test_successful_primary_records_nothing(self):
+        events: list[FallbackEvent] = []
+        orchestrator, _ = _orchestrator(
+            ai_generator=FakeGenerator("ai"),
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+            recorder=events,
+        )
+
+        await orchestrator.generate("p1")
+
+        assert events == []
+
+    async def test_recorder_failure_does_not_break_generation(self):
+        async def broken_recorder(event: FallbackEvent) -> None:
+            raise RuntimeError("audit down")
+
+        orchestrator, _ = _orchestrator(
+            ai_generator=FakeGenerator("ai", fail=True),
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+        orchestrator._fallback_recorder = broken_recorder
+
+        result = await orchestrator.generate("p1")
+
+        assert result.fallback_used is True
+        assert result.program.generation.fallback_reason_code == "ai_runtime_failure"
