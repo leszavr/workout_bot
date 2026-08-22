@@ -1,3 +1,47 @@
+Внутренний веб-интерфейс Workout Bot (Next.js App Router).
+
+## Локальная разработка
+
+```bash
+npm install
+npm run dev      # http://localhost:3000
+```
+
+Нужен работающий backend; его адрес задаётся в `.env.local`
+(`NEXT_PUBLIC_API_BASE`, по умолчанию `http://localhost:8000`).
+
+## Не запускайте `npm run build` при работающем `npm run dev`
+
+`next build` и `next dev` пишут в один и тот же каталог `.next`. Если запустить
+production-сборку, пока dev-сервер работает, его манифесты и чанки
+перемешиваются с production-артефактами, и dev-сервер начинает падать:
+
+```
+Error: Cannot find module './948.js'
+```
+
+Файл при этом на диске есть — просто собран другим прогоном, и ссылки на чанки
+не совпадают. Ошибка не связана с кодом. Лечится так:
+
+```bash
+# остановить dev-сервер, затем
+rm -rf .next
+npm run dev
+```
+
+Перед проверочной production-сборкой останавливайте dev-сервер. В CI конфликта
+нет: там сборка идёт в чистом окружении, dev-сервера не существует.
+
+## Проверки
+
+```bash
+npm run lint
+npx tsc --noEmit
+npm run build
+```
+
+---
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
