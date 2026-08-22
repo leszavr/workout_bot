@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from apps.backend.api.v1.ai_dependencies import build_ai_components
-from apps.backend.auth import require_admin
+from apps.backend.auth import AuthenticatedUser, require_admin, require_viewer
 from src.application.ai.admin_service import AIDependencyError
 from src.domain.ai.config import (
     AIEndpoint,
@@ -301,7 +301,7 @@ def _model_out(model: AIModel) -> ModelOut:
 
 
 @router.get("/providers")
-async def list_providers(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def list_providers(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     components = build_ai_components()
     providers = await components.providers.list()
     return {"total": len(providers), "items": [_provider_out(p) for p in providers]}
@@ -309,7 +309,7 @@ async def list_providers(_: Annotated[str, Depends(require_admin)]) -> dict:
 
 @router.post("/providers", status_code=201, responses=_CONFLICT)
 async def create_provider(
-    body: ProviderCreate, admin: Annotated[str, Depends(require_admin)]
+    body: ProviderCreate, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
 ) -> ProviderOut:
     components = build_ai_components()
     provider = AIProvider(
@@ -320,7 +320,7 @@ async def create_provider(
         priority=body.priority,
     )
     try:
-        created = await components.admin.create_provider(provider, actor=admin)
+        created = await components.admin.create_provider(provider, actor=admin.login)
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _provider_out(created)
@@ -328,7 +328,7 @@ async def create_provider(
 
 @router.get("/providers/{provider_id}", responses=_NOT_FOUND)
 async def get_provider(
-    provider_id: int, _: Annotated[str, Depends(require_admin)]
+    provider_id: int, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> ProviderOut:
     components = build_ai_components()
     provider = await components.providers.get(provider_id)
@@ -341,14 +341,14 @@ async def get_provider(
 async def patch_provider(
     provider_id: int,
     body: ProviderPatch,
-    admin: Annotated[str, Depends(require_admin)],
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> ProviderOut:
     components = build_ai_components()
     fields = body.model_dump(exclude_none=True)
     if "protocol" in fields:
         fields["protocol"] = fields["protocol"].value
     try:
-        updated = await components.admin.update_provider(provider_id, actor=admin, **fields)
+        updated = await components.admin.update_provider(provider_id, actor=admin.login, **fields)
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if updated is None:
@@ -358,13 +358,13 @@ async def patch_provider(
 
 @router.delete("/providers/{provider_id}", status_code=204, responses=_NOT_FOUND_CONFLICT)
 async def delete_provider(
-    provider_id: int, admin: Annotated[str, Depends(require_admin)]
+    provider_id: int, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
 ) -> None:
     components = build_ai_components()
     if await components.providers.get(provider_id) is None:
         raise HTTPException(status_code=404, detail=_PROVIDER_NOT_FOUND)
     try:
-        deleted = await components.admin.delete_provider(provider_id, actor=admin)
+        deleted = await components.admin.delete_provider(provider_id, actor=admin.login)
     except AIDependencyError as exc:
         raise _dependency_conflict(exc) from exc
     except ProfilePersistenceError as exc:
@@ -378,7 +378,7 @@ async def delete_provider(
 
 @router.get("/providers/{provider_id}/endpoints")
 async def list_endpoints(
-    provider_id: int, _: Annotated[str, Depends(require_admin)]
+    provider_id: int, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> dict:
     components = build_ai_components()
     endpoints = await components.endpoints.list_for_provider(provider_id)
@@ -390,7 +390,7 @@ async def list_endpoints(
 async def create_endpoint(
     provider_id: int,
     body: EndpointCreate,
-    admin: Annotated[str, Depends(require_admin)],
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> EndpointOut:
     components = build_ai_components()
     if await components.providers.get(provider_id) is None:
@@ -406,7 +406,7 @@ async def create_endpoint(
     )
     try:
         created = await components.admin.create_endpoint(
-            endpoint, api_key=body.api_key, actor=admin
+            endpoint, api_key=body.api_key, actor=admin.login
         )
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -417,12 +417,12 @@ async def create_endpoint(
 async def patch_endpoint(
     endpoint_id: int,
     body: EndpointPatch,
-    admin: Annotated[str, Depends(require_admin)],
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> EndpointOut:
     components = build_ai_components()
     fields = body.model_dump(exclude_none=True)
     try:
-        updated = await components.admin.update_endpoint(endpoint_id, actor=admin, **fields)
+        updated = await components.admin.update_endpoint(endpoint_id, actor=admin.login, **fields)
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if updated is None:
@@ -432,13 +432,13 @@ async def patch_endpoint(
 
 @router.delete("/endpoints/{endpoint_id}", status_code=204, responses=_NOT_FOUND_CONFLICT)
 async def delete_endpoint(
-    endpoint_id: int, admin: Annotated[str, Depends(require_admin)]
+    endpoint_id: int, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
 ) -> None:
     components = build_ai_components()
     if await components.endpoints.get(endpoint_id) is None:
         raise HTTPException(status_code=404, detail=_ENDPOINT_NOT_FOUND)
     try:
-        deleted = await components.admin.delete_endpoint(endpoint_id, actor=admin)
+        deleted = await components.admin.delete_endpoint(endpoint_id, actor=admin.login)
     except AIDependencyError as exc:
         raise _dependency_conflict(exc) from exc
     except ProfilePersistenceError as exc:
@@ -451,12 +451,12 @@ async def delete_endpoint(
 async def set_endpoint_secret(
     endpoint_id: int,
     body: EndpointSecretSet,
-    admin: Annotated[str, Depends(require_admin)],
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> dict:
     """Установка/ротация API key. Старый ключ заменяется атомарно."""
     components = build_ai_components()
     try:
-        await components.admin.rotate_endpoint_secret(endpoint_id, body.api_key, actor=admin)
+        await components.admin.rotate_endpoint_secret(endpoint_id, body.api_key, actor=admin.login)
     except AIConfigurationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     view = await components.admin.endpoint_secret_view(endpoint_id)
@@ -465,7 +465,7 @@ async def set_endpoint_secret(
 
 @router.post("/endpoints/{endpoint_id}/test", responses=_NOT_FOUND)
 async def test_endpoint(
-    endpoint_id: int, _: Annotated[str, Depends(require_admin)]
+    endpoint_id: int, _: Annotated[AuthenticatedUser, Depends(require_admin)]
 ) -> dict:
     """Connection test: нейтральный минимальный запрос, без персональных данных."""
     components = build_ai_components()
@@ -480,7 +480,7 @@ async def test_endpoint(
 
 @router.get("/endpoints/{endpoint_id}/models")
 async def list_models(
-    endpoint_id: int, _: Annotated[str, Depends(require_admin)]
+    endpoint_id: int, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> dict:
     components = build_ai_components()
     models = await components.models.list_for_endpoint(endpoint_id)
@@ -491,7 +491,7 @@ async def list_models(
 async def create_model(
     endpoint_id: int,
     body: ModelCreate,
-    admin: Annotated[str, Depends(require_admin)],
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> ModelOut:
     components = build_ai_components()
     if await components.endpoints.get(endpoint_id) is None:
@@ -509,7 +509,7 @@ async def create_model(
         supports_streaming=body.supports_streaming,
     )
     try:
-        created = await components.admin.create_model(model, actor=admin)
+        created = await components.admin.create_model(model, actor=admin.login)
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _model_out(created)
@@ -519,12 +519,12 @@ async def create_model(
 async def patch_model(
     model_pk: int,
     body: ModelPatch,
-    admin: Annotated[str, Depends(require_admin)],
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> ModelOut:
     components = build_ai_components()
     fields = body.model_dump(exclude_none=True)
     try:
-        updated = await components.admin.update_model(model_pk, actor=admin, **fields)
+        updated = await components.admin.update_model(model_pk, actor=admin.login, **fields)
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if updated is None:
@@ -534,13 +534,13 @@ async def patch_model(
 
 @router.delete("/models/{model_pk}", status_code=204, responses=_NOT_FOUND_CONFLICT)
 async def delete_model(
-    model_pk: int, admin: Annotated[str, Depends(require_admin)]
+    model_pk: int, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
 ) -> None:
     components = build_ai_components()
     if await components.models.get(model_pk) is None:
         raise HTTPException(status_code=404, detail=_MODEL_NOT_FOUND)
     try:
-        deleted = await components.admin.delete_model(model_pk, actor=admin)
+        deleted = await components.admin.delete_model(model_pk, actor=admin.login)
     except AIDependencyError as exc:
         raise _dependency_conflict(exc) from exc
     except WorkoutBotError as exc:
@@ -580,7 +580,7 @@ def _task_item(task_type: AITaskType, config: AITaskConfig | None, bindings: lis
 
 
 @router.get("/tasks")
-async def list_tasks(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def list_tasks(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     """Все типы задач: существующие конфигурации + дефолты для остальных."""
     components = build_ai_components()
     configs = await components.tasks.list()
@@ -599,7 +599,7 @@ async def list_tasks(_: Annotated[str, Depends(require_admin)]) -> dict:
 
 @router.get("/tasks/{task_type}", responses=_NOT_FOUND)
 async def get_task(
-    task_type: AITaskType, _: Annotated[str, Depends(require_admin)]
+    task_type: AITaskType, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> TaskConfigOut:
     components = build_ai_components()
     config, bindings = await components.admin.get_task(task_type)
@@ -632,7 +632,7 @@ async def get_task(
 async def put_task(
     task_type: AITaskType,
     body: TaskConfigPut,
-    admin: Annotated[str, Depends(require_admin)],
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> TaskConfigOut:
     components = build_ai_components()
     config = AITaskConfig(
@@ -649,7 +649,7 @@ async def put_task(
         if config.enabled:
             await components.readiness.validate_enable(config, body.model_ids)
         saved, bindings = await components.admin.configure_task(
-            config, model_pks=body.model_ids, actor=admin
+            config, model_pks=body.model_ids, actor=admin.login
         )
     except AIConfigurationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -681,7 +681,7 @@ async def put_task(
 
 @router.get("/prompts/{task_type}")
 async def list_prompts(
-    task_type: AITaskType, _: Annotated[str, Depends(require_admin)]
+    task_type: AITaskType, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> dict:
     components = build_ai_components()
     templates = await components.prompts.list_for_task(task_type)
@@ -704,7 +704,7 @@ async def list_prompts(
 
 @router.post("/prompts", status_code=201, responses=_CONFLICT)
 async def create_prompt(
-    body: PromptCreate, admin: Annotated[str, Depends(require_admin)]
+    body: PromptCreate, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
 ) -> PromptOut:
     components = build_ai_components()
     template = PromptTemplate(
@@ -716,7 +716,7 @@ async def create_prompt(
         enabled=body.enabled,
     )
     try:
-        created = await components.admin.create_prompt_version(template, actor=admin)
+        created = await components.admin.create_prompt_version(template, actor=admin.login)
     except WorkoutBotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProfilePersistenceError as exc:
@@ -738,7 +738,7 @@ async def create_prompt(
 
 @router.get("/readiness")
 async def task_readiness(
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     task_type: AITaskType = AITaskType.WORKOUT_GENERATION,
 ) -> dict:
     """Сводная готовность AI-задачи: чек-лист, эффективная цепочка, стратегия.
@@ -752,21 +752,21 @@ async def task_readiness(
 
 
 @router.get("/usage")
-async def recent_usage(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def recent_usage(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     components = build_ai_components()
     items = await components.admin.recent_usage(limit=50)
     return {"total": len(items), "items": items}
 
 
 @router.get("/audit")
-async def recent_audit(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def recent_audit(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     components = build_ai_components()
     items = await components.admin.recent_audit(limit=50)
     return {"total": len(items), "items": items}
 
 
 @router.get("/fallback-events")
-async def recent_fallback_events(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def recent_fallback_events(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     """Почему программа сгенерирована не AI.
 
     Запрошенный и фактический генератор, машиночитаемая причина, время.
@@ -781,7 +781,7 @@ async def recent_fallback_events(_: Annotated[str, Depends(require_admin)]) -> d
 
 
 @router.get("/infrastructure-health")
-async def infrastructure_health(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def infrastructure_health(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     """Дерево provider → endpoint → model → задачи с состояниями.
 
     Строится динамически из конфигурации: новый провайдер или модель
@@ -795,7 +795,7 @@ async def infrastructure_health(_: Annotated[str, Depends(require_admin)]) -> di
 
 @router.post("/infrastructure-health/refresh")
 async def refresh_infrastructure_health(
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> dict:
     """Активная проверка включённых эндпоинтов и свежее состояние.
 

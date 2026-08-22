@@ -1,7 +1,8 @@
 """API v1: auth, dashboard, profiles, users, exercises.
 
 Внутренний интерфейс: чтение данных из PostgreSQL. Все endpoint'ы,
-кроме /auth/login, защищены JWT (require_admin).
+кроме /auth/login, защищены JWT. Чтение доступно любой роли
+(`require_viewer`), изменение — только роли admin (`require_admin`).
 """
 from __future__ import annotations
 
@@ -12,13 +13,21 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from apps.backend.api.v1.dependencies import build_program_service
+from apps.backend.api.v1.user_dependencies import build_admin_user_service
 from apps.backend.auth import (
+    AuthenticatedUser,
+    ChangePasswordRequest,
     LoginRequest,
     TokenResponse,
+    current_user,
+    env_admin_configured,
     issue_token,
     require_admin,
-    verify_credentials,
+    require_viewer,
+    verify_env_admin,
 )
+from src.application.auth.service import AdminUserError
+from src.domain.auth import AdminRole
 from src.domain.program import WorkoutProgram
 from src.errors import ProgramGenerationError, ProgramValidationError
 from src.infrastructure.persistence.postgres.db import get_session_factory
@@ -34,20 +43,144 @@ router = APIRouter(prefix="/api/v1")
 
 # --- Auth ---------------------------------------------------------------------
 
+
+class CurrentUserOut(BaseModel):
+    """Кто вошёл. Хеш пароля и секреты сюда не попадают."""
+
+    login: str
+    role: str
+    display_name: str | None = None
+    must_change_password: bool = False
+    # true — вход выполнен аварийным администратором из переменных окружения.
+    is_env_admin: bool = False
+    can_write: bool = False
+
+
 @router.post(
     "/auth/login",
     responses={401: {"description": "Invalid credentials"}},
 )
 async def login(body: LoginRequest) -> TokenResponse:
-    if not verify_credentials(body.login, body.password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return TokenResponse(access_token=issue_token(body.login))
+    """Вход: сначала пользователи из БД, затем аварийный env-администратор.
+
+    Причина отказа не детализируется намеренно: ответ не должен подсказывать,
+    существует ли такой логин.
+    """
+    service = build_admin_user_service()
+    user = await service.authenticate(body.login, body.password)
+    if user is not None:
+        return TokenResponse(
+            access_token=issue_token(
+                user.login,
+                role=user.role,
+                user_id=user.id,
+                must_change_password=user.must_change_password,
+            ),
+            role=user.role.value,
+            must_change_password=user.must_change_password,
+        )
+
+    if verify_env_admin(body.login, body.password):
+        return TokenResponse(
+            access_token=issue_token(body.login, role=AdminRole.ADMIN),
+            role=AdminRole.ADMIN.value,
+        )
+
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@router.get("/auth/me")
+async def whoami(
+    user: Annotated[AuthenticatedUser, Depends(current_user)],
+) -> CurrentUserOut:
+    """Профиль текущего пользователя.
+
+    Намеренно использует `current_user`, а не `require_viewer`: этот endpoint
+    обязан работать в состоянии «пароль нужно сменить», иначе интерфейс не
+    сможет показать нужный экран.
+    """
+    display_name = None
+    if user.user_id is not None:
+        stored = await build_admin_user_service().get_user(user.user_id)
+        if stored is not None:
+            display_name = stored.display_name
+    return CurrentUserOut(
+        login=user.login,
+        role=user.role.value,
+        display_name=display_name,
+        must_change_password=user.must_change_password,
+        is_env_admin=user.is_env_admin,
+        can_write=user.can_write,
+    )
+
+
+@router.post(
+    "/auth/change-password",
+    responses={
+        400: {"description": "Password rejected"},
+        409: {"description": "Env admin cannot change password via API"},
+    },
+)
+async def change_own_password(
+    body: ChangePasswordRequest,
+    user: Annotated[AuthenticatedUser, Depends(current_user)],
+) -> TokenResponse:
+    """Смена собственного пароля. Требует текущий пароль.
+
+    Доступна в состоянии «пароль нужно сменить» — это единственный выход из
+    него. В ответ выдаётся новый токен уже без флага обязательной смены.
+    """
+    if user.user_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Аварийный администратор задаётся переменными окружения: "
+                "смените ADMIN_PASSWORD в конфигурации сервера."
+            ),
+        )
+    service = build_admin_user_service()
+    try:
+        await service.change_own_password(
+            user.user_id,
+            current_password=body.current_password,
+            new_password=body.new_password,
+        )
+    except AdminUserError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return TokenResponse(
+        access_token=issue_token(
+            user.login, role=user.role, user_id=user.user_id, must_change_password=False
+        ),
+        role=user.role.value,
+    )
+
+
+@router.get("/auth/providers")
+async def auth_providers(
+    _: Annotated[AuthenticatedUser, Depends(current_user)],
+) -> dict:
+    """Доступные способы входа.
+
+    Внешние провайдеры (Яндекс, VK, MAX) заведены в схеме и домене, но
+    OAuth-флоу не реализованы, поэтому здесь они помечены как недоступные.
+    Интерфейс не должен предлагать неработающий способ входа.
+    """
+    return {
+        "password": True,
+        "env_admin": env_admin_configured(),
+        "external": [
+            {"provider": "yandex", "available": False},
+            {"provider": "vk", "available": False},
+            {"provider": "max", "available": False},
+        ],
+    }
 
 
 # --- Dashboard ----------------------------------------------------------------
 
 @router.get("/dashboard")
-async def dashboard(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def dashboard(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     async with get_session_factory()() as session:
         users_total = (await session.execute(select(func.count()).select_from(UserRow))).scalar_one()
         profiles_total = (await session.execute(select(func.count()).select_from(ProfileRow))).scalar_one()
@@ -79,7 +212,7 @@ async def dashboard(_: Annotated[str, Depends(require_admin)]) -> dict:
 
 @router.get("/profiles")
 async def list_profiles(
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     search: Annotated[str | None, Query(max_length=100)] = None,
     status: Annotated[str | None, Query(max_length=32)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -129,7 +262,7 @@ async def list_profiles(
     "/profiles/{profile_id}",
     responses={404: {"description": "Profile not found"}},
 )
-async def get_profile(profile_id: str, _: Annotated[str, Depends(require_admin)]) -> dict:
+async def get_profile(profile_id: str, _: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     async with get_session_factory()() as session:
         row = (
             await session.execute(select(ProfileRow).where(ProfileRow.profile_id == profile_id))
@@ -169,7 +302,7 @@ async def get_profile(profile_id: str, _: Annotated[str, Depends(require_admin)]
 
 @router.get("/users")
 async def list_users(
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
@@ -198,7 +331,7 @@ async def list_users(
     "/users/{user_id}",
     responses={404: {"description": "User not found"}},
 )
-async def get_user(user_id: int, _: Annotated[str, Depends(require_admin)]) -> dict:
+async def get_user(user_id: int, _: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     async with get_session_factory()() as session:
         row = (await session.execute(select(UserRow).where(UserRow.id == user_id))).scalar_one_or_none()
         if row is None:
@@ -224,7 +357,7 @@ async def get_user(user_id: int, _: Annotated[str, Depends(require_admin)]) -> d
 
 @router.get("/exercises")
 async def list_exercises(
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     search: Annotated[str | None, Query(max_length=100)] = None,
     exercise_type: Annotated[str | None, Query(max_length=64)] = None,
     difficulty: Annotated[str | None, Query(max_length=32)] = None,
@@ -330,7 +463,7 @@ async def _media_items_for(row: ExerciseRow) -> list[dict]:
 )
 async def get_exercise_by_external_id(
     external_id: str,
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     source: Annotated[str | None, Query(max_length=64)] = None,
 ) -> dict:
     """Поиск упражнения по каноническому external_id (+source).
@@ -352,7 +485,7 @@ async def get_exercise_by_external_id(
     "/exercises/{exercise_id}",
     responses={404: {"description": "Exercise not found"}},
 )
-async def get_exercise(exercise_id: int, _: Annotated[str, Depends(require_admin)]) -> dict:
+async def get_exercise(exercise_id: int, _: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     async with get_session_factory()() as session:
         row = (
             await session.execute(select(ExerciseRow).where(ExerciseRow.id == exercise_id))
@@ -382,7 +515,7 @@ def _program_summary(program: WorkoutProgram) -> dict:
 
 @router.get("/programs")
 async def list_programs(
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
@@ -397,7 +530,7 @@ async def list_programs(
 )
 async def get_program(
     program_id: str,
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     version: Annotated[int | None, Query(ge=1)] = None,
 ) -> dict:
     service = build_program_service()
@@ -416,7 +549,7 @@ async def get_program(
 
 @router.get("/profiles/{profile_id}/programs")
 async def list_profile_programs(
-    profile_id: str, _: Annotated[str, Depends(require_admin)]
+    profile_id: str, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> dict:
     service = build_program_service()
     programs = await service.list_for_profile(profile_id)
@@ -436,7 +569,7 @@ class GenerateProgramRequest(BaseModel):
 
 
 @router.get("/ai/providers")
-async def list_ai_providers(_: Annotated[str, Depends(require_admin)]) -> dict:
+async def list_ai_providers(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
     """Список AI-провайдеров для UI (без секретов).
 
     Возвращает только безопасную информацию:
@@ -489,7 +622,7 @@ async def list_ai_providers(_: Annotated[str, Depends(require_admin)]) -> dict:
 )
 async def generate_program(
     profile_id: str,
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[AuthenticatedUser, Depends(require_admin)],
     body: GenerateProgramRequest | None = None,
 ) -> dict:
     """Запуск генерации программы (deterministic или AI)."""
