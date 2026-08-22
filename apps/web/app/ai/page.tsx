@@ -22,6 +22,7 @@ import {
   getToken,
 } from "@/lib/api";
 import { aiProtocolLabel, aiTaskLabel } from "@/lib/labels";
+import { useCurrentUser } from "@/lib/session";
 
 const MAIN_TASK_TYPE = "workout_generation";
 
@@ -49,6 +50,7 @@ async function runDelete(
 }
 
 export default function AIConfigPage() {
+  const { canWrite } = useCurrentUser();
   const [providers, setProviders] = useState<AIProviderItem[]>([]);
   const [endpoints, setEndpoints] = useState<Record<number, AIEndpointItem[]>>({});
   const [models, setModels] = useState<Record<number, AIModelItem[]>>({});
@@ -143,6 +145,17 @@ export default function AIConfigPage() {
         <h1 className="page-title">AI-конфигурация</h1>
         {error && <div className="error">{error}</div>}
         {notice && <div className="badge confirmed">{notice}</div>}
+
+        {/* Роль viewer не может менять конфигурацию: сервер отвечает 403.
+            Предупреждаем заранее, чтобы отказ не выглядел как поломка. */}
+        {!canWrite && (
+          <div className="card">
+            <p style={{ margin: 0 }}>
+              У вашей роли только просмотр: состояние и журналы доступны,
+              изменение настроек AI — нет.
+            </p>
+          </div>
+        )}
 
         <AIReadinessPanel
           report={readiness}

@@ -69,20 +69,146 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw parseErrorBody(response.status, detail);
+    const error = parseErrorBody(response.status, detail);
+    // Пароль выдан администратором как временный: до его смены API закрыт.
+    // Обрабатывается здесь, чтобы каждая страница не повторяла эту логику.
+    if (
+      response.status === 403 &&
+      error.message === PASSWORD_CHANGE_REQUIRED &&
+      typeof window !== "undefined" &&
+      !window.location.pathname.startsWith("/change-password")
+    ) {
+      window.location.href = "/change-password";
+    }
+    throw error;
   }
   // 204 No Content: тела нет, парсить нечего.
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
-export async function login(loginName: string, password: string): Promise<void> {
-  const body = await request<{ access_token: string }>("/api/v1/auth/login", {
+// --- Авторизация и текущий пользователь --------------------------------------------
+
+// Значение detail, которым backend сообщает «пароль нужно сменить».
+export const PASSWORD_CHANGE_REQUIRED = "password_change_required";
+
+export interface LoginResult {
+  role: string;
+  must_change_password: boolean;
+}
+
+export interface CurrentUser {
+  login: string;
+  role: string;
+  display_name: string | null;
+  must_change_password: boolean;
+  // Вход выполнен аварийным администратором из переменных окружения.
+  is_env_admin: boolean;
+  can_write: boolean;
+}
+
+export interface AdminUserItem {
+  id: number;
+  login: string;
+  display_name: string | null;
+  role: string;
+  is_active: boolean;
+  must_change_password: boolean;
+  has_password: boolean;
+  last_login_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AdminIdentityItem {
+  id: number;
+  provider: string;
+  provider_user_id: string;
+  created_at: string | null;
+}
+
+export interface PasswordResetResult {
+  login: string;
+  temporary_password: string;
+  must_change_password: boolean;
+}
+
+export interface AuthProvidersInfo {
+  password: boolean;
+  env_admin: boolean;
+  external: Array<{ provider: string; available: boolean }>;
+}
+
+export async function login(
+  loginName: string,
+  password: string
+): Promise<LoginResult> {
+  const body = await request<{
+    access_token: string;
+    role: string;
+    must_change_password: boolean;
+  }>("/api/v1/auth/login", {
     method: "POST",
     body: JSON.stringify({ login: loginName, password }),
   });
   setToken(body.access_token);
+  return { role: body.role, must_change_password: body.must_change_password };
 }
+
+export const authApi = {
+  me: () => request<CurrentUser>("/api/v1/auth/me"),
+  providers: () => request<AuthProvidersInfo>("/api/v1/auth/providers"),
+  changePassword: async (currentPassword: string, newPassword: string) => {
+    const body = await request<{ access_token: string; role: string }>(
+      "/api/v1/auth/change-password",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      }
+    );
+    // Новый токен уже без флага обязательной смены пароля.
+    setToken(body.access_token);
+  },
+};
+
+export const usersApi = {
+  list: () => request<ListResponse<AdminUserItem>>("/api/v1/admin/users"),
+  create: (body: Record<string, unknown>) =>
+    request<AdminUserItem>("/api/v1/admin/users", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  patch: (id: number, body: Record<string, unknown>) =>
+    request<AdminUserItem>(`/api/v1/admin/users/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  remove: (id: number) =>
+    request<void>(`/api/v1/admin/users/${id}`, { method: "DELETE" }),
+  resetPassword: (id: number) =>
+    request<PasswordResetResult>(`/api/v1/admin/users/${id}/reset-password`, {
+      method: "POST",
+    }),
+  identities: (id: number) =>
+    request<ListResponse<AdminIdentityItem>>(
+      `/api/v1/admin/users/${id}/identities`
+    ),
+  linkIdentity: (id: number, provider: string, providerUserId: string) =>
+    request<AdminIdentityItem>(`/api/v1/admin/users/${id}/identities`, {
+      method: "POST",
+      body: JSON.stringify({
+        provider,
+        provider_user_id: providerUserId,
+      }),
+    }),
+  unlinkIdentity: (userId: number, identityId: number) =>
+    request<void>(`/api/v1/admin/users/${userId}/identities/${identityId}`, {
+      method: "DELETE",
+    }),
+};
 
 export interface Dashboard {
   users_total: number;

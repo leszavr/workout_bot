@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from "react";
 import AppNav from "@/components/AppNav";
 import { api, getToken, ProfileDetail, ProgramListItem } from "@/lib/api";
 import { generationSourceLabel, statusLabel } from "@/lib/labels";
+import { useCurrentUser } from "@/lib/session";
 
 function Section({
   title,
@@ -68,6 +69,7 @@ function Kv({
 
 export default function ProfileDetailPage() {
   const params = useParams<{ id: string }>();
+  const { canWrite } = useCurrentUser();
   const [profile, setProfile] = useState<ProfileDetail | null>(null);
   const [error, setError] = useState("");
   const [view, setView] = useState<"structured" | "raw">("structured");
@@ -263,7 +265,10 @@ export default function ProfileDetailPage() {
             </Section>
             <Section title="Программы тренировок">
               {generateError && <div className="error">{generateError}</div>}
-              <div style={{ marginBottom: 12, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+              {/* Генерация — изменяющая операция: сервер откажет роли viewer,
+                  поэтому не показываем заведомо нерабочую кнопку. */}
+              {canWrite ? (
+                <div style={{ marginBottom: 12, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <input
                     type="radio"
@@ -293,6 +298,11 @@ export default function ProfileDetailPage() {
                   {generating ? "Генерация..." : "Сгенерировать программу"}
                 </button>
               </div>
+              ) : (
+                <p className="muted">
+                  Генерация недоступна: у вашей роли только просмотр.
+                </p>
+              )}
               {programs.length === 0 ? (
                 <p className="muted">Программ пока нет</p>
               ) : (

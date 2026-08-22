@@ -17,8 +17,10 @@ export default function LoginPage() {
     setBusy(true);
     setError("");
     try {
-      await login(loginName, password);
-      router.push("/");
+      const result = await login(loginName, password);
+      // Временный пароль: остальные разделы всё равно закрыты сервером,
+      // поэтому ведём сразу на смену пароля, а не на панель.
+      router.push(result.must_change_password ? "/change-password" : "/");
     } catch {
       setError("Неверный логин или пароль");
     } finally {
