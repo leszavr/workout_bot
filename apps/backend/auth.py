@@ -23,8 +23,14 @@ Env-администратор оставлен намеренно как **ав
 - `require_viewer` — любой аутентифицированный, доступ к чтению;
 - `require_admin`  — только роль `admin`, доступ к записи.
 
+Для пользователей из БД JWT содержит только идентификатор пользователя как
+ссылку на серверное состояние. На каждом защищённом запросе активность, роль
+и `must_change_password` перечитываются из БД. Поэтому деактивация или смена
+роли действует немедленно, не дожидаясь истечения JWT.
+
 Осознанные ограничения: нет refresh-токенов (срок жизни 12 часов), нет
-rate limiting на попытки входа (Phase 1.3).
+rate limiting на попытки входа (Phase 1.3). Аварийный env-администратор
+валидируется только по JWT и изменяется через конфигурацию сервера.
 """
 from __future__ import annotations
 
@@ -39,11 +45,11 @@ from pydantic import BaseModel, Field
 
 from src.domain.auth import AdminRole
 from src.infrastructure.config import ADMIN_LOGIN, ADMIN_PASSWORD, JWT_SECRET
+from src.infrastructure.persistence.postgres.admin_user_repository import AdminUserRepository
+from src.infrastructure.persistence.postgres.db import get_session_factory
 
 TOKEN_TTL_HOURS = 12
 ALGORITHM = "HS256"
-
-# Причина отказа для UI: пароль просрочен и его нужно сменить.
 PASSWORD_CHANGE_REQUIRED = "password_change_required"
 
 _bearer = HTTPBearer(auto_error=False)
@@ -58,7 +64,6 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     role: str = AdminRole.ADMIN.value
-    # UI обязан увести пользователя на смену пароля, если это true.
     must_change_password: bool = False
 
 
@@ -94,11 +99,7 @@ def env_admin_configured() -> bool:
 
 
 def verify_env_admin(login: str, password: str) -> bool:
-    """Аварийный вход из переменных окружения.
-
-    Сравнение константное по времени. Отдельный от БД путь: он должен
-    работать, даже когда таблица пользователей пуста или недоступна.
-    """
+    """Аварийный вход из переменных окружения."""
     if not env_admin_configured():
         return False
     login_ok = hmac.compare_digest(login, ADMIN_LOGIN)
@@ -144,25 +145,51 @@ def _decode(credentials: HTTPAuthorizationCredentials | None) -> dict:
         ) from exc
 
 
-def current_user(
+async def current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> AuthenticatedUser:
-    """Аутентифицированный пользователь без проверки смены пароля.
+    """Возвращает текущего пользователя из актуального server-side state.
 
-    Используется endpoint'ами, которые обязаны работать именно в состоянии
-    «пароль нужно сменить»: /auth/me и /auth/change-password.
+    Для DB-пользователя JWT лишь идентифицирует запись. Роль, активность и
+    требование смены пароля берутся из PostgreSQL на каждом запросе. Это
+    немедленно отзывает доступ после disable/delete/demotion и не позволяет
+    старой роли из JWT продолжать давать права.
     """
     payload = _decode(credentials)
+    user_id = payload.get("uid")
+
+    if user_id is not None:
+        try:
+            repository = AdminUserRepository(get_session_factory())
+            stored = await repository.get(int(user_id))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication state is temporarily unavailable",
+            ) from exc
+
+        if stored is None or not stored.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token",
+            )
+
+        return AuthenticatedUser(
+            login=stored.login,
+            role=stored.role,
+            user_id=stored.id,
+            must_change_password=stored.must_change_password,
+        )
+
     raw_role = payload.get("role", AdminRole.ADMIN.value)
     try:
         role = AdminRole(raw_role)
     except ValueError:
-        # Неизвестная роль трактуется как минимальные права, а не максимальные.
         role = AdminRole.VIEWER
     return AuthenticatedUser(
         login=payload.get("sub", "admin"),
         role=role,
-        user_id=payload.get("uid"),
+        user_id=None,
         must_change_password=bool(payload.get("pwd", False)),
     )
 
@@ -186,10 +213,7 @@ def require_viewer(
 def require_admin(
     user: AuthenticatedUser = Depends(current_user),
 ) -> AuthenticatedUser:
-    """Доступ на запись: только роль admin.
-
-    Возвращает пользователя; для audit-полей используется `.login`.
-    """
+    """Доступ на запись: только роль admin."""
     _ensure_password_is_current(user)
     if not user.can_write:
         raise HTTPException(
