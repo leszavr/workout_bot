@@ -27,7 +27,7 @@ from src.domain.auth import (
     AdminUser,
     AuthProvider,
 )
-from src.errors import WorkoutBotError
+from src.errors import ProfilePersistenceError, WorkoutBotError
 from src.infrastructure.auth.passwords import (
     PasswordPolicyError,
     generate_temporary_password,
@@ -163,8 +163,6 @@ class AdminUserService:
             (role is not None and role is not AdminRole.ADMIN)
             or is_active is False
         )
-        if losing_admin:
-            await self._assert_other_admin_remains(user_id)
 
         fields: dict = {}
         if display_name is not None:
@@ -176,7 +174,25 @@ class AdminUserService:
         if not fields:
             return user
 
-        updated = await self._users.update(user_id, **fields)
+        try:
+            if losing_admin:
+                # Критическая проверка выполняется внутри одной DB-транзакции
+                # с изменением и под PostgreSQL advisory lock. Предварительная
+                # проверка через отдельный запрос здесь намеренно отсутствует:
+                # она была бы подвержена race condition между инстансами.
+                updated = await self._users.update_guarded_last_admin(
+                    user_id, **fields
+                )
+            else:
+                updated = await self._users.update(user_id, **fields)
+        except ProfilePersistenceError as exc:
+            if "последнего активного администратора" in str(exc):
+                raise LastAdminError(
+                    "Это последний активный администратор. Сначала назначьте "
+                    "администратором другого пользователя."
+                ) from exc
+            raise
+
         if updated is not None:
             await self._record(
                 "admin_user_updated",
@@ -198,10 +214,20 @@ class AdminUserService:
                 "Нельзя удалить собственную учётную запись. "
                 "Попросите другого администратора."
             )
-        if user.role is AdminRole.ADMIN and user.is_active:
-            await self._assert_other_admin_remains(user_id)
 
-        deleted = await self._users.delete(user_id)
+        try:
+            if user.role is AdminRole.ADMIN and user.is_active:
+                deleted = await self._users.delete_guarded_last_admin(user_id)
+            else:
+                deleted = await self._users.delete(user_id)
+        except ProfilePersistenceError as exc:
+            if "последнего активного администратора" in str(exc):
+                raise LastAdminError(
+                    "Это последний активный администратор. Сначала назначьте "
+                    "администратором другого пользователя."
+                ) from exc
+            raise
+
         if deleted:
             await self._record(
                 "admin_user_deleted",
@@ -236,18 +262,13 @@ class AdminUserService:
             "admin_user_password_changed",
             actor=user.login,
             user_id=user_id,
-            metadata={},  # ни старого, ни нового пароля в журнале нет
+            metadata={},
         )
 
     async def reset_password(
         self, user_id: int, *, actor: str | None = None
     ) -> str:
-        """Сброс пароля администратором: возвращает временный пароль.
-
-        Значение возвращается ровно один раз — в ответе на этот вызов, и
-        нигде не сохраняется в открытом виде. Пользователь обязан сменить
-        его при следующем входе.
-        """
+        """Сброс пароля администратором: возвращает временный пароль."""
         user = await self._users.get(user_id)
         if user is None:
             raise AdminUserError("Пользователь не найден")
@@ -261,7 +282,7 @@ class AdminUserService:
             "admin_user_password_reset",
             actor=actor,
             user_id=user_id,
-            metadata={"login": user.login},  # сам пароль не логируется
+            metadata={"login": user.login},
         )
         return temporary
 
@@ -293,7 +314,7 @@ class AdminUserService:
             "admin_identity_linked",
             actor=actor,
             user_id=user_id,
-            metadata={"provider": provider.value},  # provider_user_id не логируем
+            metadata={"provider": provider.value},
         )
         return identity
 
