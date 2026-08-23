@@ -33,10 +33,23 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # FSM-тесты проверяют restart-safe состояние анкеты и без Redis
+      # пропускаются, а не «проходят».
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       # Интеграционные тесты пропускаются без DATABASE_URL — в CI он задан,
       # поэтому PostgreSQL-тесты выполняются реально, а не молча скипаются.
       DATABASE_URL: postgresql+asyncpg://workout_ci:workout_ci@localhost:5432/workout_bot_ci
+      REDIS_URL: redis://localhost:6379/0
       # Одноразовые значения только для CI: из них детерминированно выводится
       # Fernet-ключ шифрования AI-секретов. Это не production-секреты.
       JWT_SECRET: ci-only-jwt-secret-not-a-production-value

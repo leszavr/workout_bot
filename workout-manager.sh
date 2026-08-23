@@ -2,7 +2,7 @@
 # Workout Bot Manager — управление локальным окружением проекта.
 #
 # Под управлением четыре части: backend (FastAPI), веб-интерфейс (Next.js),
-# Telegram-бот и инфраструктура в docker compose (PostgreSQL, MinIO).
+# Telegram-бот и инфраструктура в docker compose (PostgreSQL, Redis, MinIO).
 #
 # Процессы запускаются откреплённо (setsid), поэтому живут после закрытия
 # терминала. Логи и PID-файлы лежат в data/ (каталог не под git).
@@ -399,6 +399,22 @@ env_database_url() {
     grep -m1 '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true
 }
 
+# Redis хранит состояние анкеты (FSM). Без него бот не запускается: на
+# in-memory хранилище анкета теряется при перезапуске процесса.
+env_redis_url() {
+    if [[ -n "${REDIS_URL:-}" ]]; then
+        printf '%s\n' "$REDIS_URL"
+        return
+    fi
+    grep -m1 '^REDIS_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true
+}
+
+redis_port_effective() {
+    local port
+    port="$(grep -m1 '^REDIS_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 || true)"
+    printf '%s\n' "${port:-6379}"
+}
+
 # Схема БД отстаёт от кода — частая причина «страница не работает» после
 # обновления. Это предупреждение, а не отказ: миграции применяет `migrate`.
 warn_pending_migrations() {
@@ -414,7 +430,7 @@ warn_pending_migrations() {
 
 start_services() {
     require_env && require_python || return 1
-    info "Запуск инфраструктуры (PostgreSQL, MinIO)"
+    info "Запуск инфраструктуры (PostgreSQL, Redis, MinIO)"
     local port="${1:-$(pg_port)}"
     port="${port:-5432}"
     if port_busy "$port" && ! compose ps --services --filter status=running | grep -qx postgres; then
@@ -424,7 +440,16 @@ start_services() {
         warn "Контейнер PostgreSQL не поднимется, а приложение подключится к чужой базе."
         return 1
     fi
-    compose up -d postgres minio || return 1
+    local redis_port
+    redis_port="$(redis_port_effective)"
+    if port_busy "$redis_port" && ! compose ps --services --filter status=running | grep -qx redis; then
+        local redis_owner
+        redis_owner="$(port_owner_pid "$redis_port")"
+        warn "Порт $redis_port занят посторонним процессом (PID ${redis_owner:-неизвестен})."
+        warn "Контейнер Redis не поднимется, а бот будет писать состояние анкеты в чужое хранилище."
+        return 1
+    fi
+    compose up -d postgres redis minio || return 1
     local ready=0
     for _ in $(seq 1 30); do
         if compose ps --services --filter status=running | grep -qx postgres; then
@@ -436,7 +461,43 @@ start_services() {
     done
     ((ready == 0)) && { fail "Контейнер PostgreSQL не запустился"; return 1; }
     ensure_database || return 1
+    ensure_redis || return 1
     warn_pending_migrations
+}
+
+# Доступность Redis по тому адресу, с которым будет работать бот. Проверяется
+# отдельно от «контейнер работает»: у контейнера может пропасть публикация
+# порта, и тогда бот падает уже при старте.
+REDIS_VERIFIED=0
+
+ensure_redis() {
+    ((REDIS_VERIFIED == 1)) && return 0
+
+    local url probe
+    url="$(env_redis_url)"
+    if [[ -z "$url" ]]; then
+        fail "REDIS_URL не задан ни в окружении, ни в .env"
+        echo "Без него Telegram-бот не запустится: состояние анкеты негде хранить."
+        return 1
+    fi
+    local shown
+    shown="$(sed -E 's#^(redis://)[^@]*@#\1#' <<<"$url")"
+
+    local _
+    for _ in $(seq 1 10); do
+        probe="$(redis_probe "$url")"
+        [[ "$probe" == ok* ]] && break
+        sleep 1
+    done
+    if [[ "$probe" == ok* ]]; then
+        ok "Redis доступен ($shown)"
+        REDIS_VERIFIED=1
+        return 0
+    fi
+    fail "Redis недоступен ($shown): ${probe#fail }"
+    echo "Бот без Redis не стартует, анкета не сохранится."
+    echo "Проверьте: $0 doctor  и  $0 logs redis"
+    return 1
 }
 
 # Доступность базы по тому адресу, с которым будет работать приложение.
@@ -505,7 +566,7 @@ ensure_database() {
 
 stop_services() {
     info "Остановка контейнеров инфраструктуры"
-    compose stop postgres minio && ok "Контейнеры остановлены"
+    compose stop postgres redis minio && ok "Контейнеры остановлены"
 }
 
 # --- Приложения ---------------------------------------------------------------
@@ -567,6 +628,8 @@ start_bot() {
         fail "В .env нет BOT_TOKEN — бот не запустится"
         return 1
     fi
+    # Состояние анкеты хранится в Redis: без него бот завершится при старте.
+    ensure_redis || return 1
     info "Запуск Telegram-бота"
     launch_service bot "$YELLOW" "$PROJECT_DIR" "$foreground" \
         "$VENV_PY" -m apps.telegram_gateway.main
@@ -861,6 +924,34 @@ raise SystemExit(asyncio.run(main()))
 PY
 }
 
+# Достижимость Redis из REDIS_URL: состояние анкеты хранится там, и при
+# недоступности бот не стартует.
+redis_probe() {
+    local url="$1"
+    "$VENV_PY" - "$url" <<'PY' 2>/dev/null
+import asyncio
+import sys
+
+from redis.asyncio import Redis
+
+
+async def main() -> int:
+    client = Redis.from_url(sys.argv[1])
+    try:
+        await client.ping()
+        print("ok")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"fail {type(exc).__name__}: {str(exc)[:120]}")
+        return 1
+    finally:
+        await client.aclose(close_connection_pool=True)
+
+
+raise SystemExit(asyncio.run(main()))
+PY
+}
+
 # Метка фиксированной ширины. printf с %-28s выравнивает по байтам, поэтому на
 # кириллице колонки разъезжаются — считаем длину в символах.
 label() {
@@ -892,7 +983,7 @@ doctor() {
 
     if [[ -f "$ENV_FILE" ]]; then
         # Ключи, без которых части системы молча не работают.
-        local -a required=(DATABASE_URL ADMIN_LOGIN ADMIN_PASSWORD JWT_SECRET)
+        local -a required=(DATABASE_URL REDIS_URL ADMIN_LOGIN ADMIN_PASSWORD JWT_SECRET)
         local -a missing=()
         local key
         for key in "${required[@]}"; do
@@ -960,6 +1051,26 @@ doctor() {
                 echo -e "${YELLOW}использует другую базу: $(sed -E 's#^[^@]*@##' <<<"$backend_url")${NC}"
             fi
         fi
+
+        # Состояние анкеты живёт в Redis: без него бот не стартует, а уже
+        # начатые анкеты не продолжатся.
+        local redis_url
+        redis_url="$(grep -m1 '^REDIS_URL=' "$ENV_FILE" | cut -d= -f2- || true)"
+        label "Redis из .env:"
+        if [[ -z "$redis_url" ]]; then
+            echo -e "${RED}REDIS_URL не задан — бот не запустится${NC}"
+            ((problems++))
+        else
+            local redis_shown redis_result
+            redis_shown="$(sed -E 's#^(redis://)[^@]*@#\1#' <<<"$redis_url")"
+            redis_result="$(redis_probe "$redis_url")"
+            if [[ "$redis_result" == ok* ]]; then
+                echo -e "${GREEN}$redis_shown — доступен${NC}"
+            else
+                echo -e "${RED}$redis_shown — ${redis_result#fail }${NC}"
+                ((problems++))
+            fi
+        fi
     fi
 
     label "Порты:"
@@ -988,7 +1099,7 @@ show_logs() {
     local file
     case "$target" in
         backend | web | bot | manager) file="$(logfile "$target")" ;;
-        postgres | minio)
+        postgres | redis | minio)
             if [[ "$follow" == "-f" ]]; then
                 compose logs -f --tail 100 "$target"
             else
@@ -998,7 +1109,7 @@ show_logs() {
             ;;
         *)
             fail "Неизвестный источник логов: $target"
-            echo "Доступно: backend, web, bot, manager, postgres, minio"
+            echo "Доступно: backend, web, bot, manager, postgres, redis, minio"
             return 1
             ;;
     esac
@@ -1072,8 +1183,26 @@ run_tests() {
         return 1
     fi
 
+    # FSM-тесты проверяют, что состояние анкеты переживает restart, поэтому им
+    # нужен реальный Redis. Свои ключи они создают со случайными id и удаляют
+    # после себя, чужие не трогают; отдельный TEST_REDIS_URL не обязателен.
+    local redis_url
+    redis_url="${TEST_REDIS_URL:-$(env_redis_url)}"
+    if [[ -z "$redis_url" ]]; then
+        fail "Не задан REDIS_URL — тесты устойчивого FSM были бы пропущены"
+        echo "Добавьте в .env строку REDIS_URL=redis://localhost:6379/0 или задайте TEST_REDIS_URL."
+        return 1
+    fi
+    local redis_probe_result
+    redis_probe_result="$(redis_probe "$redis_url")"
+    if [[ "$redis_probe_result" != ok* ]]; then
+        fail "Redis для тестов недоступен ($(sed -E 's#^(redis://)[^@]*@#\1#' <<<"$redis_url")): ${redis_probe_result#fail }"
+        echo "Поднимите инфраструктуру: $0 start services"
+        return 1
+    fi
+
     info "Прогон тестов на $(sed -E 's#^[^@]*@##' <<<"$test_url")"
-    DATABASE_URL="$test_url" "$VENV_PY" -m pytest "${target[@]}" -q
+    DATABASE_URL="$test_url" REDIS_URL="$redis_url" "$VENV_PY" -m pytest "${target[@]}" -q
 }
 
 check_web() {
@@ -1117,7 +1246,7 @@ $(printf '%b' "  Флаг ${GREEN}-d${NC} оставляет службы раб
 $(printf '%b' "${YELLOW}Наблюдение:${NC}")
   status                    что запущено, к какой базе подключён backend, состояние контейнеров
   doctor                    проверка окружения: .venv, .env, доступность базы, порты
-  logs <источник> [-f]      backend | web | bot | manager | postgres | minio
+  logs <источник> [-f]      backend | web | bot | manager | postgres | redis | minio
   ai-status                 чек-лист готовности ИИ и последние вызовы
   clean-logs                удалить файлы логов
 

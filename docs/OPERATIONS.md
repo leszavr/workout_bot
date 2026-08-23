@@ -2,8 +2,8 @@
 
 ## Локальное окружение: workout-manager.sh
 
-Скрипт в корне проекта поднимает и обслуживает локальное окружение: PostgreSQL и
-MinIO в docker compose, backend, веб-интерфейс, Telegram-бот.
+Скрипт в корне проекта поднимает и обслуживает локальное окружение: PostgreSQL,
+Redis и MinIO в docker compose, backend, веб-интерфейс, Telegram-бот.
 
 ```bash
 ./workout-manager.sh start        # инфраструктура + backend + веб, логи в терминале, Ctrl+C — стоп
@@ -21,6 +21,9 @@ MinIO в docker compose, backend, веб-интерфейс, Telegram-бот.
 - **не запускает backend без базы.** uvicorn поднимается и без PostgreSQL, но
   тогда все запросы отвечают ошибкой, а в интерфейсе это выглядит как
   `Failed to fetch`. Доступность базы проверяется по `DATABASE_URL` до запуска.
+- **не запускает бота без Redis.** Состояние анкеты хранится в Redis; при
+  недоступности бот завершился бы при старте, поэтому `REDIS_URL` проверяется
+  заранее (`start bot`, `start services`, `doctor`).
 - **восстанавливает публикацию порта PostgreSQL.** Контейнер может остаться
   запущенным, потеряв проброс порта на хост; тогда контейнер пересоздаётся
   (данные в именованном volume не затрагиваются).
@@ -45,6 +48,7 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 ## Зависимости
 
 - PostgreSQL — основные данные;
+- Redis — состояние анкеты (FSM) между сообщениями и перезапусками;
 - MinIO — бинарные изображения упражнений;
 - FastAPI — backend/API;
 - Telegram gateway — пользовательский транспорт;
@@ -60,13 +64,16 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 - deterministic generation проходит;
 - при настроенном AI проходит AI generation;
 - при искусственной ошибке AI deterministic fallback работает;
-- HTML delivery приходит в Telegram.
+- HTML delivery приходит в Telegram;
+- анкета продолжается после перезапуска процесса бота (`restart bot` посреди
+  анкеты не сбрасывает вопросы).
 
 ## Переменные
 
 Полный список и примеры — `.env.example`. Критические группы:
 - Telegram: `BOT_TOKEN`, `ADMIN_CHAT_ID`;
 - PostgreSQL: `DATABASE_URL`/пароли;
+- Redis: `REDIS_URL` (обязателен для бота), `REDIS_PORT`;
 - admin/JWT;
 - MinIO/media;
 - `PROGRAM_PRIMARY_GENERATOR`, `PROGRAM_FALLBACK_GENERATOR`;
@@ -96,6 +103,12 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 переменная не задана или совпадает с `DATABASE_URL`. Часть интеграционных тестов
 требует наполненного каталога упражнений.
 
+Тестам устойчивого FSM нужен доступный Redis: без `REDIS_URL` они были бы
+пропущены, поэтому `./workout-manager.sh test` проверяет подключение заранее.
+Свои ключи такие тесты создают со случайными идентификаторами и удаляют после
+себя, поэтому рабочий Redis они не портят; при желании можно указать отдельный
+экземпляр через `TEST_REDIS_URL`.
+
 Тесты рассчитаны на общую БД разработки, в которой есть посторонние записи:
 они вычищают только свои данные по префиксу и не удаляют чужие. Проверки
 защиты от потери админского доступа считают всех активных администраторов в
@@ -104,6 +117,23 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 `sole_database_admin` в `tests/integration/test_admin_users_api.py`). Если
 прогон был прерван принудительно, стоит убедиться, что рабочая учётная запись
 снова активна.
+
+## Инцидент: бот не отвечает на анкету
+
+Состояние анкеты хранится в Redis, и его недоступность выглядит как «бот
+перестал понимать ответы».
+
+1. Пользователь получает сообщение «Сервис временно недоступен, ответ не
+   сохранён» — значит хранилище состояния недоступно, а не сломалась анкета.
+2. Проверить Redis: `./workout-manager.sh doctor` (строка «Redis из .env») и
+   `./workout-manager.sh logs redis`.
+3. В логах бота искать `event=fsm_storage_unavailable` и
+   `event=fsm_storage_error`: в них только имя операции и класс ошибки, без
+   пользовательских данных.
+4. Сохранённые профили и программы при этом не затронуты: PostgreSQL остаётся
+   source of truth. Потеряться могут только незавершённые анкеты.
+5. После восстановления Redis пользователи продолжают анкету с того же вопроса;
+   перезапуск бота состояние не сбрасывает.
 
 ## Инцидент: программа не пришла
 
@@ -176,7 +206,9 @@ CI (`.github/workflows/ci.yml`) запускается на каждый Pull Re
 `main`. Джобы:
 
 - **backend** — миграции до head, засев каталога упражнений из публичного
-  репозитория `leszavr/workout`, полный `pytest` на реальной PostgreSQL;
+  репозитория `leszavr/workout`, полный `pytest` на реальной PostgreSQL и
+  реальном Redis (сервис `redis:7`, `REDIS_URL` задан — тесты устойчивого FSM
+  выполняются, а не скипаются);
 - **migrations** — на чистой базе `upgrade head` → `downgrade base` →
   `upgrade head`, плюс проверка единственного alembic head;
 - **frontend** — `npm ci`, lint, `tsc --noEmit`, production build.

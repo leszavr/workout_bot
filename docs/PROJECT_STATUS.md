@@ -104,12 +104,34 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - веб-кнопка Generate Program должна использовать тот же orchestration path;
 - Phase 1.2 разбита на 1.2-A…1.2-G: FSM, generation state, orchestrator, worker/retry/recovery, delivery, admin visibility, E2E acceptance.
 
-**Следующий рабочий этап:** Phase 1.2-A — Persistent FSM.
+**Следующий рабочий этап:** Phase 1.2-B — Generation domain state.
+
+### Phase 1.2-A — Persistent FSM: ГОТОВО
+
+- состояние анкеты хранится в Redis (`REDIS_URL`) вместо `MemoryStorage`:
+  перезапуск процесса бота не сбрасывает анкету, несколько экземпляров
+  приложения работают с общим состоянием;
+- `src/infrastructure/telegram/fsm_storage.py` — aiogram `RedisStorage` и
+  `RedisEventIsolation` с ключами, включающими `bot_id`; изоляция обновлений
+  общая для всех процессов, поэтому один ответ не обрабатывается дважды;
+- бот не запускается без `REDIS_URL`, доступность проверяется до старта
+  polling, соединения закрываются при остановке (повторное закрытие безопасно);
+- сбой Redis нормализуется в `FSMStorageError` и превращается в понятное
+  сообщение пользователю; ответы анкеты и подключение не попадают в логи;
+- PostgreSQL остаётся source of truth: в Redis лежит только черновик анкеты,
+  профиль сохраняется при подтверждении, и сбой runtime state не портит
+  бизнес-данные;
+- Redis добавлен в `docker/docker-compose.yml`, `workout-manager.sh`
+  (start/stop/status/doctor/logs/test) и в CI, поэтому FSM-тесты выполняются
+  реально, а не пропускаются.
 
 ## Открытые проблемы и риски
 
 ### P0 — до реального production
-1. Production hardening: Redis/устойчивое FSM storage, централизованные логи, error tracking/metrics, backup/restore, rate limits и эксплуатационные процедуры.
+1. Production hardening: централизованные логи, error tracking/metrics,
+   backup/restore, rate limits и эксплуатационные процедуры. Устойчивое FSM
+   storage закрыто в Phase 1.2-A; backup/restore Redis не требуется — там
+   только незавершённые анкеты.
 2. **Нет rate limiting на вход в админку** — перебор пароля остаётся задачей Phase 1.3.
 3. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа, AI primary, deterministic fallback, delivery failure/retry.
 4. Проверка безопасности production-конфигурации и секретов.
@@ -141,4 +163,4 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 ## Следующий приоритет
 
-Phase 1.2-A: Persistent FSM. Подробный design baseline — `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`; порядок дальнейших работ — `DEVELOPMENT_ROADMAP.md`.
+Phase 1.2-B: Generation domain state. Подробный design baseline — `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`; порядок дальнейших работ — `DEVELOPMENT_ROADMAP.md`.

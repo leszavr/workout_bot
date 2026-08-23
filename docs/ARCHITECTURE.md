@@ -49,7 +49,8 @@
 │   src/infrastructure/files       — FileStorage (Local)     │
 │   src/infrastructure/media       — ObjectStorage (MinIO/S3)│
 │   src/infrastructure/telegram    — TelegramAdminSender,    │
-│       ProgramSender (документы), AlertSender               │
+│       ProgramSender (документы), AlertSender,              │
+│       FSMStorage (Redis, состояние анкеты)                 │
 │   src/infrastructure/config.py, logging_setup.py           │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -79,6 +80,25 @@
   статус и класс ошибки, без ключей и тела ответа провайдера. Это состояние,
   а не конфигурация: без него нельзя отличить «не проверялось» от
   «проверка провалилась».
+
+### Runtime-состояние анкеты (Redis)
+
+Незавершённая анкета — это runtime-состояние, а не бизнес-данные: профиль
+попадает в PostgreSQL только при подтверждении. Черновик хранится в **Redis**
+(`REDIS_URL`), поэтому он переживает перезапуск процесса и одинаково доступен
+всем экземплярам бота.
+
+- `src/infrastructure/telegram/fsm_storage.py` — `FSMStorage`: aiogram
+  `RedisStorage` для состояния и `RedisEventIsolation` для блокировки
+  обновлений одного пользователя. Ключи включают `bot_id`, поэтому один Redis
+  может обслуживать несколько ботов.
+- Соединение проверяется до старта polling (`FSMStorage.verify`) и
+  закрывается при остановке; повторный `close` безопасен.
+- Ошибки Redis нормализуются в `FSMStorageError`, а
+  `apps/telegram_gateway/handlers/errors.py` отвечает пользователю безопасным
+  текстом. Без этого сбой хранилища выглядел бы как «бот молчит».
+- Redis не является source of truth: его потеря стоит незавершённых анкет, но
+  не сохранённых профилей и программ.
 
 ## Внутренний веб-интерфейс
 
