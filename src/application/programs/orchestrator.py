@@ -1,12 +1,24 @@
-"""ProgramGenerationOrchestrator: end-to-end генерация программы (Stage 5).
+"""ProgramGenerationOrchestrator: единственная точка генерации программы.
 
-Оркестратор соединяет существующие компоненты (фильтр, safety, генераторы,
-валидатор, репозиторий) в конвейер с primary/fallback конфигурацией:
+Phase 1.2-C: и Telegram, и Admin API приходят сюда. Альтернативных
+generation pipeline'ов в приложении больше нет — `ProgramService` отвечает
+только за чтение уже созданных программ.
 
-    Profile → Pools → readiness gate → primary generator → validation
-        → (failure) fallback generator → validation
-        → (failure) ProgramGenerationError
-    → ProgramRepository → результат.
+    GenerationRequest
+        ↓
+    Profile → GenerationJob (Phase 1.2-B) → Pools → readiness gate
+        → primary generator → validation
+        → (failure, если fallback разрешён) fallback generator → validation
+    → ProgramRepository → GenerationOutcome.
+
+Различие между вызывающими слоями выражается только запросом, а не отдельным
+конвейером:
+
+- Telegram (автогенерация после finalize) — стратегия из конфигурации и
+  `allow_fallback=True`: пользовательский сценарий не должен падать из-за
+  неработоспособного AI;
+- Admin API — генератор выбран администратором явно и `allow_fallback=False`:
+  подменять выбор молча нельзя, администратор должен увидеть причину отказа.
 
 Правила:
 - строго один fallback: primary → fallback → final failure, никаких циклов;
@@ -31,7 +43,7 @@ Readiness gate (Phase 1.1.1). Перед AI-попыткой оркестрат�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from src.application.programs.filtering import ExerciseFilter
@@ -48,12 +60,18 @@ from src.domain.ai.errors import (
     AIInvalidResponseError,
     AITimeoutError,
 )
-from src.domain.enums import GenerationSource, ProgramStatus
-from src.domain.generation import GenerationJob, GenerationTrigger
+from src.domain.enums import GenerationJobStatus, GenerationSource, ProgramStatus
+from src.domain.generation import (
+    GenerationErrorCode,
+    GenerationJob,
+    GenerationTrigger,
+    classify_error,
+    safe_error_message,
+)
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 from src.domain.profile import FitnessProfile
 from src.domain.program import WorkoutProgram
-from src.errors import ProgramGenerationError
+from src.errors import GenerationFailedError
 from src.infrastructure.persistence.postgres.exercise_repository import (
     ExerciseRepository,
 )
@@ -97,8 +115,55 @@ class FallbackEvent:
     ai_attempted: bool
 
 
+@dataclass(frozen=True)
+class GenerationRequest:
+    """Запрос генерации: единственный вход в pipeline (Phase 1.2-C).
+
+    Telegram и Admin API различаются только этим запросом.
+
+    - `requested_generator=None` — взять стратегию из конфигурации приложения
+      (автогенерация);
+    - `allow_fallback=False` — генератор выбран вызывающей стороной явно,
+      подменять его нельзя (запрос администратора);
+    - `reuse_existing=True` — если у профиля уже есть валидная программа,
+      вернуть её без новой генерации (повторный finalize).
+    """
+
+    profile_id: str
+    trigger: GenerationTrigger
+    requested_generator: str | None = None
+    allow_fallback: bool = True
+    reuse_existing: bool = False
+    client_idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class GenerationStrategy:
+    """Порядок генераторов для одного запроса.
+
+    `fallback=None` означает «подмена генератора запрещена»: так работает явный
+    запрос администратора, который выбрал генератор сам.
+    """
+
+    primary: str
+    fallback: str | None = None
+
+    @property
+    def ordered(self) -> tuple[str, ...]:
+        if self.fallback is None or self.fallback == self.primary:
+            return (self.primary,)
+        return (self.primary, self.fallback)
+
+
 @dataclass
 class OrchestratorResult:
+    """Единый application-level результат генерации (Phase 1.2-C).
+
+    Вызывающий слой узнаёт из него всё, что ему нужно: программу, состояние
+    operational-записи, фактически применённую стратегию и причину fallback.
+    Внутренние исключения AI-контура наружу не выходят.
+    """
+
     program: WorkoutProgram
     candidate_pool: ExerciseCandidatePool
     safe_pool: SafeExercisePool
@@ -106,6 +171,14 @@ class OrchestratorResult:
     reused_existing: bool = False
     # Заполняется, когда генерация шла под persistent job (Phase 1.2-B).
     job: GenerationJob | None = None
+    requested_generator: str = ""
+    actual_generator: str = ""
+    fallback_reason_code: str | None = None
+
+    @property
+    def status(self) -> GenerationJobStatus:
+        """Состояние генерации. Без job-контура успешный возврат = SUCCEEDED."""
+        return self.job.status if self.job else GenerationJobStatus.SUCCEEDED
 
 
 @dataclass
@@ -115,6 +188,9 @@ class _GeneratorAttempt:
     reason_code: str | None = None
     error_type: str | None = None
     error_message: str | None = None
+    # Стабильный код отказа этой попытки: по нему оркестратор формирует
+    # наружный контракт ошибки, а job — свою классификацию.
+    error_code: GenerationErrorCode = GenerationErrorCode.GENERATION_FAILED
     # skipped=True — генератор не вызывался (gate запретил или он не настроен).
     skipped: bool = False
 
@@ -169,17 +245,10 @@ class ProgramGenerationOrchestrator:
 
     # --- public API -------------------------------------------------------------
 
-    async def generate(
-        self,
-        profile_id: str,
-        *,
-        reuse_existing: bool = False,
-        trigger: GenerationTrigger = GenerationTrigger.AUTO_FINALIZATION,
-        client_idempotency_key: str | None = None,
-    ) -> OrchestratorResult:
-        """Основной сценарий pipeline.
+    async def generate(self, request: GenerationRequest) -> OrchestratorResult:
+        """Единственный вход в генерацию программы (Phase 1.2-C).
 
-        reuse_existing=True (автозапуск после finalize): если у профиля уже
+        `reuse_existing=True` (автозапуск после finalize): если у профиля уже
         есть валидная программа — возвращает её без новой генерации,
         повторный finalize не создаёт дубликаты.
 
@@ -188,12 +257,22 @@ class ProgramGenerationOrchestrator:
         защиту от параллельных дубликатов обеспечивает уже не она, а
         PostgreSQL: два одновременных запроса, оба не увидевшие готовой
         программы, создают ровно один job.
+
+        Транзакционные границы наследуются от job-сервиса: короткая транзакция
+        на создание/переход job, затем генерация (включая внешний AI-вызов) вне
+        транзакции, затем короткая транзакция на закрытие job.
         """
+        profile_id = request.profile_id
+        strategy = self._resolve_strategy(request)
+
         profile = await self._profiles.get(profile_id)
         if profile is None:
-            raise ProgramGenerationError(f"Профиль {profile_id} не найден")
+            raise GenerationFailedError(
+                f"Профиль {profile_id} не найден",
+                generation_error_code=GenerationErrorCode.PROFILE_NOT_FOUND.value,
+            )
 
-        if reuse_existing:
+        if request.reuse_existing:
             existing = await self._latest_valid_program(profile_id)
             if existing is not None:
                 logger.info(
@@ -207,14 +286,14 @@ class ProgramGenerationOrchestrator:
                 return self._reused_result(profile_id, existing)
 
         if self._generation_jobs is None:
-            return await self._generate(profile, profile_id)
+            return await self._generate(profile, profile_id, strategy)
 
         run = await self._generation_jobs.run(
             profile_id=profile_id,
-            trigger=trigger,
-            requested_generator=self._primary,
-            client_idempotency_key=client_idempotency_key,
-            operation=lambda: self._generate(profile, profile_id),
+            trigger=request.trigger,
+            requested_generator=strategy.primary,
+            client_idempotency_key=request.client_idempotency_key,
+            operation=lambda: self._generate(profile, profile_id, strategy),
         )
         if run.duplicate and run.existing_program is not None:
             result = self._reused_result(profile_id, run.existing_program)
@@ -222,28 +301,59 @@ class ProgramGenerationOrchestrator:
             return result
         if run.result is None:
             # Контракт `run`: либо duplicate с готовой программой, либо result.
-            raise ProgramGenerationError("Генерация не вернула результат")
+            raise GenerationFailedError(
+                "Генерация не вернула результат",
+                generation_error_code=GenerationErrorCode.GENERATION_FAILED.value,
+            )
         run.result.job = run.job
         return run.result
 
     # --- internals --------------------------------------------------------------
 
+    def _resolve_strategy(self, request: GenerationRequest) -> GenerationStrategy:
+        """Стратегия одного запроса.
+
+        Явно выбранный генератор не подменяется: `allow_fallback=False` даёт
+        стратегию из одного генератора, поэтому администратор видит настоящую
+        причину отказа, а не молча получает другую программу.
+        """
+        primary = request.requested_generator or self._primary
+        if primary not in VALID_GENERATORS:
+            raise ValueError(f"Недопустимый генератор: {primary}")
+        if not request.allow_fallback:
+            return GenerationStrategy(primary=primary)
+        return GenerationStrategy(primary=primary, fallback=self._fallback)
+
     def _reused_result(
         self, profile_id: str, program: WorkoutProgram
     ) -> OrchestratorResult:
         """Результат без новой генерации: пулы не пересчитывались."""
+        info = program.generation
         return OrchestratorResult(
             program=program,
             candidate_pool=ExerciseCandidatePool(
                 profile_id=profile_id,
-                total_exercises=program.generation.candidate_pool_total or 0,
+                total_exercises=info.candidate_pool_total or 0,
             ),
             safe_pool=SafeExercisePool(profile_id=profile_id),
             reused_existing=True,
+            requested_generator=(
+                info.requested_generator.value if info.requested_generator else ""
+            ),
+            actual_generator=(
+                info.actual_generator.value
+                if info.actual_generator
+                else info.source.value
+            ),
+            fallback_used=info.fallback_used,
+            fallback_reason_code=info.fallback_reason_code,
         )
 
     async def _generate(
-        self, profile: FitnessProfile, profile_id: str
+        self,
+        profile: FitnessProfile,
+        profile_id: str,
+        strategy: GenerationStrategy,
     ) -> OrchestratorResult:
         catalog = await self._exercises.list(limit=CATALOG_FETCH_LIMIT)
         catalog_ids = {e.external_id for e in catalog}
@@ -251,7 +361,7 @@ class ProgramGenerationOrchestrator:
         safe_pool = self._safety.apply(profile, candidate_pool.included)
 
         program, fallback_used = await self._run_generators(
-            profile, safe_pool, catalog_ids
+            profile, safe_pool, catalog_ids, strategy
         )
 
         program.generation.candidate_pool_total = candidate_pool.total_exercises
@@ -261,11 +371,17 @@ class ProgramGenerationOrchestrator:
         program.status = ProgramStatus.VALIDATED
         await self._persist(program, profile_id)
 
+        info = program.generation
         return OrchestratorResult(
             program=program,
             candidate_pool=candidate_pool,
             safe_pool=safe_pool,
             fallback_used=fallback_used,
+            requested_generator=strategy.primary,
+            actual_generator=(
+                info.actual_generator.value if info.actual_generator else ""
+            ),
+            fallback_reason_code=info.fallback_reason_code,
         )
 
     def _resolve_generator(self, name: str) -> ProgramGenerator | None:
@@ -287,18 +403,17 @@ class ProgramGenerationOrchestrator:
         profile: FitnessProfile,
         safe_pool: SafeExercisePool,
         catalog_ids: set[str],
+        strategy: GenerationStrategy,
     ) -> tuple[WorkoutProgram, bool]:
-        ordered = [self._primary]
-        if self._fallback != self._primary:
-            ordered.append(self._fallback)
+        ordered = strategy.ordered
 
         attempts: list[_GeneratorAttempt] = []
         logger.info(
             "event=generation_started",
             extra={
                 "profile_id": profile.profile_id,
-                "primary_generator": self._primary,
-                "fallback_generator": self._fallback,
+                "primary_generator": strategy.primary,
+                "fallback_generator": strategy.fallback or "none",
             },
         )
 
@@ -308,7 +423,7 @@ class ProgramGenerationOrchestrator:
                 reason = "; ".join(
                     f"{a.name}: {a.error_type or 'unavailable'} ({a.reason or 'n/a'})"
                     for a in attempts
-                ) or f"{self._primary} недоступен"
+                ) or f"{strategy.primary} недоступен"
                 logger.warning(
                     "event=generation_fallback_started",
                     extra={
@@ -337,6 +452,9 @@ class ProgramGenerationOrchestrator:
                         reason_code=AIFallbackReason.GENERATOR_NOT_CONFIGURED.value
                         if name == GENERATOR_AI
                         else None,
+                        error_code=GenerationErrorCode.AI_NOT_CONFIGURED
+                        if name == GENERATOR_AI
+                        else GenerationErrorCode.GENERATION_FAILED,
                         skipped=True,
                     )
                 )
@@ -345,7 +463,7 @@ class ProgramGenerationOrchestrator:
             try:
                 program = await generator.generate(profile, safe_pool)
             except Exception as exc:  # noqa: BLE001 — любая ошибка генератора ведёт к fallback
-                message = str(exc)[:400]
+                message = safe_error_message(exc)[:400]
                 attempts.append(
                     _GeneratorAttempt(
                         name=name,
@@ -355,6 +473,7 @@ class ProgramGenerationOrchestrator:
                         else None,
                         error_type=exc.__class__.__name__,
                         error_message=message,
+                        error_code=classify_error(exc),
                     )
                 )
                 logger.warning(
@@ -379,6 +498,7 @@ class ProgramGenerationOrchestrator:
                         else None,
                         error_type="ValidationError",
                         error_message=message,
+                        error_code=GenerationErrorCode.VALIDATION_FAILED,
                     )
                 )
                 logger.warning(
@@ -387,7 +507,9 @@ class ProgramGenerationOrchestrator:
                 )
                 continue
 
-            self._fill_generation_metadata(program, name, is_fallback, reason, attempts)
+            self._fill_generation_metadata(
+                program, name, is_fallback, reason, attempts, strategy
+            )
 
             logger.info(
                 "event=generation_primary_success"
@@ -400,7 +522,7 @@ class ProgramGenerationOrchestrator:
                 },
             )
             if is_fallback:
-                await self._record_fallback(program, attempts)
+                await self._record_fallback(program, attempts, strategy)
             return program, is_fallback
 
         last = attempts[-1]
@@ -408,15 +530,20 @@ class ProgramGenerationOrchestrator:
             "event=generation_failed",
             extra={
                 "profile_id": profile.profile_id,
-                "primary_generator": self._primary,
-                "fallback_generator": self._fallback,
+                "primary_generator": strategy.primary,
+                "fallback_generator": strategy.fallback or "none",
                 "last_generator": last.name,
                 "error_type": last.error_type or "unavailable",
+                "error_code": last.error_code.value,
             },
         )
-        raise ProgramGenerationError(
+        # Наружу уходит стабильный код отказа, а не тип внутреннего исключения:
+        # HTTP-слой и Telegram решают по коду, не разбирая ошибки AI Gateway.
+        raise GenerationFailedError(
             f"Не удалось сгенерировать программу "
-            f"(primary={self._primary}, fallback={self._fallback}): {last.reason or 'нет доступного генератора'}"
+            f"(primary={strategy.primary}, fallback={strategy.fallback or 'нет'}): "
+            f"{last.reason or 'нет доступного генератора'}",
+            generation_error_code=last.error_code.value,
         )
 
     async def _ai_gate_decision(self, profile_id: str) -> _GeneratorAttempt | None:
@@ -450,11 +577,17 @@ class ProgramGenerationOrchestrator:
             name=GENERATOR_AI,
             reason=decision.detail or "AI-конфигурация не готова",
             reason_code=reason_code,
+            # Gate отклонил попытку по состоянию конфигурации, а не по сбою
+            # вызова: код отказа должен отражать именно это.
+            error_code=GenerationErrorCode.AI_NOT_CONFIGURED,
             skipped=True,
         )
 
     async def _record_fallback(
-        self, program: WorkoutProgram, attempts: list[_GeneratorAttempt]
+        self,
+        program: WorkoutProgram,
+        attempts: list[_GeneratorAttempt],
+        strategy: GenerationStrategy,
     ) -> None:
         """Пишет fallback в журнал администратора. Сбой журнала не критичен."""
         if self._fallback_recorder is None:
@@ -468,7 +601,7 @@ class ProgramGenerationOrchestrator:
         try:
             await self._fallback_recorder(
                 FallbackEvent(
-                    requested_generator=self._primary,
+                    requested_generator=strategy.primary,
                     actual_generator=(
                         info.actual_generator.value if info.actual_generator else ""
                     ),
@@ -487,9 +620,10 @@ class ProgramGenerationOrchestrator:
         is_fallback: bool,
         reason: str | None,
         attempts: list[_GeneratorAttempt],
+        strategy: GenerationStrategy,
     ) -> None:
         info = program.generation
-        info.requested_generator = GenerationSource(self._primary)
+        info.requested_generator = GenerationSource(strategy.primary)
         info.actual_generator = GenerationSource(generator_name)
         info.fallback_used = is_fallback
         fallback_reason = reason

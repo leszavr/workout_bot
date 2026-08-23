@@ -245,6 +245,47 @@ def test_generate_program(client: TestClient, auth_headers: dict):
     assert body["generation"]["attempts"] == 1
     assert body["generation"]["reused_existing"] is False
     assert body["generation"]["last_error_code"] is None
+    # Фактическая стратегия — часть контракта результата (Phase 1.2-C).
+    assert body["generation"]["requested_generator"] == "deterministic"
+    assert body["generation"]["actual_generator"] == "deterministic"
+    assert body["generation"]["fallback_used"] is False
+    assert body["generation"]["fallback_reason_code"] is None
+
+
+def test_generate_program_ai_is_never_substituted(
+    client: TestClient, auth_headers: dict
+):
+    """Явно выбранный ИИ не подменяется алгоритмом подбора.
+
+    Главное следствие Phase 1.2-C: генерация идёт через оркестратор, но выбор
+    администратора не переопределяется fallback'ом. Тест не зависит от того,
+    настроен ли ИИ в окружении: проверяется инвариант, а не конкретный исход —
+    либо программа собрана именно ИИ, либо администратор видит отказ и
+    программы нет.
+    """
+    profile_id = "test-api-prog-ai"
+    _create_test_profile(client, profile_id)
+
+    response = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json={"generator": "ai"},
+    )
+
+    if response.status_code == 200:
+        generation = response.json()["generation"]
+        assert generation["requested_generator"] == "ai"
+        assert generation["actual_generator"] == "ai"
+        assert generation["fallback_used"] is False
+        return
+
+    # Отказ ИИ — не ошибка запроса администратора: это 502.
+    assert response.status_code == 502
+    assert "ИИ" in response.json()["detail"]
+    programs = client.get(
+        f"/api/v1/profiles/{profile_id}/programs", headers=auth_headers
+    ).json()
+    assert programs["total"] == 0
 
 
 def test_generate_program_with_same_idempotency_key_reuses_program(

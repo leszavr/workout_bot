@@ -12,7 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
-from apps.backend.api.v1.dependencies import build_program_service
+from apps.backend.api.v1.dependencies import (
+    build_generation_orchestrator,
+    build_program_service,
+)
 from apps.backend.api.v1.user_dependencies import build_admin_user_service
 from apps.backend.auth import (
     AuthenticatedUser,
@@ -26,13 +29,16 @@ from apps.backend.auth import (
     verify_env_admin,
 )
 from src.application.auth.service import AdminUserError
-from src.application.programs.service import GenerationResult
-from src.domain.ai.errors import AIError
+from src.application.programs.orchestrator import (
+    GenerationRequest,
+    OrchestratorResult,
+)
 from src.domain.auth import AdminRole
-from src.domain.generation import GenerationTrigger
+from src.domain.generation import GenerationErrorCode, GenerationTrigger
 from src.domain.program import WorkoutProgram
 from src.errors import (
     GenerationAlreadyRunningError,
+    GenerationFailedError,
     ProgramGenerationError,
     ProgramValidationError,
 )
@@ -605,7 +611,6 @@ async def list_ai_providers(_: Annotated[AuthenticatedUser, Depends(require_view
 @router.post(
     "/profiles/{profile_id}/programs/generate",
     responses={
-        404: {"description": "Profile not found"},
         409: {"description": "Generation for this profile is already running"},
         422: {"description": "Generation or validation failed"},
         502: {"description": "AI service call failed"},
@@ -618,33 +623,34 @@ async def generate_program(
 ) -> dict:
     """Запуск сборки программы выбранным генератором.
 
+    Phase 1.2-C: запрос обслуживает тот же `ProgramGenerationOrchestrator`,
+    что и автогенерация после подтверждения анкеты. Отличие только в запросе:
+    администратор выбрал генератор явно, поэтому `allow_fallback=False` —
+    подменять его молча нельзя, иначе администратор не узнает, что AI не
+    сработал.
+
     Идемпотентность серверная: повторный запрос той же логической генерации не
     создаёт вторую программу. Пока предыдущий запрос выполняется, повтор
     получает 409, а не второй job.
     """
     request = body or GenerateProgramRequest()
-    service = build_program_service(generator_type=request.generator)
+    orchestrator = build_generation_orchestrator()
     try:
-        result = await service.generate(
-            profile_id,
-            trigger=GenerationTrigger.ADMIN_REQUEST,
-            client_idempotency_key=request.idempotency_key,
+        result = await orchestrator.generate(
+            GenerationRequest(
+                profile_id=profile_id,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator=request.generator,
+                allow_fallback=False,
+                client_idempotency_key=request.idempotency_key,
+            )
         )
     except GenerationAlreadyRunningError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ProgramGenerationError as exc:
+    except GenerationFailedError as exc:
+        raise _generation_http_error(exc) from exc
+    except (ProgramGenerationError, ProgramValidationError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ProgramValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except AIError as exc:
-        # Сбой на стороне ИИ — не ошибка запроса. Администратор выбрал ИИ
-        # явно, поэтому молча подменять генератор нельзя: он должен увидеть
-        # причину и решить сам.
-        raise HTTPException(
-            status_code=502,
-            detail=f"Не удалось получить ответ от ИИ: {exc}. "
-            "Программу можно собрать алгоритмом подбора.",
-        ) from exc
     return {
         "program": result.program.model_dump(mode="json"),
         "generation": _generation_summary(result),
@@ -661,17 +667,51 @@ async def generate_program(
     }
 
 
-def _generation_summary(result: GenerationResult) -> dict:
+# Коды отказа, относящиеся к внешнему AI-сервису: это не ошибка запроса
+# администратора, поэтому отвечаем 502, а не 422.
+_AI_ERROR_CODES = frozenset(
+    {
+        GenerationErrorCode.AI_NOT_CONFIGURED.value,
+        GenerationErrorCode.AI_UNSUPPORTED_PROTOCOL.value,
+        GenerationErrorCode.AI_TIMEOUT.value,
+        GenerationErrorCode.AI_CONNECTION_FAILED.value,
+        GenerationErrorCode.AI_RATE_LIMITED.value,
+        GenerationErrorCode.AI_INVALID_RESPONSE.value,
+        GenerationErrorCode.AI_RUNTIME_FAILURE.value,
+    }
+)
+
+
+def _generation_http_error(exc: GenerationFailedError) -> HTTPException:
+    """HTTP-статус по стабильному коду отказа генерации.
+
+    Слой API не разбирает внутренние типы исключений AI Gateway: решение
+    принимается по коду, который оркестратор зафиксировал в момент отказа.
+    """
+    if exc.generation_error_code in _AI_ERROR_CODES:
+        return HTTPException(
+            status_code=502,
+            detail=f"Не удалось получить ответ от ИИ: {exc}. "
+            "Программу можно собрать алгоритмом подбора.",
+        )
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _generation_summary(result: OrchestratorResult) -> dict:
     """Operational-состояние генерации для админки.
 
-    Наружу отдаются только статус, попытки и код ошибки: internal id записи и
-    idempotency key клиенту не нужны.
+    Наружу отдаются только статус, попытки, код ошибки и фактическая стратегия:
+    internal id записи и idempotency key клиенту не нужны.
     """
     job = result.job
     return {
         "reused_existing": result.reused_existing,
         "job_id": job.job_id if job else None,
-        "status": job.status.value if job else None,
+        "status": result.status.value,
         "attempts": job.attempts if job else None,
         "last_error_code": job.last_error_code if job else None,
+        "requested_generator": result.requested_generator or None,
+        "actual_generator": result.actual_generator or None,
+        "fallback_used": result.fallback_used,
+        "fallback_reason_code": result.fallback_reason_code,
     }

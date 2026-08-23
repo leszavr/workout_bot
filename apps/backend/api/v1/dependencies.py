@@ -1,6 +1,7 @@
-"""Фабрика зависимостей backend: сборка ProgramService.
+"""Фабрика зависимостей backend.
 
 Routes не создают бизнес-логику напрямую — только запрашивают сервис.
+Генерация собирается в единственном месте: `build_generation_orchestrator`.
 """
 from __future__ import annotations
 
@@ -61,37 +62,19 @@ def build_generation_job_service() -> GenerationJobService:
     )
 
 
-def build_program_service(generator_type: str = "deterministic") -> ProgramService:
-    """Собирает ProgramService с указанным генератором.
-
-    Args:
-        generator_type: "deterministic" или "ai"
-    """
-    session_factory = get_session_factory()
-
-    if generator_type == "ai":
-        generator = build_ai_program_generator()
-    else:
-        generator = DeterministicProgramGenerator()
-
+def build_program_service() -> ProgramService:
+    """Чтение сохранённых программ. Генерации здесь нет (Phase 1.2-C)."""
     return ProgramService(
-        profile_repository=PostgresProfileRepository(session_factory),
-        exercise_repository=ExerciseRepository(session_factory),
-        program_repository=PostgresProgramRepository(session_factory),
-        generator=generator,
-        exercise_filter=ExerciseFilter(),
-        safety_engine=SafetyEngine(),
-        validator=ProgramValidator(),
-        generation_jobs=build_generation_job_service(),
-        requested_generator=generator_type,
+        program_repository=PostgresProgramRepository(get_session_factory())
     )
 
 
-def build_generation_orchestrator(
-    primary_generator: str | None = None,
-    fallback_generator: str | None = None,
-) -> ProgramGenerationOrchestrator:
-    """Собирает оркестратор генерации с конфигурируемыми generator'ами.
+def build_generation_orchestrator() -> ProgramGenerationOrchestrator:
+    """Единственная точка сборки generation pipeline (Phase 1.2-C).
+
+    Стратегия по умолчанию берётся из конфигурации приложения; вызывающий слой
+    может переопределить генератор в самом `GenerationRequest`, поэтому
+    отдельных фабрик под Telegram и Admin API нет.
 
     Оркестратор получает readiness gate и журнал fallback: решение «вызывать
     ли AI» принимается по фактическому состоянию конфигурации, а причина
@@ -102,8 +85,8 @@ def build_generation_orchestrator(
         profile_repository=PostgresProfileRepository(session_factory),
         exercise_repository=ExerciseRepository(session_factory),
         program_repository=PostgresProgramRepository(session_factory),
-        primary_generator=primary_generator or PROGRAM_PRIMARY_GENERATOR,
-        fallback_generator=fallback_generator or PROGRAM_FALLBACK_GENERATOR,
+        primary_generator=PROGRAM_PRIMARY_GENERATOR,
+        fallback_generator=PROGRAM_FALLBACK_GENERATOR,
         ai_generator_factory=build_ai_program_generator,
         deterministic_generator=DeterministicProgramGenerator(),
         exercise_filter=ExerciseFilter(),

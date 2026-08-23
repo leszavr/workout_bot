@@ -42,6 +42,20 @@ class ProgramGenerationError(WorkoutBotError):
     """Не удалось сгенерировать программу (пустой пул, неверный профиль)."""
 
 
+class GenerationFailedError(ProgramGenerationError):
+    """Отказ генерации с машиночитаемым кодом (Phase 1.2-C).
+
+    Оркестратор — единственная точка генерации, поэтому наружу он отдаёт не
+    внутренние исключения AI-контура, а стабильный код отказа. Вызывающий слой
+    (HTTP, Telegram) выбирает реакцию по коду и не разбирает типы исключений
+    AI Gateway; operational-запись получает ту же классификацию.
+    """
+
+    def __init__(self, message: str, *, generation_error_code: str) -> None:
+        super().__init__(message)
+        self.generation_error_code = generation_error_code
+
+
 class GenerationAlreadyRunningError(WorkoutBotError):
     """Та же логическая генерация уже выполняется.
 

@@ -36,6 +36,7 @@ from src.domain.ai.errors import (
 )
 from src.domain.enums import GenerationJobStatus
 from src.errors import (
+    GenerationFailedError,
     ProgramGenerationError,
     ProgramPersistenceError,
     ProgramValidationError,
@@ -172,7 +173,17 @@ def error_kind(code: GenerationErrorCode | str) -> GenerationErrorKind:
 
 
 def classify_error(exc: BaseException) -> GenerationErrorCode:
-    """Относит исключение генерации к стабильному коду ошибки."""
+    """Относит исключение генерации к стабильному коду ошибки.
+
+    `GenerationFailedError` уже несёт код, определённый оркестратором в момент
+    отказа: повторно классифицировать его по типу исключения нельзя, иначе
+    причина «AI не сконфигурирован» превратилась бы в общий сбой генерации.
+    """
+    if isinstance(exc, GenerationFailedError):
+        try:
+            return GenerationErrorCode(exc.generation_error_code)
+        except ValueError:
+            return GenerationErrorCode.GENERATION_FAILED
     if isinstance(exc, ProgramValidationError):
         return GenerationErrorCode.VALIDATION_FAILED
     if isinstance(exc, ProgramPersistenceError):

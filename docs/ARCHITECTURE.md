@@ -162,9 +162,11 @@ Profile → ExerciseFilter → CandidatePool → SafetyEngine → SafeExercisePo
 → ProgramGenerator → ProgramValidator → ProgramRepository (versioned)
 ```
 
-Оркестрацию выполняет `ProgramService` (application-слой); FastAPI routes
-и Telegram handlers не содержат бизнес-логики и получают сервис через
-фабрику зависимостей (`apps/backend/api/v1/dependencies.py`).
+Оркестрацию выполняет `ProgramGenerationOrchestrator` (application-слой) —
+единственная точка генерации в системе (Phase 1.2-C). FastAPI routes и Telegram
+handlers не содержат бизнес-логики и получают его через фабрику зависимостей
+(`apps/backend/api/v1/dependencies.py`). `ProgramService` из того же пакета
+генерацией не занимается: он только читает сохранённые версии программ.
 
 ### Exercise Filtering (`filtering.py`)
 Детерминированный отбор кандидатов. Учитываются:
@@ -224,10 +226,12 @@ JSONB (`data`), денормализованные колонки для спи�
 - `GET /api/v1/programs` — список (последние версии);
 - `GET /api/v1/programs/{id}?version=N` — программа + список версий;
 - `GET /api/v1/profiles/{id}/programs` — программы профиля;
-- `POST /api/v1/profiles/{id}/programs/generate` — запуск генерации; принимает
-  необязательный `idempotency_key` и возвращает блок `generation` (статус job,
-  число попыток, код ошибки, признак повторного использования). Повтор при
-  активной генерации → `409`;
+- `POST /api/v1/profiles/{id}/programs/generate` — запуск генерации через
+  `ProgramGenerationOrchestrator`; принимает необязательный `idempotency_key` и
+  возвращает блок `generation` (статус job, число попыток, код ошибки, признак
+  повторного использования, запрошенный и фактический генератор, признак и
+  причину fallback). Повтор при активной генерации → `409`, ошибка данных или
+  валидации → `422`, сбой явно выбранного ИИ → `502`;
 - `GET /api/v1/exercises/external/{external_id}` — поиск упражнения по
   каноническому ID (программы ссылаются на external_id, а не surrogate id).
 
@@ -266,25 +270,64 @@ Telegram Delivery (document, ограниченные retry)
 ```
 
 ### ProgramGenerationOrchestrator (`orchestrator.py`)
+
+Единственная application-level точка генерации (Phase 1.2-C). Вход —
+`GenerationRequest`, выход — `OrchestratorResult`; альтернативных generation
+pipeline'ов в системе нет.
+
+```
+Telegram (автогенерация после finalize) ──┐
+                                          ▼
+                                GenerationRequest
+                                          ▼
+                        ProgramGenerationOrchestrator
+                                          ▲
+                                          │
+Admin API (POST …/programs/generate) ─────┘
+```
+
+Различие вызывающих слоёв выражено только запросом:
+
+| | requested_generator | allow_fallback | reuse_existing |
+| --- | --- | --- | --- |
+| Автогенерация после finalize | из конфигурации | да | да |
+| Запрос администратора | выбран явно | нет | нет |
+
+`allow_fallback=False` для администратора — сознательное решение: он выбрал
+генератор сам, и молчаливая подмена скрыла бы неработоспособность ИИ. Отказ
+возвращается как HTTP 502, программа не создаётся.
+
 Соединяет фильтр, safety, генераторы, валидатор и репозиторий:
 - конфигурация primary/fallback симметрична (`PROGRAM_PRIMARY_GENERATOR`,
   `PROGRAM_FALLBACK_GENERATOR`): ai→deterministic по умолчанию,
-  обратный порядок тоже поддерживается;
+  обратный порядок тоже поддерживается; запрос может переопределить primary;
 - строго один fallback: primary → fallback → final failure, никаких циклов;
+  fallback идёт внутри того же job, второй job и вторая программа не создаются;
 - перед AI-попыткой спрашивает readiness gate (Phase 1.1.1, ниже): заведомо
   нерабочая конфигурация не приводит к AI-запросу;
 - `GenerationInfo` в программе фиксирует запрошенный и фактический
   генератор, `fallback_used`, человекочитаемую причину и машиночитаемый
-  `fallback_reason_code`;
+  `fallback_reason_code`; те же данные попадают в `OrchestratorResult`;
 - пользователь не получает техническую ошибку AI, если fallback сработал;
 - идемпотентность: повторный вызов после успешной генерации возвращает
   существующую валидную программу (`reused_existing=True`), новая версия
   создаётся только явным запросом или после failure.
 
+Наружный контракт ошибки — стабильный код, а не тип исключения: отказ приходит
+как `GenerationFailedError` с `GenerationErrorCode`. Telegram и HTTP-слой не
+разбирают внутренние исключения AI Gateway; HTTP-статус выбирается по коду
+(409 / 422 / 502). Секреты вычищаются из текста отказа.
+
 Оркестратор принимает gate и журнал fallback как две необязательные функции
 (`ai_readiness_gate`, `fallback_recorder`), а не конкретный AI-сервис. Поэтому
 он не зависит от AI-инфраструктуры и тестируется без неё; связывание
 происходит в `apps/backend/api/v1/dependencies.py`.
+
+Граница закреплена архитектурным тестом
+`tests/unit/test_generation_boundary.py`: Telegram gateway и Admin API не могут
+обращаться к генераторам, `ProgramValidator`, `SafetyEngine`, записи программы
+и переходам состояния job. Легитимное исключение — фабрика зависимостей, где
+pipeline собирается один раз для обоих слоёв.
 
 ### Generation ≠ Delivery
 Ошибка Telegram-доставки не приводит к повторной генерации: программа уже
@@ -305,7 +348,7 @@ Telegram Delivery (document, ограниченные retry)
   — создание через `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`,
   переход через `UPDATE ... WHERE status = :expected`;
 - application: `src/application/programs/generation_jobs.py` — оборачивает
-  существующую генерацию, ничего не решая за оркестратор.
+  генерацию оркестратора в operational-запись, ничего не решая за него.
 
 **Одна логическая генерация = (profile_id, бизнес-событие, номер попытки).**
 `profile_id` в одиночку ключом быть не может: анкета законно имеет несколько
@@ -446,7 +489,9 @@ AI Health нет.
 `RuntimeGateDecision(allowed, reason, detail)`. Причина берётся из первого
 блокирующего шага того же чек-листа, который показывает `report()`, поэтому
 runtime и админка не могут разойтись. Оркестратор при `allowed=False` не
-делает AI-запрос и сразу переходит к детерминированному генератору.
+делает AI-запрос: если запрос допускает fallback, он сразу переходит к
+детерминированному генератору, иначе (явный выбор администратора) возвращает
+отказ с причиной.
 
 Сбой самого gate не блокирует генерацию: при неизвестном состоянии попытка
 выполняется, решение остаётся за AI.

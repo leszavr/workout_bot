@@ -72,11 +72,27 @@
 оставлял бы job в состоянии, из которого его никто не выводит. Recovery stale
 `RUNNING` после падения процесса тоже относится к 1.2-D.
 
-#### 1.2-C — Generation Orchestrator
-- [ ] единый `ProgramGenerationOrchestrator`;
-- [ ] Telegram и Admin API используют один orchestration path;
-- [ ] readiness/fallback/safety/validation не обходятся;
-- [ ] веб-кнопка `Generate Program` переводится на общий путь.
+#### 1.2-C — Generation Orchestrator: DONE
+- [x] единый `ProgramGenerationOrchestrator`: единственный вход в генерацию —
+      `GenerationRequest`, единственный выход — `OrchestratorResult`;
+- [x] Telegram и Admin API используют один orchestration path; второй pipeline
+      (`ProgramService.generate`) удалён, сервис отвечает только за чтение;
+- [x] readiness/fallback/safety/validation не обходятся: единственный владелец
+      этих шагов — оркестратор;
+- [x] веб-кнопка `Generate Program` переведена на общий путь
+      (`POST /profiles/{id}/programs/generate` → оркестратор);
+- [x] различие вызывающих слоёв выражено только запросом: автогенерация берёт
+      стратегию из конфигурации и разрешает fallback, явный запрос
+      администратора запрещает подмену генератора;
+- [x] наружу отдаётся стабильный код отказа (`GenerationFailedError`), а не
+      внутренние исключения AI Gateway; HTTP-статус выбирается по коду;
+- [x] архитектурный acceptance-тест `tests/unit/test_generation_boundary.py`
+      статически запрещает прямые вызовы генераторов, validator, safety,
+      записи программы и переходов job из Telegram/Admin API.
+
+**Осознанное ограничение:** retry, worker и stale-recovery по-прежнему не
+реализованы (1.2-D); delivery остаётся отдельной операцией и в оркестратор не
+входит (1.2-E).
 
 #### 1.2-D — Worker / retry / recovery
 - [ ] фоновые jobs;

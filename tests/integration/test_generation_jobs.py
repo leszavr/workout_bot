@@ -23,9 +23,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.application.programs.filtering import ExerciseFilter
 from src.application.programs.generation_jobs import GenerationJobService
 from src.application.programs.generator import DeterministicProgramGenerator
-from src.application.programs.orchestrator import ProgramGenerationOrchestrator
+from src.application.programs.orchestrator import (
+    GenerationRequest,
+    ProgramGenerationOrchestrator,
+)
 from src.application.programs.safety import SafetyEngine
-from src.application.programs.service import ProgramService
 from src.application.programs.validator import ProgramValidator
 from src.domain.ai.errors import AITimeoutError
 from src.domain.enums import (
@@ -45,8 +47,8 @@ from src.domain.generation import (
 from src.domain.profile import FitnessProfile
 from src.errors import (
     GenerationAlreadyRunningError,
+    GenerationFailedError,
     ProgramGenerationError,
-    ProgramValidationError,
 )
 from src.infrastructure.config import DATABASE_URL
 from src.infrastructure.persistence.postgres.generation_job_repository import (
@@ -162,9 +164,16 @@ def _job(profile_id: str, *, job_id: str, key: str) -> GenerationJob:
     )
 
 
-def _program_service(
-    sessions, *, generator=None, with_jobs: bool = True
-) -> ProgramService:
+def _orchestrator(
+    sessions,
+    *,
+    primary: str = "deterministic",
+    fallback: str = "deterministic",
+    ai_generator=None,
+    deterministic=None,
+    with_jobs: bool = True,
+) -> ProgramGenerationOrchestrator:
+    """Оркестратор — единственная точка генерации (Phase 1.2-C)."""
     from src.infrastructure.persistence.postgres.exercise_repository import (
         ExerciseRepository,
     )
@@ -183,15 +192,38 @@ def _program_service(
         if with_jobs
         else None
     )
-    return ProgramService(
+    return ProgramGenerationOrchestrator(
         profile_repository=PostgresProfileRepository(sessions),
         exercise_repository=ExerciseRepository(sessions),
         program_repository=programs,
-        generator=generator or DeterministicProgramGenerator(),
+        primary_generator=primary,
+        fallback_generator=fallback,
+        ai_generator_factory=(lambda: ai_generator) if ai_generator else None,
+        deterministic_generator=deterministic or DeterministicProgramGenerator(),
         exercise_filter=ExerciseFilter(),
         safety_engine=SafetyEngine(),
         validator=ProgramValidator(),
         generation_jobs=jobs,
+    )
+
+
+def _admin_request(profile_id: str, *, key: str | None = None) -> GenerationRequest:
+    """Запрос администратора: генератор выбран явно, fallback запрещён."""
+    return GenerationRequest(
+        profile_id=profile_id,
+        trigger=GenerationTrigger.ADMIN_REQUEST,
+        requested_generator="deterministic",
+        allow_fallback=False,
+        client_idempotency_key=key,
+    )
+
+
+def _auto_request(profile_id: str, *, reuse_existing: bool = True) -> GenerationRequest:
+    """Автогенерация после finalize: стратегия из конфигурации, fallback разрешён."""
+    return GenerationRequest(
+        profile_id=profile_id,
+        trigger=GenerationTrigger.AUTO_FINALIZATION,
+        reuse_existing=reuse_existing,
     )
 
 
@@ -228,10 +260,10 @@ class TestGenerationJobPersistence:
         assert running.started_at is not None
 
     async def test_running_to_succeeded_links_program_version(self, sessions):
-        service = _program_service(sessions)
+        orchestrator = _orchestrator(sessions)
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}success")
 
-        result = await service.generate(profile.profile_id)
+        result = await orchestrator.generate(_admin_request(profile.profile_id))
 
         assert result.job is not None
         assert result.job.status is GenerationJobStatus.SUCCEEDED
@@ -386,13 +418,13 @@ class TestIdempotencyBoundary:
     async def test_concurrent_generation_requests_create_one_program(self, sessions):
         """Параллельные запросы генерации: один job, одна программа."""
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}race-gen")
-        service_a = _program_service(sessions)
-        service_b = _program_service(sessions)
+        orchestrator_a = _orchestrator(sessions)
+        orchestrator_b = _orchestrator(sessions)
         key = "client-race"
 
         results = await asyncio.gather(
-            service_a.generate(profile.profile_id, client_idempotency_key=key),
-            service_b.generate(profile.profile_id, client_idempotency_key=key),
+            orchestrator_a.generate(_admin_request(profile.profile_id, key=key)),
+            orchestrator_b.generate(_admin_request(profile.profile_id, key=key)),
             return_exceptions=True,
         )
 
@@ -422,11 +454,11 @@ class TestIdempotencyBoundary:
     async def test_repeated_successful_request_reuses_program(self, sessions):
         """Повтор успешного запроса не создаёт вторую программу."""
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}reuse")
-        service = _program_service(sessions)
+        orchestrator = _orchestrator(sessions)
         key = "client-reuse"
 
-        first = await service.generate(profile.profile_id, client_idempotency_key=key)
-        second = await service.generate(profile.profile_id, client_idempotency_key=key)
+        first = await orchestrator.generate(_admin_request(profile.profile_id, key=key))
+        second = await orchestrator.generate(_admin_request(profile.profile_id, key=key))
 
         assert second.reused_existing is True
         assert second.program.program_id == first.program.program_id
@@ -437,10 +469,10 @@ class TestIdempotencyBoundary:
     async def test_admin_request_after_success_creates_new_version(self, sessions):
         """Явный повторный запрос администратора — законная новая генерация."""
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}new-version")
-        service = _program_service(sessions)
+        orchestrator = _orchestrator(sessions)
 
-        first = await service.generate(profile.profile_id)
-        second = await service.generate(profile.profile_id)
+        first = await orchestrator.generate(_admin_request(profile.profile_id))
+        second = await orchestrator.generate(_admin_request(profile.profile_id))
 
         assert second.reused_existing is False
         assert second.program.version == first.program.version + 1
@@ -450,13 +482,13 @@ class TestIdempotencyBoundary:
     async def test_auto_generation_repeat_does_not_regenerate(self, sessions):
         """Повторная автогенерация после finalize возвращает готовую программу."""
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}auto")
-        service = _program_service(sessions)
+        orchestrator = _orchestrator(sessions)
 
-        first = await service.generate(
-            profile.profile_id, trigger=GenerationTrigger.AUTO_FINALIZATION
+        first = await orchestrator.generate(
+            _auto_request(profile.profile_id, reuse_existing=False)
         )
-        second = await service.generate(
-            profile.profile_id, trigger=GenerationTrigger.AUTO_FINALIZATION
+        second = await orchestrator.generate(
+            _auto_request(profile.profile_id, reuse_existing=False)
         )
 
         assert second.reused_existing is True
@@ -495,10 +527,10 @@ class TestTransactionSafety:
     async def test_failed_generation_creates_no_program(self, sessions):
         """При отказе программа не создаётся даже фиктивно."""
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}no-program")
-        service = _program_service(sessions, generator=_FailingGenerator())
+        orchestrator = _orchestrator(sessions, deterministic=_FailingGenerator())
 
         with pytest.raises(ProgramGenerationError):
-            await service.generate(profile.profile_id)
+            await orchestrator.generate(_admin_request(profile.profile_id))
 
         assert await _count_programs(sessions, profile.profile_id) == 0
         jobs = await GenerationJobRepository(sessions).list_for_profile(
@@ -511,11 +543,11 @@ class TestTransactionSafety:
 
     async def test_validation_failure_is_recorded_as_non_retryable(self, sessions):
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}invalid")
-        service = _program_service(sessions, generator=DeterministicProgramGenerator())
-        service._validator = _RejectingValidator()  # noqa: SLF001 — подмена в тесте
+        orchestrator = _orchestrator(sessions)
+        orchestrator._validator = _RejectingValidator()  # noqa: SLF001 — подмена в тесте
 
-        with pytest.raises(ProgramValidationError):
-            await service.generate(profile.profile_id)
+        with pytest.raises(ProgramGenerationError):
+            await orchestrator.generate(_admin_request(profile.profile_id))
 
         jobs = await GenerationJobRepository(sessions).list_for_profile(
             profile.profile_id
@@ -525,10 +557,12 @@ class TestTransactionSafety:
 
     async def test_missing_profile_creates_no_job(self, sessions):
         """У несуществующего профиля не должно остаться operational-записи."""
-        service = _program_service(sessions)
+        orchestrator = _orchestrator(sessions)
 
         with pytest.raises(ProgramGenerationError):
-            await service.generate(f"{PROFILE_PREFIX}nonexistent")
+            await orchestrator.generate(
+                _admin_request(f"{PROFILE_PREFIX}nonexistent")
+            )
 
         async with sessions() as session:
             total = (
@@ -544,9 +578,9 @@ class TestTransactionSafety:
     async def test_generation_without_jobs_still_works(self, sessions):
         """Существующий путь без job-контура не сломан."""
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}no-jobs")
-        service = _program_service(sessions, with_jobs=False)
+        orchestrator = _orchestrator(sessions, with_jobs=False)
 
-        result = await service.generate(profile.profile_id)
+        result = await orchestrator.generate(_admin_request(profile.profile_id))
 
         assert result.job is None
         assert result.program.status is ProgramStatus.VALIDATED
@@ -577,35 +611,6 @@ class _BrokenAIGenerator:
         raise AITimeoutError("AI недоступен в тесте")
 
 
-def _orchestrator(sessions, *, primary: str, ai_generator):
-    from src.infrastructure.persistence.postgres.exercise_repository import (
-        ExerciseRepository,
-    )
-    from src.infrastructure.persistence.postgres.profile_repository import (
-        PostgresProfileRepository,
-    )
-    from src.infrastructure.persistence.postgres.program_repository import (
-        PostgresProgramRepository,
-    )
-
-    programs = PostgresProgramRepository(sessions)
-    return ProgramGenerationOrchestrator(
-        profile_repository=PostgresProfileRepository(sessions),
-        exercise_repository=ExerciseRepository(sessions),
-        program_repository=programs,
-        primary_generator=primary,
-        fallback_generator="deterministic",
-        ai_generator_factory=lambda: ai_generator,
-        deterministic_generator=DeterministicProgramGenerator(),
-        exercise_filter=ExerciseFilter(),
-        safety_engine=SafetyEngine(),
-        validator=ProgramValidator(),
-        generation_jobs=GenerationJobService(
-            repository=GenerationJobRepository(sessions), program_repository=programs
-        ),
-    )
-
-
 class TestOrchestratorUnderJobControl:
     async def test_ai_generation_still_works(self, sessions):
         """Существующая AI-генерация не сломана job-контуром."""
@@ -616,7 +621,7 @@ class TestOrchestratorUnderJobControl:
             ai_generator=_StubAIGenerator(DeterministicProgramGenerator()),
         )
 
-        result = await orchestrator.generate(profile.profile_id)
+        result = await orchestrator.generate(_auto_request(profile.profile_id))
 
         assert result.program.generation.source is GenerationSource.AI
         assert result.fallback_used is False
@@ -632,15 +637,44 @@ class TestOrchestratorUnderJobControl:
             sessions, primary="ai", ai_generator=_BrokenAIGenerator()
         )
 
-        result = await orchestrator.generate(profile.profile_id)
+        result = await orchestrator.generate(_auto_request(profile.profile_id))
 
         assert result.fallback_used is True
         assert result.program.generation.actual_generator is (
             GenerationSource.DETERMINISTIC
         )
+        assert result.actual_generator == "deterministic"
+        assert result.requested_generator == "ai"
         assert result.job is not None
         assert result.job.status is GenerationJobStatus.SUCCEEDED
+        # Fallback выполняется внутри одного job: второй записи нет.
+        assert await _count_jobs(sessions, profile.profile_id) == 1
         assert await _count_programs(sessions, profile.profile_id) == 1
+
+    async def test_admin_request_does_not_fall_back(self, sessions):
+        """Явно выбранный генератор не подменяется молча (Phase 1.2-C)."""
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}orch-no-fallback")
+        orchestrator = _orchestrator(
+            sessions, primary="ai", ai_generator=_BrokenAIGenerator()
+        )
+
+        with pytest.raises(GenerationFailedError) as exc:
+            await orchestrator.generate(
+                GenerationRequest(
+                    profile_id=profile.profile_id,
+                    trigger=GenerationTrigger.ADMIN_REQUEST,
+                    requested_generator="ai",
+                    allow_fallback=False,
+                )
+            )
+
+        assert exc.value.generation_error_code == GenerationErrorCode.AI_TIMEOUT.value
+        assert await _count_programs(sessions, profile.profile_id) == 0
+        jobs = await GenerationJobRepository(sessions).list_for_profile(
+            profile.profile_id
+        )
+        assert jobs[0].status is GenerationJobStatus.FAILED
+        assert jobs[0].last_error_code == GenerationErrorCode.AI_TIMEOUT.value
 
     async def test_repeated_auto_generation_reuses_program(self, sessions):
         """Повторный finalize не создаёт вторую программу."""
@@ -651,8 +685,8 @@ class TestOrchestratorUnderJobControl:
             ai_generator=_StubAIGenerator(DeterministicProgramGenerator()),
         )
 
-        first = await orchestrator.generate(profile.profile_id, reuse_existing=True)
-        second = await orchestrator.generate(profile.profile_id, reuse_existing=True)
+        first = await orchestrator.generate(_auto_request(profile.profile_id))
+        second = await orchestrator.generate(_auto_request(profile.profile_id))
 
         assert second.reused_existing is True
         assert second.program.program_id == first.program.program_id
@@ -674,8 +708,8 @@ class TestOrchestratorUnderJobControl:
         )
 
         results = await asyncio.gather(
-            orchestrator_a.generate(profile.profile_id, reuse_existing=True),
-            orchestrator_b.generate(profile.profile_id, reuse_existing=True),
+            orchestrator_a.generate(_auto_request(profile.profile_id)),
+            orchestrator_b.generate(_auto_request(profile.profile_id)),
             return_exceptions=True,
         )
 
@@ -686,15 +720,35 @@ class TestOrchestratorUnderJobControl:
         assert await _count_jobs(sessions, profile.profile_id) == 1
         assert await _count_programs(sessions, profile.profile_id) == 1
 
+    async def test_telegram_and_admin_paths_use_same_orchestrator(self, sessions):
+        """Оба пути приходят в одну точку и дают эквивалентную программу."""
+        auto_profile = await _save_profile(sessions, f"{PROFILE_PREFIX}orch-auto-path")
+        admin_profile = await _save_profile(
+            sessions, f"{PROFILE_PREFIX}orch-admin-path"
+        )
+        orchestrator = _orchestrator(sessions)
+
+        auto = await orchestrator.generate(_auto_request(auto_profile.profile_id))
+        admin = await orchestrator.generate(_admin_request(admin_profile.profile_id))
+
+        assert auto.job is not None and admin.job is not None
+        assert auto.job.trigger is GenerationTrigger.AUTO_FINALIZATION
+        assert admin.job.trigger is GenerationTrigger.ADMIN_REQUEST
+        assert auto.program.status is admin.program.status is ProgramStatus.VALIDATED
+        assert auto.actual_generator == admin.actual_generator == "deterministic"
+        assert len(auto.program.training_days) == len(admin.program.training_days)
+
     async def test_failed_generation_records_error_code(self, sessions):
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}orch-failed")
         orchestrator = _orchestrator(
-            sessions, primary="deterministic", ai_generator=_BrokenAIGenerator()
+            sessions,
+            primary="deterministic",
+            ai_generator=_BrokenAIGenerator(),
+            deterministic=_FailingGenerator(),
         )
-        orchestrator._deterministic = _FailingGenerator()  # noqa: SLF001 — подмена в тесте
 
         with pytest.raises(ProgramGenerationError):
-            await orchestrator.generate(profile.profile_id)
+            await orchestrator.generate(_auto_request(profile.profile_id))
 
         jobs = await GenerationJobRepository(sessions).list_for_profile(
             profile.profile_id
