@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from pathlib import Path
 
 import pytest
 
@@ -415,6 +417,48 @@ class TestUnifiedFallbackClassification:
     def test_fallback_reasons_are_valid_enum_members(self):
         for reason in _FALLBACK_REASON_BY_CODE.values():
             assert AIFallbackReason(reason.value) is reason
+
+    def test_every_fallback_reason_has_admin_label(self):
+        """Каждая причина видна администратору словами, а не кодом.
+
+        Причина fallback попадает в журнал администратора и отображается в
+        админке через `AI_FALLBACK_REASON_LABELS`; отсутствующая метка выводится
+        как сырой код. Добавление значения в enum без метки — тихая регрессия
+        интерфейса, поэтому соответствие проверяется тестом.
+        """
+        labels_file = (
+            Path(__file__).resolve().parents[2] / "apps/web/lib/labels.ts"
+        ).read_text(encoding="utf-8")
+        block = labels_file.split("AI_FALLBACK_REASON_LABELS", 1)[1].split("};", 1)[0]
+        labelled = set(re.findall(r"^\s*([a-z_]+):", block, flags=re.MULTILINE))
+
+        missing = sorted(r.value for r in AIFallbackReason if r.value not in labelled)
+        assert missing == [], (
+            "Для этих причин fallback нет подписи в apps/web/lib/labels.ts: "
+            f"{missing}. Администратор увидит сырой код."
+        )
+
+    def test_every_fallback_reason_has_admin_label(self):
+        """У каждой причины есть человекочитаемая метка в админке.
+
+        Причина попадает в журнал администратора и в ответ API, а фронтенд
+        показывает сырой код, если метки нет. Добавление значения в enum без
+        метки — именно тот случай, который иначе замечают только глазами в UI.
+        """
+        labels_file = (
+            Path(__file__).resolve().parents[2] / "apps/web/lib/labels.ts"
+        )
+        source = labels_file.read_text(encoding="utf-8")
+        block = re.search(
+            r"AI_FALLBACK_REASON_LABELS[^{]*\{(.*?)\n\};", source, re.DOTALL
+        )
+        assert block is not None, "Не найден AI_FALLBACK_REASON_LABELS в labels.ts"
+        labelled = set(re.findall(r"^\s*([a-z_]+):", block.group(1), re.MULTILINE))
+
+        missing = sorted(r.value for r in AIFallbackReason if r.value not in labelled)
+        assert missing == [], (
+            f"Нет меток в apps/web/lib/labels.ts для причин: {missing}"
+        )
 
 
 class TestSafeErrorMessage:

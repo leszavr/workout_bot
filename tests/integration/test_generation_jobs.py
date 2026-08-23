@@ -451,8 +451,14 @@ class TestIdempotencyBoundary:
         # Проигравший запрос либо получил отказ (генерация ещё идёт), либо
         # дождался результата победителя. В обоих случаях второй программы нет.
         assert len(successes) + len(rejected) == 2
+        # Иных исходов быть не должно: любое другое исключение означало бы, что
+        # гонку разрешил не контур идемпотентности.
+        assert len(successes) >= 1
         assert await _count_jobs(sessions, profile.profile_id) == 1
         assert await _count_programs(sessions, profile.profile_id) == 1
+        # Все успешные ответы указывают на одну и ту же версию программы.
+        program_ids = {r.program.program_id for r in successes}
+        assert len(program_ids) == 1
 
     async def test_different_keys_create_independent_jobs(self, sessions):
         profile = await _save_profile(sessions, f"{PROFILE_PREFIX}two-keys")
@@ -541,7 +547,7 @@ class TestIdempotencyKeyParameterConflict:
     async def test_concurrent_conflicting_generators_on_independent_engines(
         self, sessions, second_sessions
     ):
-        """Гонка на двух независимых engine: победитель один, второй — конфликт.
+        """Гонка на двух независимых engine: победитель один, второй не получает чужого.
 
         Сессии берутся из разных engine, поэтому взаимное исключение обеспечивает
         именно PostgreSQL (UNIQUE по ключу), а не общий пул или Python-примитив.
@@ -582,6 +588,10 @@ class TestIdempotencyKeyParameterConflict:
         assert len(conflicts) + len(running) == 1
         assert await _count_jobs(sessions, profile.profile_id) == 1
         assert await _count_programs(sessions, profile.profile_id) == 1
+        # Главное: никто не получил программу, собранную не тем генератором,
+        # который он запросил. Именно это ломалось до проверки параметров ключа.
+        for result in successes:
+            assert result.actual_generator == result.requested_generator
 
     async def test_same_key_same_generator_still_reuses(self, sessions):
         """Regression: совместимый повтор по-прежнему отдаёт готовую программу."""
