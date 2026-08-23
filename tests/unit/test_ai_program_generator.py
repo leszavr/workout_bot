@@ -272,6 +272,30 @@ class TestAIProgramGenerator:
             await generator.generate(profile, pool)
 
     @pytest.mark.asyncio
+    async def test_repair_is_skipped_when_time_budget_exhausted(self):
+        """Исчерпанный бюджет времени прекращает попытки исправления.
+
+        Без общего бюджета таймауты складывались (попытки × таймаут × repair) и
+        запрос «висел» минутами вместо понятного отказа.
+        """
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        gateway = FakeAIGateway(["invalid json", make_valid_program_json(pool)])
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=2,
+            total_budget_seconds=0,  # время вышло ещё до первой попытки
+        )
+
+        with pytest.raises(ProgramGenerationError, match="время"):
+            await generator.generate(profile, pool)
+        # Исправление не запрашивалось: был только первоначальный вызов.
+        assert len(gateway.calls) == 1
+
+    @pytest.mark.asyncio
     async def test_exercise_outside_safe_pool_rejected(self):
         """Упражнение вне safe pool → отклонение."""
         pool = make_safe_pool()

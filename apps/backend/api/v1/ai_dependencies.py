@@ -100,6 +100,7 @@ def build_ai_components(http_client: httpx.AsyncClient | None = None) -> AICompo
         prompts=prompts,
         selector=selector,
         adapter_registry=adapter_registry,
+        secret_store=secret_store,
         primary_generator=PROGRAM_PRIMARY_GENERATOR,
         fallback_generator=PROGRAM_FALLBACK_GENERATOR,
         auto_generate_after_finalize=AUTO_GENERATE_PROGRAM_AFTER_FINALIZE,

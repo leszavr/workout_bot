@@ -1,16 +1,19 @@
 "use client";
 
-// Guided setup: одна форма вместо ручного обхода трёх уровней вложенности.
-// Порядок шагов зафиксирован и виден пользователю: провайдер → эндпоинт с
-// ключом → модель → проверка подключения → включение задачи. Задача НЕ
-// включается, если проверка подключения не прошла.
+// Подключение ИИ за один шаг.
 //
-// Собственного backend-пути у мастера нет: используются те же admin-endpoint'ы,
-// что и в экспертном режиме ниже на странице.
+// Основной путь настройки: вместо обхода трёх уровней вложенности —
+// одна форма. Порядок действий виден пользователю, и задача включается
+// только если проверка связи прошла: иначе получилась бы настройка,
+// которая гарантированно не работает.
+//
+// Своего отдельного пути на сервере у мастера нет — используются те же
+// запросы, что и на вкладке «Подключения».
 
 import { useState } from "react";
 
-import { aiApi } from "@/lib/api";
+import { Card, Field, Notice, Status } from "@/components/ui/Primitives";
+import { AIDiscoveredModel, aiApi } from "@/lib/api";
 
 type StepStatus = "pending" | "running" | "ok" | "error";
 
@@ -22,33 +25,34 @@ interface Step {
 }
 
 const STEP_TITLES: Array<{ key: string; title: string }> = [
-  { key: "provider", title: "Провайдер" },
-  { key: "endpoint", title: "Эндпоинт и API-ключ" },
-  { key: "model", title: "Модель" },
-  { key: "connection", title: "Проверка подключения" },
-  { key: "task", title: "Включение генерации" },
+  { key: "provider", title: "Создаём сервис" },
+  { key: "endpoint", title: "Сохраняем адрес и ключ доступа" },
+  { key: "model", title: "Добавляем модель" },
+  { key: "connection", title: "Проверяем связь" },
+  { key: "task", title: "Включаем создание программ через ИИ" },
 ];
 
-const STATUS_ICONS: Record<StepStatus, string> = {
-  pending: "○",
-  running: "…",
-  ok: "✓",
-  error: "✗",
+const STATUS_LABELS: Record<StepStatus, string> = {
+  pending: "ожидает",
+  running: "выполняется",
+  ok: "готово",
+  error: "ошибка",
 };
 
-const STATUS_COLORS: Record<StepStatus, string> = {
-  pending: "#4b5563",
-  running: "#1d4ed8",
-  ok: "#166534",
-  error: "#b91c1c",
+const STATUS_TONES: Record<StepStatus, "neutral" | "info" | "ok" | "bad"> = {
+  pending: "neutral",
+  running: "info",
+  ok: "ok",
+  error: "bad",
 };
 
+/** Короткое имя для сервиса: техническое поле, пользователь его не вводит. */
 function slugify(value: string): string {
   const slug = value
     .toLowerCase()
     .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return slug || "ai-provider";
+  return slug || "ai-service";
 }
 
 export default function AIQuickSetup(props: Readonly<{
@@ -62,6 +66,29 @@ export default function AIQuickSetup(props: Readonly<{
   const [modelId, setModelId] = useState("");
   const [steps, setSteps] = useState<Step[]>([]);
   const [running, setRunning] = useState(false);
+  // Список моделей запрашивается у сервиса по введённому адресу и ключу:
+  // переписывать идентификатор из документации вручную не нужно.
+  const [models, setModels] = useState<AIDiscoveredModel[] | null>(null);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [modelsError, setModelsError] = useState("");
+  const [modelFilter, setModelFilter] = useState("");
+
+  const ready = name.trim() && baseUrl.trim() && modelId.trim();
+
+  const loadModels = async () => {
+    setLoadingModels(true);
+    setModelsError("");
+    try {
+      const res = await aiApi.probeModels(baseUrl.trim(), apiKey.trim() || undefined);
+      setModels(res.items);
+      if (res.items.length === 1) setModelId(res.items[0].model_id);
+    } catch (e) {
+      setModels(null);
+      setModelsError((e as Error).message);
+    } finally {
+      setLoadingModels(false);
+    }
+  };
 
   const update = (key: string, status: StepStatus, detail?: string) =>
     setSteps((prev) =>
@@ -69,12 +96,6 @@ export default function AIQuickSetup(props: Readonly<{
     );
 
   const run = async () => {
-    if (!name.trim() || !baseUrl.trim() || !modelId.trim()) {
-      props.onError(
-        "Заполните название сервиса, базовый URL и идентификатор модели."
-      );
-      return;
-    }
     setRunning(true);
     setSteps(
       STEP_TITLES.map((step) => ({ ...step, status: "pending" as StepStatus }))
@@ -86,11 +107,11 @@ export default function AIQuickSetup(props: Readonly<{
         slug: slugify(name),
         protocol: "openai_compatible",
       });
-      update("provider", "ok", `${provider.name} (slug: ${provider.slug})`);
+      update("provider", "ok", provider.name);
 
       update("endpoint", "running");
       const endpoint = await aiApi.createEndpoint(provider.id, {
-        name: `Эндпоинт ${provider.name}`,
+        name: `Основное подключение`,
         base_url: baseUrl.trim(),
         api_key: apiKey.trim() || undefined,
       });
@@ -110,35 +131,28 @@ export default function AIQuickSetup(props: Readonly<{
       update("connection", "running");
       const test = await aiApi.testEndpoint(endpoint.id);
       if (!test.success) {
-        update(
-          "connection",
-          "error",
-          `${test.error_type ?? "ошибка"}: ${test.message ?? ""}`
-        );
-        update(
-          "task",
-          "error",
-          "Задача не включена: сначала должно пройти подключение"
-        );
+        update("connection", "error", test.message ?? "связь не установлена");
+        update("task", "error", "Не включили: сначала должна пройти проверка связи");
         props.onFinished(
-          "Провайдер, эндпоинт и модель созданы, но подключение не прошло. " +
-            "Исправьте URL, ключ или идентификатор модели и повторите проверку."
+          "Сервис, подключение и модель созданы, но связь не установлена. " +
+            "Проверьте адрес, ключ доступа и название модели, затем повторите " +
+            "проверку на вкладке «Подключения»."
         );
         return;
       }
-      update("connection", "ok", `${test.latency_ms} мс, модель: ${test.model}`);
+      update("connection", "ok", `ответ за ${test.latency_ms} мс`);
 
       update("task", "running");
       await aiApi.putTask(props.taskType, {
         enabled: true,
         model_ids: [model.id],
       });
-      update("task", "ok", "Задача включена с параметрами по умолчанию");
+      update("task", "ok", "включено");
       setName("");
       setBaseUrl("");
       setApiKey("");
       setModelId("");
-      props.onFinished("AI подключён: проверка прошла, задача включена");
+      props.onFinished("ИИ подключён: связь проверена, создание программ включено");
     } catch (e) {
       const message = (e as Error).message;
       setSteps((prev) =>
@@ -155,72 +169,177 @@ export default function AIQuickSetup(props: Readonly<{
   };
 
   return (
-    <div className="card">
-      <h2 className="section-title" style={{ marginTop: 0 }}>
-        Быстрое подключение AI
-      </h2>
-      <p className="muted" style={{ marginTop: 0 }}>
-        Создаст провайдера (OpenAI-совместимый протокол), эндпоинт с ключом и
-        модель, затем выполнит проверку подключения и включит задачу с
-        параметрами по умолчанию. Если проверка не пройдёт, задача включена не
-        будет. Тонкая настройка — в разделах ниже.
-      </p>
+    <Card
+      title="Подключить ИИ"
+      description="Укажите адрес и ключ, выберите модель из списка сервиса — остальное система сделает сама: создаст сервис, сохранит ключ, добавит модель, проверит связь и включит создание программ через ИИ."
+    >
+      <div className="form-grid">
+        <Field
+          label="Название сервиса"
+          hint="Как вы будете его узнавать в списке. Например: OpenAI, Яндекс, свой сервер."
+        >
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="OpenAI"
+            aria-label="Название сервиса"
+          />
+        </Field>
 
-      <div className="toolbar">
-        <input
-          type="text"
-          placeholder="Название сервиса (например, RouterAI)"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          aria-label="Название сервиса"
-        />
-        <input
-          type="text"
-          placeholder="Базовый URL (https://api.example.com/v1)"
-          value={baseUrl}
-          onChange={(e) => setBaseUrl(e.target.value)}
-          aria-label="Базовый URL"
-          style={{ minWidth: 280 }}
-        />
-        <input
-          type="password"
-          placeholder="API-ключ (если требуется)"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          aria-label="API-ключ"
-        />
-        <input
-          type="text"
-          placeholder="Идентификатор модели (qwen/qwen3-max)"
-          value={modelId}
-          onChange={(e) => setModelId(e.target.value)}
-          aria-label="Идентификатор модели"
-          style={{ minWidth: 240 }}
-        />
-        <button type="button" className="primary" onClick={run} disabled={running}>
-          {running ? "Подключение..." : "Подключить AI"}
+        <Field
+          label="Адрес сервиса"
+          hint="Ссылка из документации поставщика, обычно заканчивается на /v1. Подходят сервисы, совместимые с OpenAI."
+        >
+          <input
+            type="text"
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder="https://api.openai.com/v1"
+            aria-label="Адрес сервиса"
+          />
+        </Field>
+
+        <Field
+          label="Ключ доступа"
+          hint="Выдаётся в личном кабинете поставщика. Хранится в зашифрованном виде и больше никогда не показывается. Некоторым своим серверам ключ не нужен — тогда оставьте пустым."
+        >
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="Оставьте пустым, если не требуется"
+            autoComplete="off"
+            aria-label="Ключ доступа"
+          />
+        </Field>
+      </div>
+
+      <h3 className="section-title">Модель</h3>
+      {models === null ? (
+        <>
+          <p className="field-hint">
+            {modelsError
+              ? `Список получить не удалось: ${modelsError} Укажите название модели вручную — точно как в документации сервиса.`
+              : "Нажмите «Показать доступные модели» — система спросит список у сервиса по указанному адресу и ключу."}
+          </p>
+          <div className="button-row" style={{ marginTop: 8 }}>
+            <button
+              type="button"
+              onClick={loadModels}
+              disabled={loadingModels || baseUrl.trim().length < 8}
+            >
+              {loadingModels ? "Спрашиваем…" : "Показать доступные модели"}
+            </button>
+          </div>
+          {modelsError && (
+            <Field
+              label="Название модели"
+              hint="Система передаёт это значение как есть."
+            >
+              <input
+                type="text"
+                value={modelId}
+                onChange={(e) => setModelId(e.target.value)}
+                placeholder="gpt-4o-mini"
+                aria-label="Название модели"
+              />
+            </Field>
+          )}
+        </>
+      ) : (
+        <>
+          <Field
+            label="Поиск по списку"
+            hint={`Сервис предоставляет ${models.length} шт. Выберите одну — остальные можно добавить позже на вкладке «Подключения».`}
+          >
+            <input
+              type="text"
+              value={modelFilter}
+              onChange={(e) => setModelFilter(e.target.value)}
+              placeholder="часть названия"
+              aria-label="Поиск модели"
+            />
+          </Field>
+          <div className="pick-list" style={{ marginTop: 8 }}>
+            {models
+              .filter((m) =>
+                modelFilter.trim()
+                  ? m.model_id
+                      .toLowerCase()
+                      .includes(modelFilter.trim().toLowerCase())
+                  : true
+              )
+              .map((m) => (
+                <label key={m.model_id} className="pick-list-item">
+                  <input
+                    type="radio"
+                    name="quick-setup-model"
+                    checked={modelId === m.model_id}
+                    onChange={() => setModelId(m.model_id)}
+                  />
+                  <span className="pick-list-text">
+                    <code>{m.model_id}</code>
+                    {m.owned_by && (
+                      <span className="field-hint" style={{ margin: 0 }}>
+                        поставщик модели: {m.owned_by}
+                      </span>
+                    )}
+                  </span>
+                </label>
+              ))}
+          </div>
+          <div className="button-row" style={{ marginTop: 8 }}>
+            <button type="button" onClick={loadModels} disabled={loadingModels}>
+              {loadingModels ? "Спрашиваем…" : "Обновить список"}
+            </button>
+          </div>
+        </>
+      )}
+
+      <div className="button-row" style={{ marginTop: 20 }}>
+        <button
+          type="button"
+          className="primary"
+          onClick={run}
+          disabled={running || !ready}
+        >
+          {running ? "Подключаем…" : "Подключить"}
         </button>
+        {!ready && (
+          <span className="field-hint">
+            Заполните название сервиса, адрес и выберите модель.
+          </span>
+        )}
       </div>
 
       {steps.length > 0 && (
-        <ol style={{ margin: "0 0 0 20px" }}>
-          {steps.map((step) => (
-            <li key={step.key} style={{ padding: "3px 0" }}>
-              <span
-                style={{
-                  fontWeight: 700,
-                  color: STATUS_COLORS[step.status],
-                  marginRight: 8,
-                }}
-              >
-                {STATUS_ICONS[step.status]}
-              </span>
-              {step.title}
-              {step.detail && <span className="muted"> — {step.detail}</span>}
-            </li>
-          ))}
-        </ol>
+        <>
+          <h3 className="section-title">Что происходит</h3>
+          <ol className="steps">
+            {steps.map((step) => (
+              <li key={step.key}>
+                <div>
+                  <div className="inline-list">
+                    <span>{step.title}</span>
+                    <Status tone={STATUS_TONES[step.status]}>
+                      {STATUS_LABELS[step.status]}
+                    </Status>
+                  </div>
+                  {step.detail && <div className="field-hint">{step.detail}</div>}
+                </div>
+              </li>
+            ))}
+          </ol>
+
+          {steps.some((s) => s.status === "error") && (
+            <Notice tone="warn" title="Настройка не завершена">
+              Созданные сервис и модель сохранены — их можно исправить на вкладке
+              «Подключения», не начиная заново.
+            </Notice>
+          )}
+        </>
       )}
-    </div>
+    </Card>
   );
 }

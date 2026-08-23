@@ -131,8 +131,8 @@ class AIConfigurationService:
         dependencies = await self.provider_dependencies(provider_id)
         if not dependencies.safe:
             raise AIDependencyError(
-                f"Невозможно удалить провайдера: {dependencies.describe()}. "
-                "Отключите его (enabled=false) или сначала снимите привязки моделей "
+                f"Невозможно удалить сервис: {dependencies.describe()}. "
+                "Сначала выключите его или уберите модели из настроек задач "
                 "в конфигурации задач.",
                 dependencies.blockers,
             )
@@ -226,8 +226,8 @@ class AIConfigurationService:
         dependencies = await self.endpoint_dependencies(endpoint_id)
         if not dependencies.safe:
             raise AIDependencyError(
-                f"Невозможно удалить эндпоинт: {dependencies.describe()}. "
-                "Отключите его (enabled=false) или сначала снимите привязки моделей "
+                f"Невозможно удалить подключение: {dependencies.describe()}. "
+                "Сначала выключите его или уберите модели из настроек задач "
                 "в конфигурации задач.",
                 dependencies.blockers,
             )
@@ -279,6 +279,50 @@ class AIConfigurationService:
         )
         return created
 
+    async def add_models(
+        self,
+        endpoint_id: int,
+        models: list[tuple[str, str]],
+        actor: str | None = None,
+    ) -> tuple[list[AIModel], list[str]]:
+        """Добавляет выбранные модели, пропуская уже зарегистрированные.
+
+        Возвращает (созданные, пропущенные model_id). Выбор нескольких моделей
+        из списка сервиса не должен обрываться из-за того, что одна из них уже
+        есть: это ожидаемая ситуация, а не ошибка.
+        """
+        existing = {
+            m.model_id for m in await self._models.list_for_endpoint(endpoint_id)
+        }
+        created: list[AIModel] = []
+        skipped: list[str] = []
+        for model_id, display_name in models:
+            if model_id in existing:
+                skipped.append(model_id)
+                continue
+            existing.add(model_id)
+            created.append(
+                await self._models.create(
+                    AIModel(
+                        endpoint_id=endpoint_id,
+                        model_id=model_id,
+                        display_name=display_name or model_id,
+                    )
+                )
+            )
+        if created:
+            await self._audit.record(
+                "ai_models_added",
+                actor=actor,
+                entity_type="ai_endpoint",
+                entity_id=str(endpoint_id),
+                metadata={
+                    "added": [m.model_id for m in created],
+                    "skipped": skipped,
+                },
+            )
+        return created, skipped
+
     async def update_model(
         self, model_pk: int, actor: str | None = None, **fields
     ) -> AIModel | None:
@@ -299,7 +343,7 @@ class AIConfigurationService:
         if not dependencies.safe:
             raise AIDependencyError(
                 f"Невозможно удалить модель: {dependencies.describe()}. "
-                "Отключите её (enabled=false) или уберите из конфигурации задачи.",
+                "Сначала выключите её или уберите из настроек задачи.",
                 dependencies.blockers,
             )
         deleted = await self._models.delete(model_pk)

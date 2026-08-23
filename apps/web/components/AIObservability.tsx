@@ -1,26 +1,23 @@
 "use client";
 
-// Observability AI: журнал вызовов (токены, латентность, ошибки) и журнал
-// изменений конфигурации. Данные уже писались backend'ом, но были доступны
-// только через psql — теперь видны администратору.
+// Журналы: обращения к ИИ и изменения настроек.
+//
+// Данные писались и раньше, но были видны только через базу. Здесь они
+// показаны администратору: расход, скорость ответа, ошибки и кто что менял.
 
+import {
+  Card,
+  Empty,
+  Status,
+  moment,
+} from "@/components/ui/Primitives";
 import {
   AIAuditItem,
   AIModelItem,
   AIProviderItem,
   AIUsageItem,
 } from "@/lib/api";
-import {
-  aiAuditEventLabel,
-  aiTaskLabel,
-  aiUsageStatusLabel,
-} from "@/lib/labels";
-
-function formatMoment(value: string | null): string {
-  if (!value) return "—";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("ru-RU");
-}
+import { aiAuditEventLabel, aiTaskLabel, aiUsageStatusLabel } from "@/lib/labels";
 
 export default function AIObservability(props: Readonly<{
   usage: AIUsageItem[];
@@ -30,106 +27,117 @@ export default function AIObservability(props: Readonly<{
   refreshing: boolean;
   onRefresh: () => void;
 }>) {
+  // Идентификаторы наружу не показываем: только понятные имена.
   const modelName = (pk: number | null) => {
     if (pk === null) return "—";
     const model = props.models.find((m) => m.id === pk);
-    return model ? `${model.display_name} (${model.model_id})` : `#${pk}`;
+    return model ? model.display_name : "удалённая модель";
   };
   const providerName = (pk: number | null) => {
     if (pk === null) return "—";
     const provider = props.providers.find((p) => p.id === pk);
-    return provider ? provider.name : `#${pk}`;
+    return provider ? provider.name : "удалённый сервис";
   };
+
+  const refreshButton = (
+    <button
+      type="button"
+      className="small"
+      onClick={props.onRefresh}
+      disabled={props.refreshing}
+    >
+      {props.refreshing ? "Обновляем…" : "Обновить"}
+    </button>
+  );
 
   return (
     <>
-      <div className="card">
-        <div className="toolbar" style={{ alignItems: "center", marginBottom: 8 }}>
-          <h2 className="section-title" style={{ margin: 0 }}>
-            Вызовы AI (последние 50)
-          </h2>
-          <button type="button" onClick={props.onRefresh} disabled={props.refreshing}>
-            {props.refreshing ? "Обновление..." : "Обновить"}
-          </button>
-        </div>
+      <Card
+        title="Обращения к ИИ"
+        description="Последние запросы: какая модель отвечала, сколько времени занял ответ и каков расход. Тексты запросов и ответов не сохраняются."
+        actions={refreshButton}
+      >
         {props.usage.length === 0 ? (
-          <p className="muted">
-            AI ещё не вызывался: записей об использовании нет.
-          </p>
+          <Empty
+            title="Обращений не было"
+            hint="Здесь появятся записи после первого запроса к ИИ. Проверка связи в этот журнал не попадает — это не выполнение задачи."
+          />
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Время</th>
-                <th>Задача</th>
-                <th>Провайдер</th>
-                <th>Модель</th>
-                <th>Статус</th>
-                <th>Токены (вход/выход)</th>
-                <th>Задержка</th>
-                <th>Ошибка</th>
-              </tr>
-            </thead>
-            <tbody>
-              {props.usage.map((item) => (
-                <tr key={item.id}>
-                  <td>{formatMoment(item.created_at)}</td>
-                  <td>{aiTaskLabel(item.task_type)}</td>
-                  <td className="muted">{providerName(item.provider_id)}</td>
-                  <td className="muted">{modelName(item.model_id)}</td>
-                  <td>
-                    <span
-                      className={
-                        item.status === "success" ? "badge confirmed" : "badge draft"
-                      }
-                    >
-                      {aiUsageStatusLabel(item.status)}
-                    </span>
-                  </td>
-                  <td>
-                    {item.input_tokens ?? "—"} / {item.output_tokens ?? "—"}
-                  </td>
-                  <td>{item.latency_ms !== null ? `${item.latency_ms} мс` : "—"}</td>
-                  <td className="muted">{item.error_type ?? "—"}</td>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Когда</th>
+                  <th>Задача</th>
+                  <th>Сервис</th>
+                  <th>Модель</th>
+                  <th>Расход</th>
+                  <th>Ответ за</th>
+                  <th>Итог</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {props.usage.map((item) => (
+                  <tr key={item.id}>
+                    <td className="text-secondary">{moment(item.created_at)}</td>
+                    <td>{aiTaskLabel(item.task_type)}</td>
+                    <td>{providerName(item.provider_id)}</td>
+                    <td>{modelName(item.model_id)}</td>
+                    <td className="text-secondary">
+                      {item.total_tokens !== null
+                        ? `${item.total_tokens} токенов`
+                        : "—"}
+                    </td>
+                    <td className="text-secondary">
+                      {item.latency_ms !== null ? `${item.latency_ms} мс` : "—"}
+                    </td>
+                    <td>
+                      <Status tone={item.status === "success" ? "ok" : "bad"}>
+                        {aiUsageStatusLabel(item.status)}
+                        {item.error_type ? `: ${item.error_type}` : ""}
+                      </Status>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
-      </div>
+      </Card>
 
-      <div className="card">
-        <h2 className="section-title" style={{ marginTop: 0 }}>
-          Изменения конфигурации (последние 50)
-        </h2>
+      <Card
+        title="Изменения настроек"
+        description="Кто и что менял в настройках ИИ и в списке пользователей. Пароли и ключи доступа здесь не сохраняются."
+        actions={refreshButton}
+      >
         {props.audit.length === 0 ? (
-          <p className="muted">Событий пока нет.</p>
+          <Empty
+            title="Изменений не было"
+            hint="Каждое действие с настройками попадает сюда автоматически."
+          />
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Время</th>
-                <th>Событие</th>
-                <th>Кто</th>
-                <th>Объект</th>
-              </tr>
-            </thead>
-            <tbody>
-              {props.audit.map((item) => (
-                <tr key={item.id}>
-                  <td>{formatMoment(item.created_at)}</td>
-                  <td>{aiAuditEventLabel(item.event_type)}</td>
-                  <td className="muted">{item.actor ?? "—"}</td>
-                  <td className="muted">
-                    {item.entity_type ?? "—"}
-                    {item.entity_id ? ` #${item.entity_id}` : ""}
-                  </td>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Когда</th>
+                  <th>Что произошло</th>
+                  <th>Кто</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {props.audit.map((item) => (
+                  <tr key={item.id}>
+                    <td className="text-secondary">{moment(item.created_at)}</td>
+                    <td>{aiAuditEventLabel(item.event_type)}</td>
+                    <td className="text-secondary">{item.actor ?? "система"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
-      </div>
+      </Card>
     </>
   );
 }

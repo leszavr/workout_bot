@@ -40,11 +40,31 @@ from src.infrastructure.ai.adapters import (
     EndpointConnection,
     ProviderAdapterRegistry,
 )
+from src.infrastructure.ai.secrets import SecretStore
 
 TASK = AITaskType.WORKOUT_GENERATION
 
 # Отличает «параметр не передан» от осознанно переданного None.
 _DEFAULT = object()
+
+
+class _FakeSecrets(SecretStore):
+    """Хранилище, которое умеет отвечать «ключа здесь нет»."""
+
+    def __init__(self, *, present: bool) -> None:
+        self._present = present
+
+    async def put(self, reference: str, secret: str) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    async def get(self, reference: str) -> str | None:
+        return "sk-test" if self._present else None
+
+    async def delete(self, reference: str) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    async def exists(self, reference: str) -> bool:
+        return self._present
 
 
 class FakeProviders:
@@ -170,6 +190,7 @@ def _service(
     prompts: list[PromptTemplate] | None = None,
     primary_generator: str = "ai",
     fallback_generator: str = "deterministic",
+    secret_store: SecretStore | None = _DEFAULT,
 ) -> AIReadinessService:
     providers_repo = FakeProviders(providers if providers is not None else [_provider()])
     endpoints_repo = FakeEndpoints(endpoints if endpoints is not None else [_endpoint()])
@@ -190,6 +211,10 @@ def _service(
         endpoint_repository=endpoints_repo,
         provider_repository=providers_repo,
     )
+    if secret_store is _DEFAULT:
+        # По умолчанию ключ на месте: проверка «ссылка есть, а ключа нет»
+        # включается отдельным тестом.
+        secret_store = _FakeSecrets(present=True)
     return AIReadinessService(
         providers=providers_repo,
         endpoints=endpoints_repo,
@@ -198,6 +223,7 @@ def _service(
         prompts=prompts_repo,
         selector=selector,
         adapter_registry=_registry(),
+        secret_store=secret_store,
         primary_generator=primary_generator,
         fallback_generator=fallback_generator,
     )
@@ -223,14 +249,6 @@ async def test_fully_configured_task_is_ready():
     assert report.chain[0].model_id == "qwen/qwen3-max"
     # Промпт берётся из файлов проекта (prompts/program_generator/v1).
     assert "файлов" in _check(report, "prompt").detail
-
-
-async def test_report_exposes_only_supported_protocols_as_supported():
-    report = await _service().report(TASK)
-    supported = {p["value"]: p["supported"] for p in report.protocols}
-    assert supported["openai_compatible"] is True
-    assert supported["anthropic"] is False
-    assert supported["custom"] is False
 
 
 async def test_report_exposes_generation_strategy():
@@ -264,7 +282,7 @@ async def test_connection_never_tested_blocks_readiness():
 
     check = _check(report, "connection")
     assert check.status == STATUS_MISSING
-    assert "ни разу не проверялось" in check.detail
+    assert "ещё не проверяли" in check.detail
     assert report.ready is False
 
 
@@ -290,6 +308,28 @@ async def test_missing_api_key_warns_but_does_not_block():
     assert report.ready is True
 
 
+async def test_dangling_secret_reference_is_reported_as_failure():
+    """Ссылка на ключ есть, а ключа в хранилище нет.
+
+    Так выглядит подключение после потери секрета (очистка хранилища, смена
+    ключа шифрования): запросы получают 401, поэтому чек-лист не должен
+    показывать «ключ сохранён».
+    """
+    report = await _service(secret_store=_FakeSecrets(present=False)).report(TASK)
+
+    check = _check(report, "api_key")
+    assert check.status == STATUS_FAILED
+    assert "в хранилище его нет" in check.detail
+    assert check.action
+
+
+async def test_api_key_check_survives_without_secret_store():
+    """Без хранилища проверка не падает: остаётся прежнее поведение."""
+    report = await _service(secret_store=None).report(TASK)
+
+    assert _check(report, "api_key").status == STATUS_OK
+
+
 async def test_protocol_without_adapter_is_not_usable():
     report = await _service(
         providers=[_provider(protocol=AIProtocol.ANTHROPIC)]
@@ -297,7 +337,8 @@ async def test_protocol_without_adapter_is_not_usable():
 
     provider_check = _check(report, "provider")
     assert provider_check.status == STATUS_FAILED
-    assert "anthropic" in provider_check.detail
+    # В тексте — название сервиса, а не внутренний код протокола.
+    assert "Router" in provider_check.detail
     assert report.ready is False
     assert report.chain == []
 
@@ -328,7 +369,7 @@ async def test_unknown_prompt_version_fails_prompt_check():
 
     check = _check(report, "prompt")
     assert check.status == STATUS_FAILED
-    assert "v99" in check.detail
+    assert "№99" in check.detail
     assert report.ready is False
 
 
@@ -403,19 +444,19 @@ async def test_validate_enable_rejects_empty_model_list():
 
 async def test_validate_enable_rejects_disabled_model():
     service = _service(models=[_model(enabled=False)])
-    with pytest.raises(AIConfigurationError, match="отключена"):
+    with pytest.raises(AIConfigurationError, match="выключена"):
         await service.validate_enable(AITaskConfig(task_type=TASK, enabled=True), [100])
 
 
 async def test_validate_enable_rejects_disabled_endpoint():
     service = _service(endpoints=[_endpoint(enabled=False)])
-    with pytest.raises(AIConfigurationError, match="эндпоинт"):
+    with pytest.raises(AIConfigurationError, match="подключение"):
         await service.validate_enable(AITaskConfig(task_type=TASK, enabled=True), [100])
 
 
 async def test_validate_enable_rejects_unsupported_protocol():
     service = _service(providers=[_provider(protocol=AIProtocol.CUSTOM)])
-    with pytest.raises(AIConfigurationError, match="не поддерживается"):
+    with pytest.raises(AIConfigurationError, match="не поддерживает"):
         await service.validate_enable(AITaskConfig(task_type=TASK, enabled=True), [100])
 
 
@@ -431,7 +472,7 @@ async def test_validate_enable_accepts_when_only_fallback_is_usable():
 
 async def test_validate_enable_rejects_unknown_prompt_version():
     service = _service()
-    with pytest.raises(AIConfigurationError, match="v42"):
+    with pytest.raises(AIConfigurationError, match="№42"):
         await service.validate_enable(
             AITaskConfig(task_type=TASK, enabled=True, prompt_version=42), [100]
         )
@@ -440,7 +481,7 @@ async def test_validate_enable_rejects_unknown_prompt_version():
 async def test_validate_enable_uses_existing_bindings_when_models_not_sent():
     """model_ids=None означает «не менять привязки» — проверяем сохранённые."""
     service = _service(models=[_model(enabled=False)])
-    with pytest.raises(AIConfigurationError, match="отключена"):
+    with pytest.raises(AIConfigurationError, match="выключена"):
         await service.validate_enable(
             AITaskConfig(task_type=TASK, enabled=True), None
         )

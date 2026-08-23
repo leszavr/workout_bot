@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:check": "WEB_DIST_DIR=.next-check next build",
     "start": "next start",
     "lint": "next lint"
   },

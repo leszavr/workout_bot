@@ -14,7 +14,12 @@ from __future__ import annotations
 import asyncio
 from typing import Protocol
 
-from src.domain.enums import ExperienceLevel, PrimaryGoal, ProgramStatus
+from src.domain.enums import (
+    ExperienceLevel,
+    PrimaryGoal,
+    ProgramStatus,
+    movement_restriction_title,
+)
 from src.domain.exercise import Exercise
 from src.domain.pools import SafeExercisePool
 from src.domain.profile import FitnessProfile
@@ -43,6 +48,17 @@ ROLE_PULL = "pull"
 ROLE_CORE = "core"
 ROLE_CARDIO = "cardio"
 ROLE_OTHER = "other"
+
+# Роли — внутренние ключи группировки. Их видит пользователь в поле focus,
+# поэтому наружу отдаём русские названия.
+ROLE_TITLES: dict[str, str] = {
+    ROLE_LEG: "ноги",
+    ROLE_PUSH: "жимовые движения",
+    ROLE_PULL: "тяговые движения",
+    ROLE_CORE: "корпус",
+    ROLE_CARDIO: "кардио",
+    ROLE_OTHER: "прочее",
+}
 
 
 def classify_role(exercise: Exercise) -> str:
@@ -295,7 +311,7 @@ class DeterministicProgramGenerator:
         return TrainingDay(
             day_number=day_number,
             title=title,
-            focus=" + ".join(roles),
+            focus=", ".join(ROLE_TITLES.get(role, role) for role in roles),
             exercises=self._to_program_exercises(
                 exercises, pool, sets, reps_min, reps_max, rest
             ),
@@ -314,7 +330,7 @@ class DeterministicProgramGenerator:
     ) -> TrainingDay:
         return self._split_day(
             day_number,
-            f"Full body {day_number}",
+            "Всё тело",
             (ROLE_LEG, ROLE_PUSH, ROLE_PULL, ROLE_CORE, ROLE_CARDIO),
             by_role,
             pool,
@@ -371,10 +387,9 @@ class DeterministicProgramGenerator:
     @staticmethod
     def _description(goal: PrimaryGoal | None, sessions: int, pool: SafeExercisePool) -> str:
         return (
-            "Программа сформирована детерминированным алгоритмом на основе "
-            f"{len(pool.allowed)} упражнений безопасного пула. "
-            f"Режим: {sessions} тренировки в неделю. "
-            "Нагрузка подобрана по цели и уровню подготовки из анкеты."
+            f"Программу собрал алгоритм подбора: из {len(pool.allowed)} упражнений, "
+            "разрешённых по ответам анкеты, выбраны подходящие по цели и уровню "
+            f"подготовки. Режим: {sessions} тренировки в неделю."
         )
 
     @staticmethod
@@ -400,8 +415,10 @@ class DeterministicProgramGenerator:
         notes: list[str] = []
         if pool.active_restrictions:
             notes.append(
-                "Учтённые ограничения движений: "
-                + ", ".join(r.value for r in pool.active_restrictions)
+                "Из подбора исключены движения: "
+                + ", ".join(
+                    movement_restriction_title(r) for r in pool.active_restrictions
+                )
             )
         if pool.warnings:
             notes.append(

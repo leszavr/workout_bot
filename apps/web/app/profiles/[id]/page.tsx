@@ -5,76 +5,174 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
+import {
+  Card,
+  Empty,
+  Notice,
+  Skeleton,
+  Status,
+  Tag,
+  moment,
+} from "@/components/ui/Primitives";
 import { api, getToken, ProfileDetail, ProgramListItem } from "@/lib/api";
-import { generationSourceLabel, statusLabel } from "@/lib/labels";
+import {
+  consentLabel,
+  generationSourceLabel,
+  questionnaireLabel,
+  statusLabel,
+  statusTone,
+} from "@/lib/labels";
+import { useCurrentUser } from "@/lib/session";
 
-function Section({
-  title,
-  children,
-}: {
-  readonly title: string;
-  readonly children: React.ReactNode;
-}) {
-  return (
-    <div className="card">
-      <div className="section-title">{title}</div>
-      {children}
-    </div>
-  );
-}
-
+/**
+ * Значение ответа в читаемом виде.
+ *
+ * Коды из бота переводим, свободный текст оставляем как есть, «да/нет»
+ * пишем словами: `true` в таблице выглядит как техническая утечка.
+ */
 function formatValue(value: unknown): string {
-  if (value === null || value === undefined || value === "") {
-    return "—";
-  }
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "boolean") return value ? "Да" : "Нет";
   if (Array.isArray(value)) {
-    return value.join(", ") || "—";
+    const parts = value
+      .filter((item) => item !== null && item !== undefined && item !== "")
+      .map((item) => (typeof item === "string" ? questionnaireLabel(item) : String(item)));
+    return parts.join(", ") || "—";
   }
-  if (typeof value === "object") {
-    return JSON.stringify(value);
-  }
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean" ||
-    typeof value === "bigint"
-  ) {
-    return String(value);
-  }
+  if (typeof value === "string") return questionnaireLabel(value);
+  if (typeof value === "number" || typeof value === "bigint") return String(value);
   return "—";
 }
 
-function Kv({
-  data,
-  fields,
-}: {
+function Answers(props: {
   readonly data: Record<string, unknown>;
-  readonly fields: [string, string][];
+  readonly fields: ReadonlyArray<readonly [string, string]>;
 }) {
   return (
     <div className="kv">
-      {fields.map(([key, label]) => {
-        const display = formatValue(data?.[key]);
-        return (
-          <div key={key} style={{ display: "contents" }}>
-            <div className="k">{label}</div>
-            <div>{display}</div>
-          </div>
-        );
-      })}
+      {props.fields.map(([key, label]) => (
+        <div key={key} style={{ display: "contents" }}>
+          <div className="k">{label}</div>
+          <div>{formatValue(props.data?.[key])}</div>
+        </div>
+      ))}
     </div>
   );
 }
 
+const SECTIONS: ReadonlyArray<{
+  key: string;
+  title: string;
+  description?: string;
+  fields: ReadonlyArray<readonly [string, string]>;
+}> = [
+  {
+    key: "client",
+    title: "О человеке",
+    fields: [
+      ["name", "Имя"],
+      ["age_years", "Возраст, лет"],
+      ["sex", "Пол"],
+      ["height_cm", "Рост, см"],
+      ["weight_kg", "Вес, кг"],
+      ["waist_cm", "Обхват талии, см"],
+    ],
+  },
+  {
+    key: "goals",
+    title: "Чего хочет добиться",
+    description: "Основная цель определяет, как строится программа.",
+    fields: [
+      ["primary", "Основная цель"],
+      ["secondary", "Дополнительные цели"],
+      ["desired_result", "Желаемый результат"],
+      ["target_timeframe", "За какой срок"],
+    ],
+  },
+  {
+    key: "training_background",
+    title: "Опыт тренировок",
+    fields: [
+      ["experience_level", "Занимался раньше"],
+      ["current_frequency_per_week", "Тренировок в неделю сейчас"],
+      ["current_activity_description", "Чем занимается сейчас"],
+      ["current_exercises", "Знакомые упражнения"],
+    ],
+  },
+  {
+    key: "training_plan_preferences",
+    title: "Удобный график",
+    description: "Сколько занятий в неделю человек готов выдержать.",
+    fields: [
+      ["sessions_per_week", "Тренировок в неделю"],
+      ["session_duration_minutes", "Длительность занятия, мин"],
+      ["preferred_days", "Удобные дни"],
+      ["preferred_training_time", "Удобное время"],
+    ],
+  },
+  {
+    key: "training_location",
+    title: "Где и чем тренируется",
+    description: "Программа собирается только из доступного оборудования.",
+    fields: [
+      ["primary_location", "Место тренировок"],
+      ["gym_name", "Зал"],
+      ["available_equipment", "Доступное оборудование"],
+      ["custom_equipment_description", "Что есть дома"],
+    ],
+  },
+  {
+    key: "lifestyle",
+    title: "Образ жизни",
+    description: "Влияет на объём кардио и общую нагрузку.",
+    fields: [
+      ["daily_activity_level", "Повседневная активность"],
+      ["cardio_preference", "Отношение к кардио"],
+      ["cardio_notes", "Уточнение про кардио"],
+    ],
+  },
+  {
+    key: "health_and_limitations",
+    title: "Здоровье и ограничения",
+    description: "Эти ответы исключают из программы небезопасные упражнения.",
+    fields: [
+      ["has_limitations", "Есть ограничения"],
+      ["categories", "С чем связаны"],
+      ["movements_to_avoid", "Каких движений избегать"],
+      ["doctor_recommendations", "Рекомендации врача"],
+      ["medical_clearance_required", "Нужно разрешение врача"],
+    ],
+  },
+  {
+    key: "exercise_preferences",
+    title: "Предпочтения",
+    fields: [
+      ["preferred_exercises", "Нравятся"],
+      ["disliked_exercises", "Не нравятся"],
+      ["exercise_goals", "Хочет освоить"],
+    ],
+  },
+  {
+    key: "additional_information",
+    title: "Что добавил сам",
+    fields: [
+      ["schedule_constraints", "Ограничения по расписанию"],
+      ["free_text", "Комментарий"],
+    ],
+  },
+];
+
 export default function ProfileDetailPage() {
   const params = useParams<{ id: string }>();
+  const { canWrite } = useCurrentUser();
   const [profile, setProfile] = useState<ProfileDetail | null>(null);
   const [error, setError] = useState("");
-  const [view, setView] = useState<"structured" | "raw">("structured");
   const [programs, setPrograms] = useState<ProgramListItem[]>([]);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState("");
-  const [generatorType, setGeneratorType] = useState<"deterministic" | "ai">("deterministic");
+  const [generatorType, setGeneratorType] = useState<"deterministic" | "ai">(
+    "deterministic",
+  );
 
   const loadPrograms = useCallback(() => {
     api
@@ -102,7 +200,9 @@ export default function ProfileDetailPage() {
       await api.generateProgram(params.id, generatorType);
       loadPrograms();
     } catch (e) {
-      setGenerateError(e instanceof Error ? e.message : "Ошибка генерации");
+      setGenerateError(
+        e instanceof Error ? e.message : "Не удалось собрать программу",
+      );
     } finally {
       setGenerating(false);
     }
@@ -114,157 +214,103 @@ export default function ProfileDetailPage() {
         <AppNav />
         <main className="main">
           <div className="error">{error}</div>
+          <Link className="btn" href="/profiles">
+            К списку анкет
+          </Link>
         </main>
       </div>
     );
   }
+
   if (!profile) {
     return (
       <div className="app-shell">
         <AppNav />
         <main className="main">
-          <div className="loading">Загрузка...</div>
+          <Card>
+            <Skeleton rows={5} />
+          </Card>
         </main>
       </div>
     );
   }
 
-  const d = profile.data as Record<string, Record<string, unknown>>;
+  const data = profile.data as Record<string, Record<string, unknown>>;
 
   return (
     <div className="app-shell">
       <AppNav />
       <main className="main">
-        <h1 className="page-title">
-          Профиль {profile.display_number || profile.profile_id}
-        </h1>
-        <div className="tabs">
-          <button
-            type="button"
-            className={view === "structured" ? "active" : ""}
-            onClick={() => setView("structured")}
-          >
-            Структурированный вид
-          </button>
-          <button
-            type="button"
-            className={view === "raw" ? "active" : ""}
-            onClick={() => setView("raw")}
-          >
-            JSON целиком
-          </button>
+        <div className="page-head">
+          <h1 className="page-title">
+            {profile.display_number
+              ? `Анкета № ${profile.display_number}`
+              : "Анкета без номера"}
+          </h1>
+          <p className="page-subtitle">
+            Ответы, которые человек дал боту. По ним подбираются упражнения.
+          </p>
+          <div className="field-row" style={{ marginTop: "var(--s-3)" }}>
+            <Status tone={statusTone(profile.status)}>
+              {statusLabel(profile.status)}
+            </Status>
+          </div>
         </div>
 
-        {view === "raw" ? (
-          <pre className="raw-json">{JSON.stringify(profile.data, null, 2)}</pre>
-        ) : (
-          <>
-            <Section title="Основные данные">
-              <Kv
-                data={d.client || {}}
-                fields={[
-                  ["name", "Имя"],
-                  ["age_years", "Возраст"],
-                  ["sex", "Пол"],
-                  ["height_cm", "Рост (см)"],
-                  ["weight_kg", "Вес (кг)"],
-                  ["waist_cm", "Талия (см)"],
-                ]}
-              />
-            </Section>
-            <Section title="Цели">
-              <Kv
-                data={d.goals || {}}
-                fields={[
-                  ["primary", "Основная цель"],
-                  ["secondary", "Дополнительные"],
-                  ["desired_result", "Желаемый результат"],
-                  ["target_timeframe", "Срок"],
-                ]}
-              />
-            </Section>
-            <Section title="Опыт тренировок">
-              <Kv
-                data={d.training_background || {}}
-                fields={[
-                  ["experience_level", "Опыт"],
-                  ["current_frequency_per_week", "Частота сейчас"],
-                  ["current_activity_description", "Текущая активность"],
-                  ["current_exercises", "Упражнения"],
-                ]}
-              />
-            </Section>
-            <Section title="Место и оборудование">
-              <Kv
-                data={d.training_location || {}}
-                fields={[
-                  ["primary_location", "Место"],
-                  ["gym_name", "Зал"],
-                  ["available_equipment", "Оборудование"],
-                  ["custom_equipment_description", "Домашнее оборудование"],
-                ]}
-              />
-            </Section>
-            <Section title="Ограничения и здоровье">
-              <Kv
-                data={d.health_and_limitations || {}}
-                fields={[
-                  ["has_limitations", "Есть ограничения"],
-                  ["categories", "Категории"],
-                  ["movements_to_avoid", "Нежелательные движения"],
-                  ["doctor_recommendations", "Рекомендации врача"],
-                ]}
-              />
-            </Section>
-            <Section title="Предпочтения">
-              <Kv
-                data={d.exercise_preferences || {}}
-                fields={[
-                  ["preferred_exercises", "Нравятся"],
-                  ["disliked_exercises", "Не нравятся"],
-                  ["exercise_goals", "Хочет освоить"],
-                ]}
-              />
-            </Section>
-            <Section title="Дополнительная информация">
-              <Kv
-                data={d.additional_information || {}}
-                fields={[
-                  ["schedule_constraints", "Ограничения расписания"],
-                  ["free_text", "Другое"],
-                ]}
-              />
-            </Section>
-            <Section title="Согласия">
-              {profile.consents.length === 0 ? (
-                <p className="muted">Согласия не зафиксированы</p>
-              ) : (
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Тип</th>
-                      <th>Версия</th>
-                      <th>Дата</th>
-                      <th>Источник</th>
+        {SECTIONS.map((section) => (
+          <Card
+            key={section.key}
+            title={section.title}
+            description={section.description}
+          >
+            <Answers data={data[section.key] || {}} fields={section.fields} />
+          </Card>
+        ))}
+
+        <Card
+          title="Согласия"
+          description="Без согласия на обработку данных программа не собирается."
+        >
+          {profile.consents.length === 0 ? (
+            <Empty
+              title="Согласий нет"
+              hint="Человек ещё не дошёл до этого шага в боте."
+            />
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>На что согласился</th>
+                    <th>Редакция текста</th>
+                    <th>Когда</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {profile.consents.map((c) => (
+                    <tr key={c.consent_type}>
+                      <td>{consentLabel(c.consent_type)}</td>
+                      <td>{c.consent_version}</td>
+                      <td className="muted">{moment(c.granted_at)}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {profile.consents.map((c) => (
-                      <tr key={c.consent_type}>
-                        <td>{c.consent_type}</td>
-                        <td>{c.consent_version}</td>
-                        <td>{c.granted_at ? new Date(c.granted_at).toLocaleString("ru-RU") : "—"}</td>
-                        <td>{c.source}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </Section>
-            <Section title="Программы тренировок">
-              {generateError && <div className="error">{generateError}</div>}
-              <div style={{ marginBottom: 12, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
-                <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <Card
+          title="Программы по этой анкете"
+          description="Каждая сборка сохраняется отдельной версией — предыдущие остаются."
+        >
+          {generateError && <div className="error">{generateError}</div>}
+
+          {canWrite ? (
+            <div className="subcard" style={{ marginBottom: "var(--s-4)" }}>
+              <div className="field-label">Кто соберёт программу</div>
+              <div className="stack" style={{ marginTop: "var(--s-2)" }}>
+                <label className="check">
                   <input
                     type="radio"
                     name="generator"
@@ -272,9 +318,14 @@ export default function ProfileDetailPage() {
                     checked={generatorType === "deterministic"}
                     onChange={() => setGeneratorType("deterministic")}
                   />
-                  Deterministic
+                  <span>
+                    Алгоритм подбора
+                    <span className="field-hint" style={{ display: "block" }}>
+                      Правила отбора упражнений из каталога. Работает всегда.
+                    </span>
+                  </span>
                 </label>
-                <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <label className="check">
                   <input
                     type="radio"
                     name="generator"
@@ -282,50 +333,80 @@ export default function ProfileDetailPage() {
                     checked={generatorType === "ai"}
                     onChange={() => setGeneratorType("ai")}
                   />
-                  AI
+                  <span>
+                    Искусственный интеллект
+                    <span className="field-hint" style={{ display: "block" }}>
+                      Нужны настроенные сервис и модель. Если ИИ не ответит,
+                      сборка не состоится и система покажет причину — программу
+                      тогда можно собрать алгоритмом.
+                    </span>
+                  </span>
                 </label>
+              </div>
+              <div className="button-row">
                 <button
                   type="button"
                   className="primary"
                   disabled={generating}
                   onClick={onGenerate}
                 >
-                  {generating ? "Генерация..." : "Сгенерировать программу"}
+                  {generating ? "Собираем…" : "Собрать программу"}
                 </button>
               </div>
-              {programs.length === 0 ? (
-                <p className="muted">Программ пока нет</p>
-              ) : (
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Версия</th>
-                      <th>Статус</th>
-                      <th>Источник</th>
-                      <th>Название</th>
-                      <th>Создана</th>
+            </div>
+          ) : (
+            <Notice tone="info">
+              Собрать программу может только администратор — у вашей роли доступ
+              на просмотр.
+            </Notice>
+          )}
+
+          {programs.length === 0 ? (
+            <Empty
+              title="Программ по этой анкете ещё нет"
+              hint={
+                canWrite
+                  ? "Выберите, кто соберёт программу, и нажмите «Собрать программу»."
+                  : "Программа появится здесь после сборки."
+              }
+            />
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Версия</th>
+                    <th>Название</th>
+                    <th>Состояние</th>
+                    <th>Собрана</th>
+                    <th>Когда</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {programs.map((p) => (
+                    <tr key={`${p.program_id}-v${p.version}`}>
+                      <td>№{p.version}</td>
+                      <td>
+                        <Link href={`/programs/${p.program_id}`}>{p.title}</Link>
+                      </td>
+                      <td>
+                        <Status tone={statusTone(p.status)}>
+                          {statusLabel(p.status)}
+                        </Status>
+                      </td>
+                      <td>
+                        <Tag tone={p.generation_source === "ai" ? "info" : "neutral"}>
+                          {generationSourceLabel(p.generation_source)}
+                        </Tag>
+                      </td>
+                      <td className="muted">{moment(p.created_at)}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {programs.map((p) => (
-                      <tr key={`${p.program_id}-v${p.version}`}>
-                        <td>v{p.version}</td>
-                        <td>{statusLabel(p.status)}</td>
-                        <td>{generationSourceLabel(p.generation_source)}</td>
-                        <td>
-                          <Link href={`/programs/${p.program_id}`}>{p.title}</Link>
-                        </td>
-                        <td className="muted">
-                          {p.created_at ? new Date(p.created_at).toLocaleString("ru-RU") : "—"}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </Section>
-          </>
-        )}
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
       </main>
     </div>
   );

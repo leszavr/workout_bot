@@ -384,6 +384,10 @@ class AIAuditEventRow(Base):
     """Audit-события административных изменений AI-конфигурации.
 
     metadata НЕ должна содержать секреты (контролируется сервисным слоем).
+
+    Таблица исторически названа с префиксом `ai_`, но служит единым журналом
+    административных событий проекта, включая управление пользователями:
+    плодить параллельный журнал хуже, чем терпеть легаси-имя.
     """
 
     __tablename__ = "ai_audit_events"
@@ -396,4 +400,60 @@ class AIAuditEventRow(Base):
     metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class AdminUserRow(Base):
+    """Пользователь админ-панели.
+
+    Отдельная таблица от `users`: там клиенты Telegram-бота, здесь —
+    сотрудники с доступом к внутреннему интерфейсу. Сущности разные,
+    смешивать нельзя.
+
+    `password_hash` допускает NULL: у пользователя, который входит только
+    через внешнего провайдера, локального пароля нет.
+    """
+
+    __tablename__ = "admin_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    login: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(120))
+    role: Mapped[str] = mapped_column(String(16), default="viewer", index=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255))
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AdminIdentityRow(Base):
+    """Аккаунт внешнего провайдера, привязанный к пользователю админки.
+
+    Существует, чтобы подключение входа через Яндекс/VK/MAX не требовало
+    менять таблицу пользователей: добавляется строка, а не колонка.
+
+    Токены провайдера здесь НЕ хранятся — только идентификатор аккаунта.
+    """
+
+    __tablename__ = "admin_identities"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "provider_user_id", name="uq_admin_identity_provider_user"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    provider_user_id: Mapped[str] = mapped_column(String(191))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )

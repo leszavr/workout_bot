@@ -1,3 +1,57 @@
+Внутренний веб-интерфейс Workout Bot (Next.js App Router).
+
+## Локальная разработка
+
+```bash
+npm install
+npm run dev      # http://localhost:3000
+```
+
+Нужен работающий backend; его адрес задаётся в `.env.local`
+(`NEXT_PUBLIC_API_BASE`, по умолчанию `http://localhost:8000`).
+
+## Проверочная сборка при работающем dev-сервере
+
+`next build` и `next dev` по умолчанию пишут в один и тот же каталог `.next`.
+Production-сборка, запущенная при работающем dev-сервере, перемешивает его
+манифесты и чанки со своими, и dev-сервер начинает падать:
+
+```
+Error: Cannot find module './948.js'
+```
+
+Файл при этом на диске есть — просто собран другим прогоном, и ссылки на чанки
+не совпадают. Ошибка не связана с кодом.
+
+Каталог сборки задаётся переменной `WEB_DIST_DIR` (см. `next.config.mjs`),
+поэтому проверочную сборку можно делать не останавливая dev-сервер:
+
+```bash
+npm run build:check    # собирает в .next-check, каталог .next не трогает
+```
+
+Обычный `npm run build` по-прежнему пишет в `.next` — он для деплоя, и при
+работающем dev-сервере его запускать не нужно. Если `.next` всё же уже
+перемешан:
+
+```bash
+# остановить dev-сервер, затем
+rm -rf .next
+npm run dev
+```
+
+В CI конфликта нет: там сборка идёт в чистом окружении, dev-сервера не существует.
+
+## Проверки
+
+```bash
+npm run lint
+npx tsc --noEmit
+npm run build:check    # безопасно при работающем dev-сервере
+```
+
+---
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started

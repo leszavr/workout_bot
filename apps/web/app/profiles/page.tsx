@@ -4,30 +4,24 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
+import { Card, Empty, Field, Skeleton, Status, moment } from "@/components/ui/Primitives";
 import { api, getToken, ListResponse, ProfileListItem } from "@/lib/api";
-import { statusLabel } from "@/lib/labels";
-
-const GOAL_LABELS: Record<string, string> = {
-  weight_loss: "Снижение веса",
-  muscle_gain: "Набор массы",
-  strength: "Сила",
-  health_fitness: "Здоровье и форма",
-  endurance: "Выносливость",
-  return_to_training: "Возврат к тренировкам",
-  other: "Другое",
-};
+import { questionnaireLabel, statusLabel, statusTone } from "@/lib/labels";
 
 export default function ProfilesPage() {
   const [data, setData] = useState<ListResponse<ProfileListItem> | null>(null);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
+  const [loading, setLoading] = useState(true);
 
   function load(searchValue: string, statusValue: string) {
+    setLoading(true);
     api
       .profiles({ search: searchValue || undefined, status: statusValue || undefined })
       .then(setData)
-      .catch((e) => setError(e.message));
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
   }
 
   useEffect(() => {
@@ -38,75 +32,135 @@ export default function ProfilesPage() {
     load("", "");
   }, []);
 
+  const filtered = search !== "" || status !== "";
+
   return (
     <div className="app-shell">
       <AppNav />
       <main className="main">
-        <h1 className="page-title">Профили</h1>
-        {error && <div className="error">{error}</div>}
-        <div className="toolbar">
-          <input
-            type="text"
-            placeholder="Поиск: имя, ID, номер..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && load(search, status)}
-          />
-          <select value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">Все статусы</option>
-            <option value="confirmed">Подтверждён</option>
-            <option value="draft">Черновик</option>
-            <option value="in_progress">В работе</option>
-          </select>
-          <button type="button" className="primary" onClick={() => load(search, status)}>
-            Найти
-          </button>
+        <div className="page-head">
+          <h1 className="page-title">Анкеты</h1>
+          <p className="page-subtitle">
+            Что человек рассказал о себе боту: цель, опыт, ограничения. На основе
+            анкеты собирается программа тренировок.
+          </p>
         </div>
-        {!data && !error && <div className="loading">Загрузка...</div>}
-        {data && (
-          <>
-            <p className="muted">Всего: {data.total}</p>
-            <table>
-              <thead>
-                <tr>
-                  <th>ID / Номер</th>
-                  <th>Имя</th>
-                  <th>Возраст</th>
-                  <th>Цель</th>
-                  <th>Статус</th>
-                  <th>Дата</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.items.map((p) => (
-                  <tr key={p.profile_id}>
-                    <td>
-                      <Link href={`/profiles/${p.profile_id}`}>
-                        {p.display_number || p.profile_id.slice(0, 8)}
-                      </Link>
-                    </td>
-                    <td>{p.name || "—"}</td>
-                    <td>{p.age ?? "—"}</td>
-                    <td>{p.primary_goal ? GOAL_LABELS[p.primary_goal] || p.primary_goal : "—"}</td>
-                    <td>
-                      <span className={`badge ${p.status}`}>{statusLabel(p.status)}</span>
-                    </td>
-                    <td className="muted">
-                      {p.created_at ? new Date(p.created_at).toLocaleString("ru-RU") : "—"}
-                    </td>
-                  </tr>
-                ))}
-                {data.items.length === 0 && (
+
+        {error && <div className="error">{error}</div>}
+
+        <Card>
+          <div className="filters">
+            <Field
+              label="Поиск"
+              hint="Имя, номер анкеты или её идентификатор."
+              htmlFor="profiles-search"
+            >
+              <input
+                id="profiles-search"
+                type="search"
+                placeholder="Например: Иван или 1042"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && load(search, status)}
+              />
+            </Field>
+            <Field
+              label="Состояние анкеты"
+              hint="Черновик — человек ещё отвечает на вопросы."
+              htmlFor="profiles-status"
+            >
+              <select
+                id="profiles-status"
+                value={status}
+                onChange={(e) => setStatus(e.target.value)}
+              >
+                <option value="">Любое</option>
+                <option value="confirmed">Подтверждена</option>
+                <option value="in_progress">Заполняется</option>
+                <option value="draft">Черновик</option>
+              </select>
+            </Field>
+            <div className="filters-actions">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => load(search, status)}
+              >
+                Показать
+              </button>
+              {filtered && (
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => {
+                    setSearch("");
+                    setStatus("");
+                    load("", "");
+                  }}
+                >
+                  Сбросить
+                </button>
+              )}
+            </div>
+          </div>
+        </Card>
+
+        <Card
+          title="Список анкет"
+          description={data ? `Найдено: ${data.total}` : undefined}
+        >
+          {loading && <Skeleton rows={4} />}
+
+          {!loading && data && data.items.length === 0 && (
+            <Empty
+              title={filtered ? "Ничего не нашлось" : "Анкет пока нет"}
+              hint={
+                filtered
+                  ? "Попробуйте изменить условия поиска или сбросить фильтры."
+                  : "Анкета появляется, когда человек проходит опрос в боте."
+              }
+            />
+          )}
+
+          {!loading && data && data.items.length > 0 && (
+            <div className="table-wrap">
+              <table>
+                <thead>
                   <tr>
-                    <td colSpan={6} className="muted">
-                      Профили не найдены
-                    </td>
+                    <th>Кто</th>
+                    <th>Номер</th>
+                    <th>Возраст</th>
+                    <th>Цель</th>
+                    <th>Состояние</th>
+                    <th>Создана</th>
                   </tr>
-                )}
-              </tbody>
-            </table>
-          </>
-        )}
+                </thead>
+                <tbody>
+                  {data.items.map((p) => (
+                    <tr key={p.profile_id}>
+                      <td>
+                        <Link href={`/profiles/${p.profile_id}`}>
+                          {p.name || "без имени"}
+                        </Link>
+                      </td>
+                      <td>{p.display_number || "—"}</td>
+                      <td>{p.age ?? "—"}</td>
+                      <td>
+                        {p.primary_goal ? questionnaireLabel(p.primary_goal) : "—"}
+                      </td>
+                      <td>
+                        <Status tone={statusTone(p.status)}>
+                          {statusLabel(p.status)}
+                        </Status>
+                      </td>
+                      <td className="muted">{moment(p.created_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
       </main>
     </div>
   );

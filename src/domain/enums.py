@@ -146,4 +146,22 @@ class MovementRestriction(StrEnum):
     AVOID_HIGH_INTENSITY_CARDIO = "avoid_high_intensity_cardio"
 
 
+# Ограничения попадают в текст программы, который читает человек,
+# поэтому у каждого есть русская формулировка.
+MOVEMENT_RESTRICTION_TITLES: dict[MovementRestriction, str] = {
+    MovementRestriction.AVOID_HIGH_IMPACT: "без ударной нагрузки (прыжки, бег)",
+    MovementRestriction.AVOID_HEAVY_SPINAL_LOADING: "без тяжёлой нагрузки на позвоночник",
+    MovementRestriction.AVOID_OVERHEAD_LOADING: "без работы с весом над головой",
+    MovementRestriction.AVOID_DEEP_KNEE_FLEXION: "без глубокого сгибания колен",
+    MovementRestriction.AVOID_HIGH_INTRA_ABDOMINAL_PRESSURE: (
+        "без сильного напряжения брюшного пресса"
+    ),
+    MovementRestriction.AVOID_HIGH_INTENSITY_CARDIO: "без высокоинтенсивного кардио",
+}
+
+
+def movement_restriction_title(restriction: MovementRestriction) -> str:
+    return MOVEMENT_RESTRICTION_TITLES.get(restriction, restriction.value)
+
+
 CONSENT_DOCUMENT_VERSION = "1.0"
