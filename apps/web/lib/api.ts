@@ -367,12 +367,22 @@ export interface GenerateResponse {
   program: ProgramDetail;
   // Operational-состояние генерации (Phase 1.2-B): повторный запрос той же
   // логической генерации не создаёт вторую программу.
+  // Phase 1.2-C: генерация идёт через единый оркестратор, поэтому в ответе
+  // видна фактически применённая стратегия.
+  //
+  // `status` не nullable: успешный ответ всегда означает завершённую
+  // генерацию. Остальные operational-поля nullable, потому что job-контур
+  // опционален на уровне сервера.
   generation: {
     reused_existing: boolean;
     job_id: string | null;
-    status: string | null;
+    status: string;
     attempts: number | null;
     last_error_code: string | null;
+    requested_generator: string | null;
+    actual_generator: string | null;
+    fallback_used: boolean;
+    fallback_reason_code: string | null;
   };
   pool_stats: {
     total_exercises: number;

@@ -165,6 +165,87 @@ Telegram handlers и Admin API не должны самостоятельно с
 
 Особенно важно устранить текущий известный gap: веб-кнопка `Generate Program` должна использовать тот же orchestration path, что и автоматическая генерация.
 
+### 7.1 Реализовано в 1.2-C
+
+**Статус: DONE.** Генерация имеет ровно одну application-level точку.
+
+Контракт: вход — `GenerationRequest`, выход — `OrchestratorResult`
+(`src/application/programs/orchestrator.py`).
+
+```text
+Telegram (auto finalization) ──┐
+                               ▼
+                     GenerationRequest
+                               ▼
+              ProgramGenerationOrchestrator
+                               ▲
+                               │
+Admin API (POST …/programs/generate) ──┘
+```
+
+Различие вызывающих слоёв выражено только запросом, а не отдельным конвейером:
+
+| | requested_generator | allow_fallback | reuse_existing |
+| --- | --- | --- | --- |
+| Автогенерация после finalize | из конфигурации | да | да |
+| Запрос администратора | выбран явно | нет | нет |
+
+`allow_fallback=False` — сознательное решение: администратор выбрал генератор
+сам, и молчаливая подмена скрыла бы от него неработоспособность ИИ. Отказ
+приходит как HTTP 502, программа не создаётся.
+
+Второй pipeline устранён: `ProgramService.generate`/`build_pools` удалены,
+сервис только читает сохранённые версии программ. До 1.2-C Admin API шёл своим
+путём — без readiness gate и без fallback.
+
+Ошибки наружу: оркестратор отдаёт `GenerationFailedError` со стабильным
+`GenerationErrorCode`. Telegram и HTTP не разбирают внутренние исключения AI
+Gateway; HTTP-статус выбирается по коду (409 / 422 / 502). Секреты вычищаются
+из текста отказа перед выходом наружу. Недопустимый генератор — тоже доменный
+отказ (`validation_failed`), а не `ValueError`: оркестратор обязан отвечать
+одинаково любому вызывающему слою, а не только HTTP с pydantic-валидацией.
+
+Классификация отказа выполняется один раз:
+
+```text
+exception → classify_error() → GenerationErrorCode → AIFallbackReason
+```
+
+Второй разбор иерархии исключений удалён. Он давал общий `ai_runtime_failure`
+для rate limit, сетевого сбоя и неподдерживаемого протокола, из-за чего
+operational-запись и журнал администратора описывали одну причину по-разному.
+Таблица `_FALLBACK_REASON_BY_CODE` обязана быть полной: тест сверяет её с
+`GenerationErrorCode`, поэтому новый код нельзя добавить, не решив, как он виден
+администратору.
+
+Идемпотентность клиентского ключа: `idempotency_key` — обещание вызывающей
+стороны «это тот же запрос». Повторное использование с другим
+`requested_generator` возвращает `IdempotencyKeyConflictError` (HTTP 409): отдать
+программу прежнего генератора значило бы отменить явный выбор администратора, а
+создать второй job под тем же ключом — разрушить DB-enforced идемпотентность.
+Конфликт проверяется до разбора статуса, потому что он не зависит от того, чем
+закончилась предыдущая генерация. Серверный ключ попытки
+(`profile:trigger:attempt`) под правило не попадает: его вызывающая сторона не
+выбирала, смена генератора там означает изменение конфигурации приложения между
+запусками, и повторный finalize должен получать готовую программу, а не ошибку.
+
+Fallback выполняется внутри одного job и строго один раз: primary → fallback →
+окончательный отказ. Циклов нет, второй job и вторая программа не создаются.
+
+Границы транзакций и идемпотентность унаследованы из 1.2-B без изменений;
+собственного lock оркестратор не вводит.
+
+Граница закреплена архитектурным тестом
+`tests/unit/test_generation_boundary.py`: он статически запрещает Telegram
+gateway и Admin API обращаться к генераторам, `ProgramValidator`,
+`SafetyEngine`, записи программы и переходам состояния job. Легитимное
+исключение — `apps/backend/api/v1/dependencies.py`, где pipeline собирается один
+раз для обоих слоёв.
+
+Не входит в 1.2-C: retry, worker, stale `RUNNING` recovery (1.2-D) и delivery
+(1.2-E). Delivery по-прежнему выполняется после генерации отдельной операцией и
+частью оркестратора не является.
+
 ## 8. Idempotency
 
 Повтор одного логического запроса генерации не должен создавать несколько независимых программ.
@@ -302,14 +383,20 @@ Redis-backed FSM и restart-safe questionnaire.
 Persistent generation state/job, status model и idempotency boundary.
 
 **Статус: DONE.** Введены `generation_jobs`, state machine, DB-enforced
-idempotency и интеграция в существующие точки генерации (`ProgramService` для
-Admin API, `ProgramGenerationOrchestrator` для Telegram). Retry, worker и
-recovery по-прежнему не реализованы: stale `RUNNING` после падения процесса
-остаётся открытым и закрывается в 1.2-D.
+idempotency и интеграция в существовавшие тогда точки генерации (`ProgramService`
+для Admin API, `ProgramGenerationOrchestrator` для Telegram; в 1.2-C эти два
+пути объединены). Retry, worker и recovery по-прежнему не реализованы: stale
+`RUNNING` после падения процесса остаётся открытым и закрывается в 1.2-D.
 
 ### 1.2-C — Generation Orchestrator
 
 Единая application точка генерации для Telegram и Admin API.
+
+**Статус: DONE.** Введены `GenerationRequest`/`OrchestratorResult`, стратегия
+определяется на запрос, второй pipeline (`ProgramService.generate`) удалён,
+Admin endpoint переведён на оркестратор, наружный контракт ошибки — стабильный
+код вместо исключений AI Gateway. Retry, worker и recovery не реализованы
+(1.2-D), delivery остаётся отдельной операцией (1.2-E).
 
 ### 1.2-D — Worker / retry / recovery
 

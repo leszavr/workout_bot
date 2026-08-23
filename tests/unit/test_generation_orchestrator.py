@@ -1,6 +1,10 @@
-"""Unit-тесты ProgramGenerationOrchestrator (Stage 5).
+"""Unit-тесты ProgramGenerationOrchestrator.
 
 Никакой внешней БД: все зависимости заменены in-memory фейками.
+
+Phase 1.2-C: оркестратор — единственная точка генерации. Здесь же проверяется
+контракт запроса (стратегия на запрос, запрет подмены явно выбранного
+генератора) и наружный контракт результата/ошибки.
 """
 from __future__ import annotations
 
@@ -9,12 +13,24 @@ import pytest
 from src.application.programs.orchestrator import (
     FallbackEvent,
     GateDecision,
+    GenerationRequest,
     ProgramGenerationOrchestrator,
 )
 from src.domain.ai.enums import AIFallbackReason
-from src.domain.ai.errors import AIInvalidResponseError, AITimeoutError
-from src.domain.enums import GenerationSource, ProgramStatus
+from src.domain.ai.errors import (
+    AIConnectionError,
+    AIInvalidResponseError,
+    AIRateLimitError,
+    AITimeoutError,
+)
+from src.domain.enums import GenerationJobStatus, GenerationSource, ProgramStatus
 from src.domain.exercise import Exercise
+from src.domain.generation import (
+    GenerationErrorCode,
+    GenerationTrigger,
+    classify_error,
+    fallback_reason_for_code,
+)
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 from src.domain.profile import FitnessProfile
 from src.domain.program import (
@@ -23,9 +39,28 @@ from src.domain.program import (
     TrainingDay,
     WorkoutProgram,
 )
-from src.errors import ProgramGenerationError
+from src.errors import GenerationFailedError, ProgramGenerationError
 
 EX_ID = "Barbell_Full_Squat"
+
+
+def _request(
+    *,
+    profile_id: str = "p1",
+    trigger: GenerationTrigger = GenerationTrigger.AUTO_FINALIZATION,
+    requested_generator: str | None = None,
+    allow_fallback: bool = True,
+    reuse_existing: bool = False,
+    client_idempotency_key: str | None = None,
+) -> GenerationRequest:
+    return GenerationRequest(
+        profile_id=profile_id,
+        trigger=trigger,
+        requested_generator=requested_generator,
+        allow_fallback=allow_fallback,
+        reuse_existing=reuse_existing,
+        client_idempotency_key=client_idempotency_key,
+    )
 
 
 def _exercise() -> Exercise:
@@ -167,6 +202,21 @@ class FakeGenerator:
         return program
 
 
+class _RecordingJobService:
+    """Фиксирует, дошёл ли запрос до operational-записи.
+
+    Нужен, чтобы отличить отказ контракта запроса (job создаваться не должен) от
+    отказа самой генерации.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, **kwargs):
+        self.calls += 1
+        raise AssertionError("job не должен создаваться при отказе контракта запроса")
+
+
 def _orchestrator(
     *,
     primary: str = "ai",
@@ -217,7 +267,7 @@ class TestOrchestratorPrimarySuccess:
         ai = FakeGenerator("ai")
         orchestrator, repo = _orchestrator(ai_generator=ai)
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert result.fallback_used is False
         assert ai.calls == 1
@@ -236,7 +286,7 @@ class TestOrchestratorPrimarySuccess:
             primary="deterministic", fallback="ai", deterministic_generator=det
         )
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert result.fallback_used is False
         assert det.calls == 1
@@ -253,13 +303,163 @@ class TestOrchestratorPrimarySuccess:
             )
 
 
+class TestRequestContract:
+    """Phase 1.2-C: Telegram и Admin API различаются только запросом."""
+
+    async def test_request_generator_overrides_configuration(self):
+        """Явно выбранный генератор перекрывает конфигурацию приложения."""
+        ai = FakeGenerator("ai")
+        det = FakeGenerator("deterministic")
+        orchestrator, _ = _orchestrator(
+            primary="ai", ai_generator=ai, deterministic_generator=det
+        )
+
+        result = await orchestrator.generate(
+            _request(
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="deterministic",
+                allow_fallback=False,
+            )
+        )
+
+        assert ai.calls == 0
+        assert det.calls == 1
+        assert result.requested_generator == "deterministic"
+        assert result.actual_generator == "deterministic"
+
+    async def test_forbidden_fallback_does_not_substitute_generator(self):
+        """Отказ явно выбранного AI не подменяется детерминированной программой."""
+        ai = FakeGenerator("ai", fail=True, fail_exception=AITimeoutError("timeout"))
+        det = FakeGenerator("deterministic")
+        orchestrator, repo = _orchestrator(
+            ai_generator=ai, deterministic_generator=det
+        )
+
+        with pytest.raises(GenerationFailedError) as exc:
+            await orchestrator.generate(
+                _request(
+                    trigger=GenerationTrigger.ADMIN_REQUEST,
+                    requested_generator="ai",
+                    allow_fallback=False,
+                )
+            )
+
+        assert ai.calls == 1
+        assert det.calls == 0
+        assert repo.programs == []
+        assert exc.value.generation_error_code == GenerationErrorCode.AI_TIMEOUT.value
+
+    async def test_unknown_requested_generator_is_domain_error(self):
+        """Недопустимый генератор — доменный отказ, а не raw ValueError.
+
+        Оркестратор — application-level boundary: он обязан отвечать одинаково
+        любому вызывающему слою, а не только HTTP-слою с pydantic-валидацией.
+        """
+        orchestrator, repo = _orchestrator(
+            deterministic_generator=FakeGenerator("deterministic")
+        )
+
+        with pytest.raises(GenerationFailedError) as exc:
+            await orchestrator.generate(_request(requested_generator="magic"))
+
+        assert (
+            exc.value.generation_error_code
+            == GenerationErrorCode.VALIDATION_FAILED.value
+        )
+        # Отказ контракта не должен создавать программу.
+        assert repo.programs == []
+
+    async def test_unknown_generator_error_is_not_value_error(self):
+        """Regression: наружу уходит доменный контракт, а не raw ValueError.
+
+        `GenerationFailedError` не наследует `ValueError`, поэтому вызывающий
+        слой не может случайно поймать его общим `except ValueError` и не
+        получит 500 вместо 4xx.
+        """
+        orchestrator, _ = _orchestrator(
+            deterministic_generator=FakeGenerator("deterministic")
+        )
+
+        with pytest.raises(GenerationFailedError):
+            await orchestrator.generate(_request(requested_generator="magic"))
+
+        assert not issubclass(GenerationFailedError, ValueError)
+
+    async def test_invalid_generator_creates_no_job(self):
+        """Отказ контракта происходит до создания operational-записи."""
+        jobs = _RecordingJobService()
+        orchestrator, repo = _orchestrator(
+            deterministic_generator=FakeGenerator("deterministic")
+        )
+        orchestrator._generation_jobs = jobs  # noqa: SLF001 — подмена в тесте
+
+        with pytest.raises(GenerationFailedError):
+            await orchestrator.generate(_request(requested_generator="magic"))
+
+        assert jobs.calls == 0
+        assert repo.programs == []
+
+    async def test_result_reports_strategy_and_status(self):
+        """Результат самодостаточен: стратегия и статус доступны вызывающему."""
+        ai = FakeGenerator("ai", fail=True)
+        det = FakeGenerator("deterministic")
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai, deterministic_generator=det, gate=GateDecision(allowed=True)
+        )
+
+        result = await orchestrator.generate(_request())
+
+        assert result.requested_generator == "ai"
+        assert result.actual_generator == "deterministic"
+        assert result.fallback_used is True
+        assert result.fallback_reason_code == "ai_runtime_failure"
+        # Без job-контура успешный возврат означает завершённую генерацию.
+        assert result.status is GenerationJobStatus.SUCCEEDED
+
+    async def test_failure_code_does_not_leak_secrets(self):
+        """Наружу уходит безопасное сообщение: ключей в тексте нет."""
+        ai = FakeGenerator(
+            "ai",
+            fail=True,
+            fail_exception=AITimeoutError(
+                "HTTP 401 Authorization: Bearer sk-secret-value-123456"
+            ),
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        with pytest.raises(GenerationFailedError) as exc:
+            await orchestrator.generate(
+                _request(requested_generator="ai", allow_fallback=False)
+            )
+
+        assert "sk-secret-value-123456" not in str(exc.value)
+        assert "[redacted]" in str(exc.value)
+
+    async def test_reused_result_reports_previous_strategy(self):
+        det = FakeGenerator("deterministic")
+        orchestrator, _ = _orchestrator(
+            primary="deterministic", fallback="deterministic", deterministic_generator=det
+        )
+
+        await orchestrator.generate(_request(reuse_existing=True))
+        second = await orchestrator.generate(_request(reuse_existing=True))
+
+        assert second.reused_existing is True
+        assert second.actual_generator == "deterministic"
+        assert second.status is GenerationJobStatus.SUCCEEDED
+
+
 class TestOrchestratorFallback:
     async def test_ai_error_falls_back_to_deterministic(self):
         ai = FakeGenerator("ai", fail=True)
         det = FakeGenerator("deterministic")
         orchestrator, repo = _orchestrator(ai_generator=ai, deterministic_generator=det)
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert result.fallback_used is True
         assert ai.calls == 1
@@ -276,7 +476,7 @@ class TestOrchestratorFallback:
         det = FakeGenerator("deterministic")
         orchestrator, _ = _orchestrator(ai_generator=ai, deterministic_generator=det)
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert result.fallback_used is True
         assert det.calls == 1
@@ -294,7 +494,7 @@ class TestOrchestratorFallback:
             deterministic_generator=det,
         )
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert result.fallback_used is True
         info = result.program.generation
@@ -307,7 +507,7 @@ class TestOrchestratorFallback:
         orchestrator, repo = _orchestrator(ai_generator=ai, deterministic_generator=det)
 
         with pytest.raises(ProgramGenerationError):
-            await orchestrator.generate("p1")
+            await orchestrator.generate(_request())
 
         assert ai.calls == 1
         assert det.calls == 1
@@ -320,7 +520,7 @@ class TestOrchestratorFallback:
         )
 
         with pytest.raises(ProgramGenerationError):
-            await orchestrator.generate("p1")
+            await orchestrator.generate(_request())
 
         assert det.calls == 1
 
@@ -331,7 +531,7 @@ class TestOrchestratorFallback:
             ai_factory_error=RuntimeError("ai config missing"),
         )
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert result.fallback_used is True
         assert det.calls == 1
@@ -343,7 +543,7 @@ class TestOrchestratorFallback:
         )
 
         with pytest.raises(ProgramGenerationError):
-            await orchestrator.generate("p1")
+            await orchestrator.generate(_request())
 
         assert det.calls == 1
 
@@ -353,8 +553,8 @@ class TestOrchestratorIdempotency:
         det = FakeGenerator("deterministic")
         orchestrator, repo = _orchestrator(deterministic_generator=det)
 
-        first = await orchestrator.generate("p1", reuse_existing=True)
-        second = await orchestrator.generate("p1", reuse_existing=True)
+        first = await orchestrator.generate(_request(reuse_existing=True))
+        second = await orchestrator.generate(_request(reuse_existing=True))
 
         assert det.calls == 1
         assert second.reused_existing is True
@@ -366,8 +566,8 @@ class TestOrchestratorIdempotency:
         det = FakeGenerator("deterministic")
         orchestrator, repo = _orchestrator(deterministic_generator=det)
 
-        first = await orchestrator.generate("p1")
-        second = await orchestrator.generate("p1")
+        first = await orchestrator.generate(_request())
+        second = await orchestrator.generate(_request())
 
         assert det.calls == 2
         assert second.program.version == 2
@@ -377,8 +577,13 @@ class TestOrchestratorIdempotency:
         orchestrator, _ = _orchestrator(deterministic_generator=FakeGenerator("deterministic"))
         orchestrator._profiles = FakeProfileRepository(None)
 
-        with pytest.raises(ProgramGenerationError):
-            await orchestrator.generate("no-such-profile")
+        with pytest.raises(GenerationFailedError) as exc:
+            await orchestrator.generate(_request(profile_id="no-such-profile"))
+
+        assert (
+            exc.value.generation_error_code
+            == GenerationErrorCode.PROFILE_NOT_FOUND.value
+        )
 
 
 class TestReadinessGate:
@@ -397,7 +602,7 @@ class TestReadinessGate:
             ),
         )
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         # Ключевое: заведомо бесполезный AI-запрос не выполнялся.
         assert ai.calls == 0
@@ -415,7 +620,7 @@ class TestReadinessGate:
             ),
         )
 
-        info = (await orchestrator.generate("p1")).program.generation
+        info = (await orchestrator.generate(_request())).program.generation
 
         assert info.fallback_reason_code == "connection_not_tested"
         assert info.requested_generator is GenerationSource.AI
@@ -430,7 +635,7 @@ class TestReadinessGate:
             gate=GateDecision(allowed=True),
         )
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert ai.calls == 1
         assert result.fallback_used is False
@@ -445,7 +650,7 @@ class TestReadinessGate:
             gate=RuntimeError("readiness backend down"),
         )
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert ai.calls == 1
         assert result.fallback_used is False
@@ -463,7 +668,7 @@ class TestReadinessGate:
         )
 
         with pytest.raises(ProgramGenerationError):
-            await orchestrator.generate("p1")
+            await orchestrator.generate(_request())
 
         assert ai.calls == 0
         assert det.calls == 1
@@ -480,7 +685,7 @@ class TestRuntimeFallbackClassification:
             gate=GateDecision(allowed=True),
         )
 
-        info = (await orchestrator.generate("p1")).program.generation
+        info = (await orchestrator.generate(_request())).program.generation
 
         assert ai.calls == 1
         assert info.fallback_reason_code == "ai_timeout"
@@ -495,7 +700,7 @@ class TestRuntimeFallbackClassification:
             gate=GateDecision(allowed=True),
         )
 
-        info = (await orchestrator.generate("p1")).program.generation
+        info = (await orchestrator.generate(_request())).program.generation
 
         assert info.fallback_reason_code == "ai_invalid_response"
 
@@ -507,9 +712,63 @@ class TestRuntimeFallbackClassification:
             gate=GateDecision(allowed=True),
         )
 
-        info = (await orchestrator.generate("p1")).program.generation
+        info = (await orchestrator.generate(_request())).program.generation
 
         assert info.fallback_reason_code == "ai_runtime_failure"
+
+    async def test_rate_limit_is_not_generic_runtime_failure(self):
+        """Конкретная причина не деградирует в общий сбой (Phase 1.2-C).
+
+        До объединения классификаций rate limit получал конкретный
+        `GenerationErrorCode`, но общий `ai_runtime_failure` в журнале
+        администратора.
+        """
+        ai = FakeGenerator(
+            "ai", fail=True, fail_exception=AIRateLimitError("too many requests")
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate(_request())).program.generation
+
+        assert info.fallback_reason_code == "ai_rate_limited"
+
+    async def test_connection_failure_is_not_generic_runtime_failure(self):
+        ai = FakeGenerator(
+            "ai", fail=True, fail_exception=AIConnectionError("connection reset")
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate(_request())).program.generation
+
+        assert info.fallback_reason_code == "ai_connection_failed"
+
+    async def test_fallback_reason_matches_job_error_code(self):
+        """Журнал администратора и код отказа описывают одну причину.
+
+        Это и есть свойство, которое раньше нарушалось: две независимые таблицы
+        классификации давали разные ответы на одно исключение.
+        """
+        ai = FakeGenerator(
+            "ai", fail=True, fail_exception=AIRateLimitError("too many requests")
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        result = await orchestrator.generate(_request())
+
+        code = classify_error(AIRateLimitError("x"))
+        assert result.fallback_reason_code == fallback_reason_for_code(code).value
 
     async def test_validation_failure_is_classified(self):
         ai = FakeGenerator("ai", invalid=True)
@@ -519,7 +778,7 @@ class TestRuntimeFallbackClassification:
             gate=GateDecision(allowed=True),
         )
 
-        info = (await orchestrator.generate("p1")).program.generation
+        info = (await orchestrator.generate(_request())).program.generation
 
         assert info.fallback_reason_code == "ai_validation_failed"
 
@@ -530,7 +789,7 @@ class TestRuntimeFallbackClassification:
             gate=GateDecision(allowed=True),
         )
 
-        info = (await orchestrator.generate("p1")).program.generation
+        info = (await orchestrator.generate(_request())).program.generation
 
         assert info.fallback_reason_code == "generator_not_configured"
 
@@ -549,7 +808,7 @@ class TestFallbackObservability:
             recorder=events,
         )
 
-        await orchestrator.generate("p1")
+        await orchestrator.generate(_request())
 
         assert len(events) == 1
         event = events[0]
@@ -568,7 +827,7 @@ class TestFallbackObservability:
             recorder=events,
         )
 
-        await orchestrator.generate("p1")
+        await orchestrator.generate(_request())
 
         assert events[0].ai_attempted is True
         assert events[0].reason_code == "ai_runtime_failure"
@@ -582,7 +841,7 @@ class TestFallbackObservability:
             recorder=events,
         )
 
-        await orchestrator.generate("p1")
+        await orchestrator.generate(_request())
 
         assert events == []
 
@@ -597,7 +856,7 @@ class TestFallbackObservability:
         )
         orchestrator._fallback_recorder = broken_recorder
 
-        result = await orchestrator.generate("p1")
+        result = await orchestrator.generate(_request())
 
         assert result.fallback_used is True
         assert result.program.generation.fallback_reason_code == "ai_runtime_failure"

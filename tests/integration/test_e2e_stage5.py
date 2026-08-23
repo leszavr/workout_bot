@@ -15,7 +15,10 @@ from src.application.profiles.finalization import ProfileFinalizationService
 from src.application.programs.filtering import ExerciseFilter
 from src.application.programs.generator import DeterministicProgramGenerator
 from src.application.programs.html_service import ProgramHtmlService
-from src.application.programs.orchestrator import ProgramGenerationOrchestrator
+from src.application.programs.orchestrator import (
+    GenerationRequest,
+    ProgramGenerationOrchestrator,
+)
 from src.application.programs.pipeline import PipelineOutcome, ProgramPipelineService
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.telegram_delivery import ProgramDeliveryService
@@ -28,6 +31,7 @@ from src.domain.enums import (
     ProgramStatus,
     TrainingLocationType,
 )
+from src.domain.generation import GenerationTrigger
 from src.domain.profile import FitnessProfile
 from src.infrastructure.config import DATABASE_URL
 
@@ -261,7 +265,12 @@ class TestEndToEndStage5:
             deterministic_generator=DeterministicProgramGenerator(),
         )
 
-        result = await orchestrator.generate(profile.profile_id, reuse_existing=False)
+        result = await orchestrator.generate(
+            GenerationRequest(
+                profile_id=profile.profile_id,
+                trigger=GenerationTrigger.AUTO_FINALIZATION,
+            )
+        )
 
         assert result.fallback_used is True
         program = result.program

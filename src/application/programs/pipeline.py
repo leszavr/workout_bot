@@ -2,7 +2,7 @@
 
 Pipeline:
     FinalizeProfile
-      → ProgramGenerationOrchestrator (AI → deterministic fallback)
+      → ProgramGenerationOrchestrator (единственная точка генерации)
       → ProgramRepository
       → ProgramHtmlService (renderer)
       → ProgramDeliveryService (Telegram document)
@@ -10,6 +10,11 @@ Pipeline:
 Pipeline-сервис возвращает безопасный user-facing результат; технические
 детали уходят в логи и алерты администратору. Telegram handler не содержит
 бизнес-логики и лишь транслирует результат пользователю.
+
+Phase 1.2-C: pipeline не выбирает генератор, не вызывает AI Gateway, не делает
+safety/validation, не сохраняет программу и не меняет состояние GenerationJob —
+всё это принадлежит оркестратору. Здесь остаётся только доставка и перевод
+результата в сообщение пользователю.
 """
 from __future__ import annotations
 
@@ -21,9 +26,13 @@ from src.application.notifications.program_alerts import (
     ProgramAlert,
     ProgramAlertService,
 )
-from src.application.programs.orchestrator import ProgramGenerationOrchestrator
+from src.application.programs.orchestrator import (
+    GenerationRequest,
+    ProgramGenerationOrchestrator,
+)
 from src.application.programs.telegram_delivery import ProgramDeliveryService
 from src.domain.enums import ProgramDeliveryStatus
+from src.domain.generation import GenerationTrigger
 from src.domain.program import WorkoutProgram
 from src.errors import (
     GenerationAlreadyRunningError,
@@ -75,7 +84,15 @@ class ProgramPipelineService:
         # --- Generation --------------------------------------------------------
         try:
             result = await self._orchestrator.generate(
-                profile_id, reuse_existing=reuse_existing
+                GenerationRequest(
+                    profile_id=profile_id,
+                    trigger=GenerationTrigger.AUTO_FINALIZATION,
+                    # Стратегия — из конфигурации приложения; fallback разрешён,
+                    # чтобы неработоспособный AI не ломал пользовательский
+                    # сценарий.
+                    allow_fallback=True,
+                    reuse_existing=reuse_existing,
+                )
             )
         except GenerationAlreadyRunningError:
             # Дубликат запуска (двойной клик, параллельный процесс): вторую

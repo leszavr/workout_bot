@@ -245,6 +245,47 @@ def test_generate_program(client: TestClient, auth_headers: dict):
     assert body["generation"]["attempts"] == 1
     assert body["generation"]["reused_existing"] is False
     assert body["generation"]["last_error_code"] is None
+    # Фактическая стратегия — часть контракта результата (Phase 1.2-C).
+    assert body["generation"]["requested_generator"] == "deterministic"
+    assert body["generation"]["actual_generator"] == "deterministic"
+    assert body["generation"]["fallback_used"] is False
+    assert body["generation"]["fallback_reason_code"] is None
+
+
+def test_generate_program_ai_is_never_substituted(
+    client: TestClient, auth_headers: dict
+):
+    """Явно выбранный ИИ не подменяется алгоритмом подбора.
+
+    Главное следствие Phase 1.2-C: генерация идёт через оркестратор, но выбор
+    администратора не переопределяется fallback'ом. Тест не зависит от того,
+    настроен ли ИИ в окружении: проверяется инвариант, а не конкретный исход —
+    либо программа собрана именно ИИ, либо администратор видит отказ и
+    программы нет.
+    """
+    profile_id = "test-api-prog-ai"
+    _create_test_profile(client, profile_id)
+
+    response = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json={"generator": "ai"},
+    )
+
+    if response.status_code == 200:
+        generation = response.json()["generation"]
+        assert generation["requested_generator"] == "ai"
+        assert generation["actual_generator"] == "ai"
+        assert generation["fallback_used"] is False
+        return
+
+    # Отказ ИИ — не ошибка запроса администратора: это 502.
+    assert response.status_code == 502
+    assert "ИИ" in response.json()["detail"]
+    programs = client.get(
+        f"/api/v1/profiles/{profile_id}/programs", headers=auth_headers
+    ).json()
+    assert programs["total"] == 0
 
 
 def test_generate_program_with_same_idempotency_key_reuses_program(
@@ -280,6 +321,50 @@ def test_generate_program_with_same_idempotency_key_reuses_program(
     assert programs["total"] == 1
 
 
+def test_generate_program_key_reuse_with_other_generator_is_409(
+    client: TestClient, auth_headers: dict
+):
+    """Тот же ключ с другим генератором — конфликт параметров, а не подмена.
+
+    Ключ означает «это тот же запрос». Отдать программу, собранную другим
+    генератором, значило бы отменить явный выбор администратора, а запустить
+    новую генерацию под тем же ключом — разрушить идемпотентность.
+    """
+    profile_id = "test-api-prog-key-conflict"
+    _create_test_profile(client, profile_id)
+    key = "api-test-conflict-1"
+
+    first = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json={"generator": "deterministic", "idempotency_key": key},
+    )
+    assert first.status_code == 200
+
+    conflict = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json={"generator": "ai", "idempotency_key": key},
+    )
+
+    assert conflict.status_code == 409
+    assert "deterministic" in conflict.json()["detail"]
+
+    # Вторая программа не создана, подмены генератора не произошло.
+    programs = client.get(
+        f"/api/v1/profiles/{profile_id}/programs", headers=auth_headers
+    ).json()
+    assert programs["total"] == 1
+
+    # Новый ключ — законный новый запрос, конфликт не «залипает».
+    retry = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json={"generator": "deterministic", "idempotency_key": "api-test-conflict-2"},
+    )
+    assert retry.status_code == 200
+
+
 def test_generate_program_without_key_creates_new_version(
     client: TestClient, auth_headers: dict
 ):
@@ -302,6 +387,22 @@ def test_generate_program_missing_profile(client: TestClient, auth_headers: dict
     response = client.post(
         "/api/v1/profiles/nonexistent-id/programs/generate", headers=auth_headers
     )
+    assert response.status_code == 422
+
+
+def test_generate_program_invalid_generator_is_422(
+    client: TestClient, auth_headers: dict
+):
+    """Недопустимый генератор — ошибка запроса, а не 500."""
+    profile_id = "test-api-prog-badgen"
+    _create_test_profile(client, profile_id)
+
+    response = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json={"generator": "magic"},
+    )
+
     assert response.status_code == 422
 
 

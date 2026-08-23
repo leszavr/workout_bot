@@ -34,7 +34,11 @@ from src.domain.generation import (
     safe_error_message,
 )
 from src.domain.program import WorkoutProgram
-from src.errors import GenerationAlreadyRunningError, ProgramGenerationError
+from src.errors import (
+    GenerationAlreadyRunningError,
+    IdempotencyKeyConflictError,
+    ProgramGenerationError,
+)
 from src.infrastructure.persistence.postgres.generation_job_repository import (
     GenerationJobRepository,
 )
@@ -102,7 +106,14 @@ class GenerationJobService:
             )
         )
         if not created:
-            return await self._handle_duplicate(job)
+            return await self._handle_duplicate(
+                job,
+                requested_generator=requested_generator,
+                # Конфликт параметров проверяется только для клиентского ключа:
+                # серверный ключ попытки вызывающая сторона не выбирала и
+                # ничего им не обещала.
+                check_parameters=bool(client_idempotency_key),
+            )
 
         job = await self._jobs.mark_running(job)
         logger.info(
@@ -178,8 +189,48 @@ class GenerationJobService:
             profile_id=profile_id, trigger=trigger, attempt=attempt
         )
 
-    async def _handle_duplicate(self, job: GenerationJob) -> GenerationRun:
-        """Дубликат логической генерации: второй раз ничего не запускаем."""
+    async def _handle_duplicate(
+        self,
+        job: GenerationJob,
+        *,
+        requested_generator: str,
+        check_parameters: bool,
+    ) -> GenerationRun:
+        """Дубликат логической генерации: второй раз ничего не запускаем.
+
+        Для клиентского ключа сначала проверяется совместимость параметров.
+        Idempotency key — это утверждение вызывающей стороны «это повтор того же
+        запроса»; если `requested_generator` отличается, утверждение неверно.
+        Отдать результат победителя нельзя (он собран другим генератором — это
+        молчаливая подмена явного выбора), запустить новую генерацию под тем же
+        ключом тоже нельзя (это разрушает идемпотентность). Поэтому конфликт
+        возвращается клиенту.
+
+        Проверка идёт до разбора статуса: конфликт параметров не зависит от того,
+        чем закончилась предыдущая генерация, и одинаково применим к активному,
+        успешному и провалившемуся job.
+
+        Серверный ключ попытки (`profile:trigger:attempt`) не проверяется:
+        вызывающая сторона его не выбирала и ничего им не обещала. Там смена
+        генератора означает изменение конфигурации приложения между запусками, а
+        не противоречивый запрос, и повторный finalize должен по-прежнему
+        получать готовую программу, а не ошибку.
+        """
+        if check_parameters and job.requested_generator != requested_generator:
+            logger.warning(
+                "event=generation_job_key_conflict",
+                extra={
+                    "profile_id": job.profile_id,
+                    "job_id": job.job_id,
+                    "existing_generator": job.requested_generator,
+                    "requested_generator": requested_generator,
+                },
+            )
+            raise IdempotencyKeyConflictError(
+                "Этот idempotency key уже использован с другим генератором "
+                f"({job.requested_generator}). Используйте новый ключ или "
+                "повторите запрос с тем же генератором."
+            )
         logger.info(
             "event=generation_job_duplicate",
             extra={

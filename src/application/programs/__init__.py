@@ -1,5 +1,11 @@
-"""Пакет этапа 3A: pipeline генерации программ тренировок.
+"""Пакет генерации программ тренировок.
 
-Profile → ExerciseFilter → CandidatePool → SafetyEngine → SafeExercisePool
-→ ProgramGenerator → ProgramValidator → ProgramRepository.
+Единственная точка входа — `ProgramGenerationOrchestrator` (Phase 1.2-C):
+
+GenerationRequest → GenerationJob → ExerciseFilter → CandidatePool
+→ SafetyEngine → SafeExercisePool → ProgramGenerator (AI | deterministic)
+→ ProgramValidator → ProgramRepository → GenerationOutcome.
+
+`ProgramService` из этого пакета генерацией не занимается: он только читает
+сохранённые версии программ.
 """

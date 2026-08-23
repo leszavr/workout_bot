@@ -42,7 +42,7 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - JSON extraction/parser;
 - schema + business validation;
 - до 2 repair attempts;
-- подключение к ProgramService.
+- подключение к pipeline генерации (с Phase 1.2-C — через `ProgramGenerationOrchestrator`).
 
 ### Этап 5 — generation → HTML → Telegram: ГОТОВО
 - автоматическая orchestration после финализации;
@@ -104,7 +104,7 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - веб-кнопка Generate Program должна использовать тот же orchestration path;
 - Phase 1.2 разбита на 1.2-A…1.2-G: FSM, generation state, orchestrator, worker/retry/recovery, delivery, admin visibility, E2E acceptance.
 
-**Следующий рабочий этап:** Phase 1.2-C — Generation Orchestrator.
+**Следующий рабочий этап:** Phase 1.2-D — Worker / retry / recovery.
 
 ### Phase 1.2-A — Persistent FSM: ГОТОВО
 
@@ -156,6 +156,57 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - существующие пути генерации сохранены: AI-генерация, deterministic fallback и
   автозапуск после финализации работают как раньше.
 
+### Phase 1.2-C — Generation Orchestrator: ГОТОВО
+
+- `ProgramGenerationOrchestrator` — единственная application-level точка
+  генерации. Telegram (автогенерация после подтверждения анкеты) и Admin API
+  (кнопка `Generate Program`) приходят в неё; второго pipeline больше нет;
+- `ProgramService.generate`/`build_pools` удалены: сервис отвечает только за
+  чтение сохранённых версий программ. До этого этапа Admin API шёл своим
+  конвейером — без readiness gate и без fallback;
+- вход — `GenerationRequest`, выход — `OrchestratorResult`. Различие вызывающих
+  слоёв выражено только запросом:
+  - автогенерация: стратегия из `PROGRAM_PRIMARY_GENERATOR`/
+    `PROGRAM_FALLBACK_GENERATOR`, `allow_fallback=True` — неработоспособный ИИ
+    не ломает пользовательский сценарий;
+  - запрос администратора: генератор выбран явно, `allow_fallback=False` —
+    подменять выбор молча нельзя, администратор должен увидеть причину;
+- fallback выполняется внутри одного job и строго один раз: primary → fallback
+  → окончательный отказ. Циклов «AI → fallback → AI» нет, вторая программа и
+  второй job не создаются;
+- результат самодостаточен: программа, состояние job, запрошенный и фактический
+  генератор, признак fallback и его машиночитаемая причина. Внутренние
+  исключения AI Gateway наружу не выходят — отказ приходит как
+  `GenerationFailedError` со стабильным кодом (`GenerationErrorCode`), и по
+  этому коду выбирается HTTP-статус: 409 (уже выполняется), 422 (ошибка данных
+  или валидации), 502 (сбой ИИ);
+- ответ `POST /api/v1/profiles/{id}/programs/generate` расширен полями
+  `requested_generator`, `actual_generator`, `fallback_used`,
+  `fallback_reason_code`; существующие поля сохранены. `generation.status`
+  зафиксирован как non-nullable: успешный ответ всегда означает завершённую
+  генерацию, остальные operational-поля остались nullable;
+- клиентский `idempotency_key` — обещание «это тот же запрос». Повторное
+  использование с другим генератором возвращает 409: отдать программу прежнего
+  генератора значило бы отменить явный выбор администратора, а создать второй job
+  под тем же ключом — разрушить идемпотентность. Серверный ключ попытки
+  (`profile:trigger:attempt`) под это правило не попадает: его вызывающая сторона
+  не выбирала, и повторный finalize по-прежнему получает готовую программу;
+- классификация отказов единственная: `classify_error` → `GenerationErrorCode` →
+  `AIFallbackReason`. Второй разбор иерархии исключений удалён, поэтому
+  operational-запись и журнал администратора не могут описывать одну причину
+  по-разному;
+- границы транзакций и идемпотентность взяты из 1.2-B без изменений: короткая
+  транзакция на создание/переход job, генерация (включая AI-вызов) вне
+  транзакции, короткая транзакция на закрытие. Собственного lock оркестратор не
+  вводит;
+- граница закреплена архитектурным тестом `tests/unit/test_generation_boundary.py`:
+  он статически запрещает Telegram gateway и Admin API обращаться к
+  генераторам, validator, safety, записи программы и переходам job.
+
+**Осознанное ограничение:** retry, worker и stale-recovery не реализованы —
+это Phase 1.2-D. Delivery остаётся отдельной операцией и в оркестратор не
+входит (Phase 1.2-E).
+
 ## Открытые проблемы и риски
 
 ### P0 — до реального production
@@ -166,10 +217,10 @@ Workout Bot — модульный монолит для Telegram: пользо�
 2. **Нет rate limiting на вход в админку** — перебор пароля остаётся задачей Phase 1.3.
 3. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа, AI primary, deterministic fallback, delivery failure/retry.
 4. Проверка безопасности production-конфигурации и секретов.
-5. Веб-кнопка `Generate Program` пока идёт по отдельному пути через `ProgramService` без fallback/gate; persistent generation state у обоих путей уже общий, но единая точка генерации через `ProgramGenerationOrchestrator` — задача Phase 1.2-C.
-6. Часть интеграционных тестов требует каталога упражнений; CI засеивает его автоматически.
-7. `alembic check` сообщает о косметическом расхождении ORM-моделей и миграций (`unique=True` против UniqueConstraint); это существовало до текущего этапа.
-8. Job, оставшийся в `RUNNING` после падения процесса, никто не восстанавливает: retry, worker и stale-recovery — Phase 1.2-D. До этого повторный запрос такой генерации будет отклоняться как «уже выполняется».
+5. Часть интеграционных тестов требует каталога упражнений; CI засеивает его автоматически.
+6. `alembic check` сообщает о косметическом расхождении ORM-моделей и миграций (`unique=True` против UniqueConstraint); это существовало до текущего этапа.
+7. Job, оставшийся в `RUNNING` после падения процесса, никто не восстанавливает: retry, worker и stale-recovery — Phase 1.2-D. До этого повторный запрос такой генерации будет отклоняться как «уже выполняется».
+8. `GenerateProgramRequest.prompt_version` не используется: поле принимается API, но никуда не передаётся. Существовало до Phase 1.2-C и относится к prompt-архитектуре, поэтому в этом этапе не менялось.
 
 ### P1 — продуктовый цикл
 - повторная/явная генерация и удобный статус программы;
@@ -195,4 +246,4 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 ## Следующий приоритет
 
-Phase 1.2-C: Generation Orchestrator — единая точка генерации для Telegram и Admin API. Подробный design baseline — `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`; порядок дальнейших работ — `DEVELOPMENT_ROADMAP.md`.
+Phase 1.2-D: Worker / retry / recovery — фоновая обработка, централизованный retry и восстановление stale `RUNNING` job после падения процесса. Подробный design baseline — `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`; порядок дальнейших работ — `DEVELOPMENT_ROADMAP.md`.

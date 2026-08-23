@@ -25,6 +25,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.domain.ai.enums import AIFallbackReason
 from src.domain.ai.errors import (
     AIConfigurationError,
     AIConnectionError,
@@ -36,6 +37,7 @@ from src.domain.ai.errors import (
 )
 from src.domain.enums import GenerationJobStatus
 from src.errors import (
+    GenerationFailedError,
     ProgramGenerationError,
     ProgramPersistenceError,
     ProgramValidationError,
@@ -172,7 +174,17 @@ def error_kind(code: GenerationErrorCode | str) -> GenerationErrorKind:
 
 
 def classify_error(exc: BaseException) -> GenerationErrorCode:
-    """Относит исключение генерации к стабильному коду ошибки."""
+    """Относит исключение генерации к стабильному коду ошибки.
+
+    `GenerationFailedError` уже несёт код, определённый оркестратором в момент
+    отказа: повторно классифицировать его по типу исключения нельзя, иначе
+    причина «AI не сконфигурирован» превратилась бы в общий сбой генерации.
+    """
+    if isinstance(exc, GenerationFailedError):
+        try:
+            return GenerationErrorCode(exc.generation_error_code)
+        except ValueError:
+            return GenerationErrorCode.GENERATION_FAILED
     if isinstance(exc, ProgramValidationError):
         return GenerationErrorCode.VALIDATION_FAILED
     if isinstance(exc, ProgramPersistenceError):
@@ -194,6 +206,47 @@ def classify_error(exc: BaseException) -> GenerationErrorCode:
     if isinstance(exc, ProgramGenerationError):
         return GenerationErrorCode.GENERATION_FAILED
     return GenerationErrorCode.UNEXPECTED_ERROR
+
+
+# Единственный маппинг «код отказа → причина fallback» (Phase 1.2-C).
+#
+# Классификация исключения выполняется ровно один раз, в `classify_error`.
+# Раньше рядом жила вторая таблица, разбиравшая ту же иерархию исключений
+# заново, и для rate limit, сетевого сбоя и неподдерживаемого протокола она
+# давала общий `ai_runtime_failure`: operational-запись и журнал администратора
+# описывали одну причину по-разному.
+#
+# Таблица обязана быть полной: тест сверяет её с `GenerationErrorCode`, поэтому
+# новый код нельзя добавить, не решив, как он выглядит для администратора.
+_FALLBACK_REASON_BY_CODE: dict[GenerationErrorCode, AIFallbackReason] = {
+    # Конфигурация: AI-вызов не выполнялся либо заведомо не мог сработать.
+    GenerationErrorCode.AI_NOT_CONFIGURED: AIFallbackReason.AI_NOT_CONFIGURED,
+    GenerationErrorCode.AI_UNSUPPORTED_PROTOCOL: AIFallbackReason.UNSUPPORTED_PROTOCOL,
+    # Runtime: попытка была и не удалась.
+    GenerationErrorCode.AI_TIMEOUT: AIFallbackReason.AI_TIMEOUT,
+    GenerationErrorCode.AI_RATE_LIMITED: AIFallbackReason.AI_RATE_LIMITED,
+    GenerationErrorCode.AI_CONNECTION_FAILED: AIFallbackReason.AI_CONNECTION_FAILED,
+    GenerationErrorCode.AI_INVALID_RESPONSE: AIFallbackReason.AI_INVALID_RESPONSE,
+    GenerationErrorCode.AI_RUNTIME_FAILURE: AIFallbackReason.AI_RUNTIME_FAILURE,
+    # Ответ AI получен, но не прошёл проверку.
+    GenerationErrorCode.VALIDATION_FAILED: AIFallbackReason.AI_VALIDATION_FAILED,
+    # Отказы, не относящиеся к самому AI: для администратора это всё равно
+    # «обращение к ИИ не дало программу», детали остаются в коде ошибки job.
+    GenerationErrorCode.PROFILE_NOT_FOUND: AIFallbackReason.AI_RUNTIME_FAILURE,
+    GenerationErrorCode.GENERATION_FAILED: AIFallbackReason.AI_RUNTIME_FAILURE,
+    GenerationErrorCode.PERSISTENCE_FAILED: AIFallbackReason.AI_RUNTIME_FAILURE,
+    GenerationErrorCode.UNEXPECTED_ERROR: AIFallbackReason.AI_RUNTIME_FAILURE,
+}
+
+
+def fallback_reason_for_code(code: GenerationErrorCode) -> AIFallbackReason:
+    """Причина fallback по стабильному коду отказа.
+
+    Единственный путь получения `AIFallbackReason` из исключения — через
+    `classify_error`, поэтому operational-состояние и журнал администратора не
+    могут разойтись.
+    """
+    return _FALLBACK_REASON_BY_CODE.get(code, AIFallbackReason.AI_RUNTIME_FAILURE)
 
 
 # Текст ошибки провайдера может содержать эхо запроса. Хранить его целиком в

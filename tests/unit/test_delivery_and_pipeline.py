@@ -213,12 +213,14 @@ class FakeOrchestrator:
         self.fail = fail
         self.already_running = already_running
         self.calls = 0
+        self.requests: list[object] = []
 
-    async def generate(self, profile_id: str, *, reuse_existing: bool = False):
+    async def generate(self, request):
         from src.application.programs.orchestrator import OrchestratorResult
         from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 
         self.calls += 1
+        self.requests.append(request)
         if self.already_running:
             from src.errors import GenerationAlreadyRunningError
 
@@ -227,6 +229,7 @@ class FakeOrchestrator:
             from src.errors import ProgramGenerationError
 
             raise ProgramGenerationError("generation boom")
+        profile_id = request.profile_id
         return OrchestratorResult(
             program=self.program,
             candidate_pool=ExerciseCandidatePool(profile_id=profile_id, total_exercises=10),
@@ -300,3 +303,26 @@ class TestPipelineService:
         assert result.program is None
         assert "уже формируется" in result.user_message
         assert alerts == []
+
+    async def test_telegram_path_delegates_generation_request(self):
+        """Phase 1.2-C: pipeline только формирует запрос к оркестратору.
+
+        Стратегию он не выбирает: генератор берётся из конфигурации, fallback
+        разрешён, чтобы неработоспособный AI не ломал пользовательский
+        сценарий.
+        """
+        from src.domain.generation import GenerationTrigger
+
+        service, _, _, _, _ = _delivery_service()
+        pipeline, _, _ = self._pipeline(delivery=service)
+        orchestrator = pipeline._orchestrator  # noqa: SLF001 — проверка контракта
+
+        await pipeline.run_for_user(profile_id="p1", chat_id="1")
+
+        assert orchestrator.calls == 1
+        request = orchestrator.requests[0]
+        assert request.profile_id == "p1"
+        assert request.trigger is GenerationTrigger.AUTO_FINALIZATION
+        assert request.requested_generator is None
+        assert request.allow_fallback is True
+        assert request.reuse_existing is True

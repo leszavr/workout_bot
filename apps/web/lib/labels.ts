@@ -305,6 +305,8 @@ export const AI_FALLBACK_REASON_LABELS: Record<string, string> = {
   generator_not_configured: "генератор не настроен",
   // Обращение было и не удалось.
   ai_timeout: "ИИ не ответил вовремя",
+  ai_rate_limited: "сервис ИИ ограничил число запросов",
+  ai_connection_failed: "не удалось соединиться с ИИ",
   ai_runtime_failure: "сбой при обращении к ИИ",
   ai_invalid_response: "ИИ вернул некорректный ответ",
   ai_validation_failed: "ответ ИИ не прошёл проверку",
