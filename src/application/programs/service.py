@@ -7,6 +7,10 @@ safety, генератор, валидатор, репозитории) чере
 Pipeline:
     Profile → ExerciseFilter → CandidatePool → SafetyEngine → SafeExercisePool
     → ProgramGenerator → ProgramValidator → ProgramRepository (versioned).
+
+Phase 1.2-B: генерация выполняется под persistent `GenerationJob`, если он
+передан. Тогда повторный запрос той же логической генерации не создаёт вторую
+программу, а состояние операции сохраняется в PostgreSQL.
 """
 from __future__ import annotations
 
@@ -14,10 +18,12 @@ import uuid
 from dataclasses import dataclass
 
 from src.application.programs.filtering import ExerciseFilter
+from src.application.programs.generation_jobs import GenerationJobService
 from src.application.programs.generator import ProgramGenerator
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.validator import ProgramValidator
-from src.domain.enums import ProgramStatus
+from src.domain.enums import GenerationSource, ProgramStatus
+from src.domain.generation import GenerationJob, GenerationTrigger
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 from src.domain.profile import FitnessProfile
 from src.domain.program import WorkoutProgram
@@ -37,6 +43,11 @@ class GenerationResult:
     program: WorkoutProgram
     candidate_pool: ExerciseCandidatePool
     safe_pool: SafeExercisePool
+    # Заполняется, когда генерация шла под persistent job (Phase 1.2-B).
+    job: GenerationJob | None = None
+    # True — программа получена от предыдущей успешной логической генерации,
+    # новая генерация не выполнялась. Пулы тогда пусты: их не пересчитывали.
+    reused_existing: bool = False
 
 
 class ProgramService:
@@ -50,6 +61,8 @@ class ProgramService:
         exercise_filter: ExerciseFilter | None = None,
         safety_engine: SafetyEngine | None = None,
         validator: ProgramValidator | None = None,
+        generation_jobs: GenerationJobService | None = None,
+        requested_generator: str = GenerationSource.DETERMINISTIC.value,
     ) -> None:
         self._profiles = profile_repository
         self._exercises = exercise_repository
@@ -58,6 +71,8 @@ class ProgramService:
         self._filter = exercise_filter or ExerciseFilter()
         self._safety = safety_engine or SafetyEngine()
         self._validator = validator or ProgramValidator()
+        self._generation_jobs = generation_jobs
+        self._requested_generator = requested_generator
 
     async def build_pools(
         self, profile: FitnessProfile
@@ -72,12 +87,52 @@ class ProgramService:
         safe_pool = self._safety.apply(profile, candidate_pool.included)
         return candidate_pool, safe_pool, catalog_ids
 
-    async def generate(self, profile_id: str) -> GenerationResult:
-        """Полный pipeline: профиль → пулы → генерация → валидация → сохранение версии."""
+    async def generate(
+        self,
+        profile_id: str,
+        *,
+        trigger: GenerationTrigger = GenerationTrigger.ADMIN_REQUEST,
+        client_idempotency_key: str | None = None,
+    ) -> GenerationResult:
+        """Полный pipeline: профиль → пулы → генерация → валидация → сохранение версии.
+
+        Профиль читается до создания job: у несуществующего профиля не должно
+        оставаться operational-записи о генерации.
+        """
         profile = await self._profiles.get(profile_id)
         if profile is None:
             raise ProgramGenerationError(f"Профиль {profile_id} не найден")
 
+        if self._generation_jobs is None:
+            return await self._generate(profile)
+
+        run = await self._generation_jobs.run(
+            profile_id=profile_id,
+            trigger=trigger,
+            requested_generator=self._requested_generator,
+            client_idempotency_key=client_idempotency_key,
+            operation=lambda: self._generate(profile),
+        )
+        if run.duplicate and run.existing_program is not None:
+            program = run.existing_program
+            return GenerationResult(
+                program=program,
+                candidate_pool=ExerciseCandidatePool(
+                    profile_id=profile_id,
+                    total_exercises=program.generation.candidate_pool_total or 0,
+                ),
+                safe_pool=SafeExercisePool(profile_id=profile_id),
+                job=run.job,
+                reused_existing=True,
+            )
+        if run.result is None:
+            # Контракт `run`: либо duplicate с готовой программой, либо result.
+            raise ProgramGenerationError("Генерация не вернула результат")
+        run.result.job = run.job
+        return run.result
+
+    async def _generate(self, profile: FitnessProfile) -> GenerationResult:
+        profile_id = profile.profile_id or ""
         candidate_pool, safe_pool, catalog_ids = await self.build_pools(profile)
 
         program = await self._generator.generate(profile, safe_pool)

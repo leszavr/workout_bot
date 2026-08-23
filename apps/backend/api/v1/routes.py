@@ -26,10 +26,16 @@ from apps.backend.auth import (
     verify_env_admin,
 )
 from src.application.auth.service import AdminUserError
+from src.application.programs.service import GenerationResult
 from src.domain.ai.errors import AIError
 from src.domain.auth import AdminRole
+from src.domain.generation import GenerationTrigger
 from src.domain.program import WorkoutProgram
-from src.errors import ProgramGenerationError, ProgramValidationError
+from src.errors import (
+    GenerationAlreadyRunningError,
+    ProgramGenerationError,
+    ProgramValidationError,
+)
 from src.infrastructure.persistence.postgres.db import get_session_factory
 from src.infrastructure.persistence.postgres.models import (
     ConsentRow,
@@ -542,6 +548,10 @@ class GenerateProgramRequest(BaseModel):
 
     generator: str = Field(default="deterministic", pattern=r"^(deterministic|ai)$")
     prompt_version: int | None = Field(default=None, ge=1)
+    # Необязательный клиентский ключ логической генерации: позволяет повторить
+    # тот же запрос (сетевой ретрай, повторная отправка) и получить прежний
+    # результат. Серверная защита от дубликатов работает и без него.
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 # --- AI Providers (публичный API для UI) ----------------------------------------
@@ -596,6 +606,7 @@ async def list_ai_providers(_: Annotated[AuthenticatedUser, Depends(require_view
     "/profiles/{profile_id}/programs/generate",
     responses={
         404: {"description": "Profile not found"},
+        409: {"description": "Generation for this profile is already running"},
         422: {"description": "Generation or validation failed"},
         502: {"description": "AI service call failed"},
     },
@@ -605,11 +616,22 @@ async def generate_program(
     _: Annotated[AuthenticatedUser, Depends(require_admin)],
     body: GenerateProgramRequest | None = None,
 ) -> dict:
-    """Запуск сборки программы выбранным генератором."""
+    """Запуск сборки программы выбранным генератором.
+
+    Идемпотентность серверная: повторный запрос той же логической генерации не
+    создаёт вторую программу. Пока предыдущий запрос выполняется, повтор
+    получает 409, а не второй job.
+    """
     request = body or GenerateProgramRequest()
     service = build_program_service(generator_type=request.generator)
     try:
-        result = await service.generate(profile_id)
+        result = await service.generate(
+            profile_id,
+            trigger=GenerationTrigger.ADMIN_REQUEST,
+            client_idempotency_key=request.idempotency_key,
+        )
+    except GenerationAlreadyRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProgramGenerationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ProgramValidationError as exc:
@@ -625,6 +647,7 @@ async def generate_program(
         ) from exc
     return {
         "program": result.program.model_dump(mode="json"),
+        "generation": _generation_summary(result),
         "pool_stats": {
             "total_exercises": result.candidate_pool.total_exercises,
             "candidates_included": len(result.candidate_pool.included),
@@ -635,4 +658,20 @@ async def generate_program(
             "safe_requires_review": len(result.safe_pool.requires_review),
             "active_restrictions": [r.value for r in result.safe_pool.active_restrictions],
         },
+    }
+
+
+def _generation_summary(result: GenerationResult) -> dict:
+    """Operational-состояние генерации для админки.
+
+    Наружу отдаются только статус, попытки и код ошибки: internal id записи и
+    idempotency key клиенту не нужны.
+    """
+    job = result.job
+    return {
+        "reused_existing": result.reused_existing,
+        "job_id": job.job_id if job else None,
+        "status": job.status.value if job else None,
+        "attempts": job.attempts if job else None,
+        "last_error_code": job.last_error_code if job else None,
     }

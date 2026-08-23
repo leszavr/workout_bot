@@ -14,6 +14,8 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     Text,
@@ -197,6 +199,58 @@ class ProgramDeliveryRow(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GenerationJobRow(Base):
+    """Persistent состояние одной логической генерации программы (Phase 1.2-B).
+
+    Идемпотентность обеспечивает БД: UNIQUE(idempotency_key). Повторный запрос
+    той же логической генерации нарушает constraint, и приложение читает уже
+    существующий job вместо создания второго.
+
+    Ссылка на программу — составная (program_id, version): версия программы, а
+    не абстрактный program_id, является результатом конкретной генерации.
+    ON DELETE SET NULL: удаление программы не должно уничтожать историю
+    операций.
+
+    Секретов, промптов, ответов провайдера и персональных данных здесь нет:
+    только код ошибки и короткое безопасное описание.
+    """
+
+    __tablename__ = "generation_jobs"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_generation_job_idempotency_key"),
+        ForeignKeyConstraint(
+            ["program_id", "program_version"],
+            ["workout_programs.program_id", "workout_programs.version"],
+            name="fk_generation_job_program",
+            ondelete=_FK_ON_DELETE_SET_NULL,
+        ),
+        Index("ix_generation_jobs_profile_status", "profile_id", "status"),
+        # Номер попытки вычисляется по завершённым job того же триггера;
+        # индекс обслуживает именно этот запрос.
+        Index("ix_generation_jobs_profile_trigger", "profile_id", "trigger"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id", ondelete="CASCADE"), index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(191))
+    trigger: Mapped[str] = mapped_column(String(32))
+    requested_generator: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    program_id: Mapped[str | None] = mapped_column(String(64))
+    program_version: Mapped[int | None] = mapped_column(Integer)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_message: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 # --- AI Configuration (этап 3B) -------------------------------------------------

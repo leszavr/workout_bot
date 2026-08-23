@@ -59,8 +59,8 @@
 
 Основное хранилище — **PostgreSQL** (SQLAlchemy 2.0 async + asyncpg + Alembic).
 Таблицы: `users`, `profiles` (JSONB), `consents`, `exercises`,
-`workout_programs`, `exercise_media`, `program_deliveries`, `ai_*`
-(конфигурация AI-провайдеров).
+`workout_programs`, `generation_jobs`, `exercise_media`, `program_deliveries`,
+`ai_*` (конфигурация AI-провайдеров).
 
 - Профиль проходит Pydantic-валидацию перед записью и после чтения:
   `Pydantic Model → Validation → PostgreSQL JSONB`. БД не является
@@ -224,7 +224,10 @@ JSONB (`data`), денормализованные колонки для спи�
 - `GET /api/v1/programs` — список (последние версии);
 - `GET /api/v1/programs/{id}?version=N` — программа + список версий;
 - `GET /api/v1/profiles/{id}/programs` — программы профиля;
-- `POST /api/v1/profiles/{id}/programs/generate` — запуск генерации;
+- `POST /api/v1/profiles/{id}/programs/generate` — запуск генерации; принимает
+  необязательный `idempotency_key` и возвращает блок `generation` (статус job,
+  число попыток, код ошибки, признак повторного использования). Повтор при
+  активной генерации → `409`;
 - `GET /api/v1/exercises/external/{external_id}` — поиск упражнения по
   каноническому ID (программы ссылаются на external_id, а не surrogate id).
 
@@ -288,6 +291,48 @@ Telegram Delivery (document, ограниченные retry)
 сохранена в PostgreSQL, доставка повторяется только на уровне
 `ProgramDeliveryService`. Статусы доставки хранятся в `program_deliveries`
 (pending/sending/sent/failed + число попыток).
+
+### Persistent generation state (Phase 1.2-B)
+
+Генерация — операция со своим состоянием, а не побочный эффект запроса.
+`generation_jobs` отвечает на вопрос «что происходило с этим запросом
+генерации» независимо от того, появилась программа или нет.
+
+- домен: `src/domain/generation.py` — состояния `PENDING → RUNNING →
+  SUCCEEDED|FAILED`, таблица разрешённых переходов, стабильные коды ошибок и их
+  класс (non-retryable/transient);
+- репозиторий: `src/infrastructure/persistence/postgres/generation_job_repository.py`
+  — создание через `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`,
+  переход через `UPDATE ... WHERE status = :expected`;
+- application: `src/application/programs/generation_jobs.py` — оборачивает
+  существующую генерацию, ничего не решая за оркестратор.
+
+**Одна логическая генерация = (profile_id, бизнес-событие, номер попытки).**
+`profile_id` в одиночку ключом быть не может: анкета законно имеет несколько
+версий программы. Автогенерация после подтверждения анкеты и явный запрос
+администратора — разные события, поэтому триггер входит в идентичность.
+
+Идемпотентность и конкурентность обеспечивает PostgreSQL, а не Python: два
+параллельных запроса одной логической генерации создают один job и одну
+программу. Повтор при активной генерации получает `GenerationAlreadyRunningError`
+(HTTP 409), повтор после успеха — уже созданную программу. Advisory lock не
+нужен: достаточно уникальности ключа и условного `UPDATE`.
+
+Длительный AI-вызов вне транзакции:
+
+```
+tx: создать job → PENDING
+tx: PENDING → RUNNING
+     генерация (AI/deterministic) + сохранение программы
+tx: RUNNING → SUCCEEDED | FAILED
+```
+
+`GenerationJob` не заменяет `WorkoutProgram`: при отказе программа не
+создаётся, а job хранит только код ошибки и короткое безопасное описание —
+промпт, ответ провайдера, ключи и PII туда не попадают.
+
+Retry в 1.2-B не реализован: `RETRY_WAIT` и переход `FAILED → PENDING/RUNNING`
+зарезервированы для Phase 1.2-D вместе с worker и recovery stale `RUNNING`.
 
 ### HTML Renderer (`html_renderer.py`, `html_service.py`)
 Mobile-first HTML-файл программы (вкладки дней, карточки упражнений,

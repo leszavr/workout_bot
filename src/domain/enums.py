@@ -122,6 +122,20 @@ class ProgramDeliveryStatus(StrEnum):
     FAILED = "failed"
 
 
+class GenerationJobStatus(StrEnum):
+    """Жизненный цикл операции генерации программы (Phase 1.2-B).
+
+    RETRY_WAIT сознательно отсутствует: retry-планировщика ещё нет, а статус
+    без обработчика оставлял бы job в состоянии, из которого его никто не
+    выводит. Он появится вместе с worker/retry (Phase 1.2-D).
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class SafetyDecision(StrEnum):
     """Решение safety-правила по упражнению."""
 
