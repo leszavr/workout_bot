@@ -30,16 +30,64 @@
 - [x] AI Infrastructure Health Dashboard: дерево provider → endpoint → model → задачи строится динамически из конфигурации (`GET /api/v1/admin/ai/infrastructure-health` + панель на `/ai`);
 - [x] разделены configuration state, infrastructure health и model availability; семантика `enabled` vs `healthy` задокументирована;
 - [x] health не требует дорогих генераций: состояние читается из сохранённого connection test и журнала вызовов, активная проверка — минимальный ping по кнопке (`POST …/infrastructure-health/refresh`);
-- [x] CI в GitHub Actions на PR и push в `main`: backend-тесты на реальной PostgreSQL, проверка миграций (head → base → head), frontend lint/typecheck/build, авто-issue при падении.
+- [x] CI в GitHub Actions на PR и push в `main`: backend-тесты на реальной PostgreSQL, миграции (head → base → head), frontend lint/typecheck/build, авто-issue при падении.
 
 **Осознанное ограничение:** фоновых периодических health-проверок нет. В проекте нет планировщика и воркеров, вводить их ради опроса провайдеров несоразмерно задаче. Автоматически обновляется дешёвое чтение состояния (включая результаты реальных AI-вызовов), активная проверка выполняется по требованию администратора.
 
-### 1.2 Reliability
-- [ ] заменить MemoryStorage на устойчивое production storage;
-- [ ] проверить restart/recovery сценарии;
-- [ ] формализовать generation/delivery status model;
-- [ ] E2E idempotency и retry acceptance;
-- [ ] единая точка генерации: веб-кнопка «Generate Program» должна идти через `ProgramGenerationOrchestrator`, а не через отдельный путь без fallback и без readiness gate.
+### 1.2 Reliability: IN PROGRESS — DESIGN APPROVED
+
+**Design baseline:** `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`.
+
+#### 1.2-A — Persistent FSM
+- [ ] заменить `MemoryStorage` на устойчивое production storage;
+- [ ] проверить restart/recovery questionnaire state;
+- [ ] acceptance: restart во время questionnaire не теряет критическое состояние.
+
+#### 1.2-B — Generation domain state
+- [ ] формализовать persistent generation status model;
+- [ ] определить idempotency boundary/key;
+- [ ] persistence для generation jobs/state;
+- [ ] acceptance duplicate generation requests.
+
+#### 1.2-C — Generation Orchestrator
+- [ ] единый `ProgramGenerationOrchestrator`;
+- [ ] Telegram и Admin API используют один orchestration path;
+- [ ] readiness/fallback/safety/validation не обходятся;
+- [ ] веб-кнопка `Generate Program` переводится на общий путь.
+
+#### 1.2-D — Worker / retry / recovery
+- [ ] фоновые jobs;
+- [ ] централизованный retry/backoff;
+- [ ] retryable vs non-retryable errors;
+- [ ] stale `RUNNING` recovery после restart/crash;
+- [ ] acceptance worker/process crash.
+
+#### 1.2-E — Delivery
+- [ ] отдельное persistent delivery state/job;
+- [ ] generation и delivery не повторяют друг друга;
+- [ ] Telegram retry;
+- [ ] delivery idempotency;
+- [ ] acceptance Telegram temporary failure.
+
+#### 1.2-F — Admin visibility
+- [ ] generation status;
+- [ ] delivery status;
+- [ ] attempts/errors;
+- [ ] requested/actual generation strategy;
+- [ ] минимальная operational visibility без создания полноценного monitoring stack.
+
+#### 1.2-G — E2E acceptance
+- [ ] restart during questionnaire;
+- [ ] restart during generation;
+- [ ] restart during delivery;
+- [ ] AI timeout/unavailable;
+- [ ] deterministic fallback;
+- [ ] duplicate generation request;
+- [ ] duplicate delivery attempt;
+- [ ] worker/process crash;
+- [ ] stale `RUNNING` recovery.
+
+**Правило:** 1.2-A…G реализуются отдельными проверяемыми PR. Каждый PR проходит CI и acceptance, после merge обновляются `PROJECT_STATUS.md` и этот roadmap.
 
 ### 1.3 Operations and security
 - [ ] structured logging и correlation IDs;
