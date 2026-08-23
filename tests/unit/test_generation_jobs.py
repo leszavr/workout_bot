@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from src.application.programs.generation_jobs import GenerationJobService
+from src.domain.ai.enums import AIFallbackReason
 from src.domain.ai.errors import (
     AIConfigurationError,
     AIConnectionError,
@@ -23,6 +24,7 @@ from src.domain.ai.errors import (
 )
 from src.domain.enums import GenerationJobStatus, GenerationSource, ProgramStatus
 from src.domain.generation import (
+    _FALLBACK_REASON_BY_CODE,
     ALLOWED_TRANSITIONS,
     GenerationErrorCode,
     GenerationErrorKind,
@@ -34,6 +36,7 @@ from src.domain.generation import (
     can_transition,
     classify_error,
     error_kind,
+    fallback_reason_for_code,
     safe_error_message,
 )
 from src.domain.program import (
@@ -44,6 +47,7 @@ from src.domain.program import (
 )
 from src.errors import (
     GenerationAlreadyRunningError,
+    IdempotencyKeyConflictError,
     ProgramGenerationError,
     ProgramPersistenceError,
     ProgramValidationError,
@@ -306,6 +310,113 @@ class TestErrorClassification:
         assert error_kind("code-from-another-version") is GenerationErrorKind.TRANSIENT
 
 
+class TestUnifiedFallbackClassification:
+    """Одна ошибка — одна причина (Phase 1.2-C).
+
+    Раньше рядом с `classify_error` жила вторая таблица, разбиравшая ту же
+    иерархию исключений заново: rate limit, сетевой сбой и неподдерживаемый
+    протокол получали конкретный `GenerationErrorCode`, но общий
+    `ai_runtime_failure` в журнале администратора. Теперь причина выводится из
+    кода, поэтому operational-состояние и журнал не могут разойтись.
+    """
+
+    @pytest.mark.parametrize(
+        "exc, expected_code, expected_reason",
+        [
+            (
+                AITimeoutError("x"),
+                GenerationErrorCode.AI_TIMEOUT,
+                AIFallbackReason.AI_TIMEOUT,
+            ),
+            (
+                AIRateLimitError("x"),
+                GenerationErrorCode.AI_RATE_LIMITED,
+                AIFallbackReason.AI_RATE_LIMITED,
+            ),
+            (
+                AIConnectionError("x"),
+                GenerationErrorCode.AI_CONNECTION_FAILED,
+                AIFallbackReason.AI_CONNECTION_FAILED,
+            ),
+            (
+                AIInvalidResponseError("x"),
+                GenerationErrorCode.AI_INVALID_RESPONSE,
+                AIFallbackReason.AI_INVALID_RESPONSE,
+            ),
+            (
+                AIUnsupportedProtocolError("x"),
+                GenerationErrorCode.AI_UNSUPPORTED_PROTOCOL,
+                AIFallbackReason.UNSUPPORTED_PROTOCOL,
+            ),
+            (
+                AIConfigurationError("x"),
+                GenerationErrorCode.AI_NOT_CONFIGURED,
+                AIFallbackReason.AI_NOT_CONFIGURED,
+            ),
+            (
+                AIProviderError("x", status_code=500),
+                GenerationErrorCode.AI_RUNTIME_FAILURE,
+                AIFallbackReason.AI_RUNTIME_FAILURE,
+            ),
+            (
+                ProgramValidationError("x"),
+                GenerationErrorCode.VALIDATION_FAILED,
+                AIFallbackReason.AI_VALIDATION_FAILED,
+            ),
+            (
+                ProgramPersistenceError("x"),
+                GenerationErrorCode.PERSISTENCE_FAILED,
+                AIFallbackReason.AI_RUNTIME_FAILURE,
+            ),
+            (
+                RuntimeError("x"),
+                GenerationErrorCode.UNEXPECTED_ERROR,
+                AIFallbackReason.AI_RUNTIME_FAILURE,
+            ),
+        ],
+    )
+    def test_exception_maps_to_consistent_pair(
+        self, exc, expected_code, expected_reason
+    ):
+        code = classify_error(exc)
+        assert code is expected_code
+        assert fallback_reason_for_code(code) is expected_reason
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            AITimeoutError("x"),
+            AIRateLimitError("x"),
+            AIConnectionError("x"),
+            AIUnsupportedProtocolError("x"),
+        ],
+    )
+    def test_specific_ai_errors_are_not_generic_runtime_failure(self, exc):
+        """Регрессия: конкретная ошибка не деградирует в общий сбой."""
+        reason = fallback_reason_for_code(classify_error(exc))
+        assert reason is not AIFallbackReason.AI_RUNTIME_FAILURE
+
+    def test_every_error_code_has_explicit_fallback_reason(self):
+        """Новый код отказа нельзя добавить, не решив, как он виден админу.
+
+        Тест защищает от молчаливой деградации: без явной записи в таблице новый
+        код провалился бы в общий `ai_runtime_failure` через `.get()`.
+        """
+        missing = [
+            code.value
+            for code in GenerationErrorCode
+            if code not in _FALLBACK_REASON_BY_CODE
+        ]
+        assert missing == [], (
+            "Для этих кодов не задана причина fallback: "
+            f"{missing}. Добавьте их в _FALLBACK_REASON_BY_CODE."
+        )
+
+    def test_fallback_reasons_are_valid_enum_members(self):
+        for reason in _FALLBACK_REASON_BY_CODE.values():
+            assert AIFallbackReason(reason.value) is reason
+
+
 class TestSafeErrorMessage:
     def test_secrets_are_redacted(self):
         message = safe_error_message(
@@ -533,6 +644,238 @@ class TestGenerationJobService:
             profile_id=PROFILE_ID,
             trigger=GenerationTrigger.AUTO_FINALIZATION,
             requested_generator="ai",
+            operation=_raise_validation,
+        )
+
+        assert second.duplicate is True
+        assert second.existing_program is program
+        assert len(jobs.rows) == 1
+
+
+class TestIdempotencyKeyParameterConflict:
+    """Клиентский ключ — обещание «это тот же запрос» (Phase 1.2-C).
+
+    Если параметры отличаются, обещание неверно: отдать результат прошлого
+    запроса нельзя (он собран другим генератором), запустить новую генерацию под
+    тем же ключом тоже нельзя (это разрушает идемпотентность). Конфликт
+    разрешает клиент.
+    """
+
+    async def test_same_key_same_generator_returns_same_job(self):
+        jobs = FakeJobRepository()
+        program = _program()
+        service = _service(jobs, FakeProgramRepository([program]))
+        key = "client-conflict-same"
+
+        first = await service.run(
+            profile_id=PROFILE_ID,
+            trigger=GenerationTrigger.ADMIN_REQUEST,
+            requested_generator="deterministic",
+            client_idempotency_key=key,
+            operation=lambda: _succeed(program),
+        )
+        second = await service.run(
+            profile_id=PROFILE_ID,
+            trigger=GenerationTrigger.ADMIN_REQUEST,
+            requested_generator="deterministic",
+            client_idempotency_key=key,
+            operation=_raise_validation,
+        )
+
+        assert second.duplicate is True
+        assert second.job.job_id == first.job.job_id
+        assert second.existing_program is program
+        assert len(jobs.rows) == 1
+
+    async def test_same_key_different_generator_conflicts(self):
+        """Главный случай: тот же ключ с другим генератором."""
+        jobs = FakeJobRepository()
+        program = _program()
+        service = _service(jobs, FakeProgramRepository([program]))
+        key = "client-conflict-diff"
+
+        await service.run(
+            profile_id=PROFILE_ID,
+            trigger=GenerationTrigger.ADMIN_REQUEST,
+            requested_generator="deterministic",
+            client_idempotency_key=key,
+            operation=lambda: _succeed(program),
+        )
+
+        with pytest.raises(IdempotencyKeyConflictError):
+            await service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="ai",
+                client_idempotency_key=key,
+                operation=_raise_validation,
+            )
+
+        # Ни второй job, ни вторая программа не создаются.
+        assert len(jobs.rows) == 1
+        assert next(iter(jobs.rows.values())).requested_generator == "deterministic"
+
+    async def test_conflict_does_not_return_foreign_generator_result(self):
+        """Программа прежнего генератора наружу не отдаётся."""
+        jobs = FakeJobRepository()
+        program = _program()
+        service = _service(jobs, FakeProgramRepository([program]))
+        key = "client-conflict-no-leak"
+
+        await service.run(
+            profile_id=PROFILE_ID,
+            trigger=GenerationTrigger.ADMIN_REQUEST,
+            requested_generator="deterministic",
+            client_idempotency_key=key,
+            operation=lambda: _succeed(program),
+        )
+
+        with pytest.raises(IdempotencyKeyConflictError) as exc:
+            await service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="ai",
+                client_idempotency_key=key,
+                operation=_raise_validation,
+            )
+
+        # Конфликт не является отказом генерации: наследование от
+        # ProgramGenerationError дало бы 422 вместо 409.
+        assert not isinstance(exc.value, ProgramGenerationError)
+        assert "deterministic" in str(exc.value)
+
+    async def test_failed_job_same_key_different_generator_conflicts(self):
+        """Провалившийся job тоже занимает ключ: конфликт, а не новый запуск."""
+        jobs = FakeJobRepository()
+        service = _service(jobs)
+        key = "client-conflict-failed"
+
+        with pytest.raises(ProgramValidationError):
+            await service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="deterministic",
+                client_idempotency_key=key,
+                operation=_raise_validation,
+            )
+
+        with pytest.raises(IdempotencyKeyConflictError):
+            await service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="ai",
+                client_idempotency_key=key,
+                operation=_raise_validation,
+            )
+
+        assert len(jobs.rows) == 1
+
+    async def test_active_job_same_key_different_generator_conflicts(self):
+        """Активная генерация: конфликт параметров важнее сообщения «уже идёт»."""
+        jobs = FakeJobRepository()
+        service = _service(jobs)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        key = "client-conflict-active"
+
+        async def _slow():
+            started.set()
+            await release.wait()
+            return _Result(_program())
+
+        first = asyncio.create_task(
+            service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="deterministic",
+                client_idempotency_key=key,
+                operation=_slow,
+            )
+        )
+        await started.wait()
+
+        with pytest.raises(IdempotencyKeyConflictError):
+            await service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="ai",
+                client_idempotency_key=key,
+                operation=_raise_validation,
+            )
+
+        release.set()
+        await first
+        assert len(jobs.rows) == 1
+
+    async def test_concurrent_same_key_conflicting_generator_is_deterministic(self):
+        """Гонка с разными генераторами: победитель один, проигравший — конфликт.
+
+        Исход не зависит от порядка: тот, чья вставка прошла, выполняет
+        генерацию; второй получает конфликт параметров, а не чужой результат и
+        не второй job.
+        """
+        jobs = FakeJobRepository()
+        service = _service(jobs)
+        key = "client-conflict-race"
+        ran: list[str] = []
+
+        def _op(name: str):
+            async def _run():
+                ran.append(name)
+                await asyncio.sleep(0)
+                return _Result(_program())
+
+            return _run
+
+        results = await asyncio.gather(
+            service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="deterministic",
+                client_idempotency_key=key,
+                operation=_op("deterministic"),
+            ),
+            service.run(
+                profile_id=PROFILE_ID,
+                trigger=GenerationTrigger.ADMIN_REQUEST,
+                requested_generator="ai",
+                client_idempotency_key=key,
+                operation=_op("ai"),
+            ),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if not isinstance(r, BaseException)]
+        conflicts = [
+            r for r in results if isinstance(r, IdempotencyKeyConflictError)
+        ]
+        assert len(successes) == 1
+        assert len(conflicts) == 1
+        assert len(ran) == 1
+        assert len(jobs.rows) == 1
+
+    async def test_server_attempt_key_ignores_generator_change(self):
+        """Серверный ключ попытки конфликтом не считается.
+
+        Ключ `profile:trigger:attempt` вызывающая сторона не выбирала, поэтому
+        смена генератора здесь означает изменение конфигурации приложения между
+        запусками, а не противоречивый запрос: повторный finalize должен
+        получить готовую программу, а не ошибку.
+        """
+        jobs = FakeJobRepository()
+        program = _program()
+        service = _service(jobs, FakeProgramRepository([program]))
+
+        await service.run(
+            profile_id=PROFILE_ID,
+            trigger=GenerationTrigger.AUTO_FINALIZATION,
+            requested_generator="ai",
+            operation=lambda: _succeed(program),
+        )
+        second = await service.run(
+            profile_id=PROFILE_ID,
+            trigger=GenerationTrigger.AUTO_FINALIZATION,
+            requested_generator="deterministic",
             operation=_raise_validation,
         )
 

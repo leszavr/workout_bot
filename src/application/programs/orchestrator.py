@@ -55,17 +55,13 @@ from src.application.programs.generator import (
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.validator import ProgramValidator
 from src.domain.ai.enums import AIFallbackReason
-from src.domain.ai.errors import (
-    AIConfigurationError,
-    AIInvalidResponseError,
-    AITimeoutError,
-)
 from src.domain.enums import GenerationJobStatus, GenerationSource, ProgramStatus
 from src.domain.generation import (
     GenerationErrorCode,
     GenerationJob,
     GenerationTrigger,
     classify_error,
+    fallback_reason_for_code,
     safe_error_message,
 )
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
@@ -195,15 +191,16 @@ class _GeneratorAttempt:
     skipped: bool = False
 
 
-def _classify_ai_error(exc: BaseException) -> AIFallbackReason:
-    """Относит ошибку AI-вызова к машиночитаемой причине fallback."""
-    if isinstance(exc, AITimeoutError):
-        return AIFallbackReason.AI_TIMEOUT
-    if isinstance(exc, AIInvalidResponseError):
-        return AIFallbackReason.AI_INVALID_RESPONSE
-    if isinstance(exc, AIConfigurationError):
-        return AIFallbackReason.AI_NOT_CONFIGURED
-    return AIFallbackReason.AI_RUNTIME_FAILURE
+def _ai_attempt_from_error(exc: BaseException) -> tuple[GenerationErrorCode, str]:
+    """Код отказа и причина fallback для одной неудачной AI-попытки.
+
+    Классификация исключения выполняется один раз (`classify_error`), причина
+    для администратора выводится из полученного кода. Второй разбор иерархии
+    исключений здесь сознательно отсутствует: раньше он давал общий
+    `ai_runtime_failure` там, где код был конкретным.
+    """
+    code = classify_error(exc)
+    return code, fallback_reason_for_code(code).value
 
 
 class ProgramGenerationOrchestrator:
@@ -316,10 +313,18 @@ class ProgramGenerationOrchestrator:
         Явно выбранный генератор не подменяется: `allow_fallback=False` даёт
         стратегию из одного генератора, поэтому администратор видит настоящую
         причину отказа, а не молча получает другую программу.
+
+        Недопустимый генератор — отказ доменного контракта, а не `ValueError`:
+        оркестратор является application-level boundary и обязан отвечать
+        одинаково любому вызывающему слою, а не только тому, перед которым
+        стоит pydantic-валидация HTTP-запроса.
         """
         primary = request.requested_generator or self._primary
         if primary not in VALID_GENERATORS:
-            raise ValueError(f"Недопустимый генератор: {primary}")
+            raise GenerationFailedError(
+                f"Недопустимый генератор: {primary}",
+                generation_error_code=GenerationErrorCode.VALIDATION_FAILED.value,
+            )
         if not request.allow_fallback:
             return GenerationStrategy(primary=primary)
         return GenerationStrategy(primary=primary, fallback=self._fallback)
@@ -464,16 +469,15 @@ class ProgramGenerationOrchestrator:
                 program = await generator.generate(profile, safe_pool)
             except Exception as exc:  # noqa: BLE001 — любая ошибка генератора ведёт к fallback
                 message = safe_error_message(exc)[:400]
+                error_code, fallback_reason = _ai_attempt_from_error(exc)
                 attempts.append(
                     _GeneratorAttempt(
                         name=name,
                         reason=f"ошибка генерации: {message}",
-                        reason_code=_classify_ai_error(exc).value
-                        if name == GENERATOR_AI
-                        else None,
+                        reason_code=fallback_reason if name == GENERATOR_AI else None,
                         error_type=exc.__class__.__name__,
                         error_message=message,
-                        error_code=classify_error(exc),
+                        error_code=error_code,
                     )
                 )
                 logger.warning(
@@ -488,12 +492,16 @@ class ProgramGenerationOrchestrator:
 
             result = self._validator.validate(program, safe_pool, profile, catalog_ids)
             if not result.valid:
-                message = "; ".join(f"{i.code}: {i.message}" for i in result.issues)[:400]
+                message = safe_error_message(
+                    "; ".join(f"{i.code}: {i.message}" for i in result.issues)
+                )[:400]
                 attempts.append(
                     _GeneratorAttempt(
                         name=name,
                         reason=f"validation failed: {message}",
-                        reason_code=AIFallbackReason.AI_VALIDATION_FAILED.value
+                        reason_code=fallback_reason_for_code(
+                            GenerationErrorCode.VALIDATION_FAILED
+                        ).value
                         if name == GENERATOR_AI
                         else None,
                         error_type="ValidationError",
@@ -575,7 +583,10 @@ class ProgramGenerationOrchestrator:
         )
         return _GeneratorAttempt(
             name=GENERATOR_AI,
-            reason=decision.detail or "AI-конфигурация не готова",
+            # Detail приходит из чек-листа readiness: он содержит имена сервисов
+            # и подключений, поэтому проходит ту же санитизацию, что и остальные
+            # тексты, попадающие наружу и в operational-запись.
+            reason=safe_error_message(decision.detail or "AI-конфигурация не готова"),
             reason_code=reason_code,
             # Gate отклонил попытку по состоянию конфигурации, а не по сбою
             # вызова: код отказа должен отражать именно это.

@@ -83,6 +83,8 @@ class AIFallbackReason(StrEnum):
 
     # --- Runtime: AI вызывался и не смог -----------------------------------
     AI_TIMEOUT = "ai_timeout"
+    AI_RATE_LIMITED = "ai_rate_limited"
+    AI_CONNECTION_FAILED = "ai_connection_failed"
     AI_RUNTIME_FAILURE = "ai_runtime_failure"
     AI_INVALID_RESPONSE = "ai_invalid_response"
     AI_VALIDATION_FAILED = "ai_validation_failed"

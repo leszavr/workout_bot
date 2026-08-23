@@ -17,10 +17,20 @@ from src.application.programs.orchestrator import (
     ProgramGenerationOrchestrator,
 )
 from src.domain.ai.enums import AIFallbackReason
-from src.domain.ai.errors import AIInvalidResponseError, AITimeoutError
+from src.domain.ai.errors import (
+    AIConnectionError,
+    AIInvalidResponseError,
+    AIRateLimitError,
+    AITimeoutError,
+)
 from src.domain.enums import GenerationJobStatus, GenerationSource, ProgramStatus
 from src.domain.exercise import Exercise
-from src.domain.generation import GenerationErrorCode, GenerationTrigger
+from src.domain.generation import (
+    GenerationErrorCode,
+    GenerationTrigger,
+    classify_error,
+    fallback_reason_for_code,
+)
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 from src.domain.profile import FitnessProfile
 from src.domain.program import (
@@ -192,6 +202,21 @@ class FakeGenerator:
         return program
 
 
+class _RecordingJobService:
+    """Фиксирует, дошёл ли запрос до operational-записи.
+
+    Нужен, чтобы отличить отказ контракта запроса (job создаваться не должен) от
+    отказа самой генерации.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, **kwargs):
+        self.calls += 1
+        raise AssertionError("job не должен создаваться при отказе контракта запроса")
+
+
 def _orchestrator(
     *,
     primary: str = "ai",
@@ -324,13 +349,55 @@ class TestRequestContract:
         assert repo.programs == []
         assert exc.value.generation_error_code == GenerationErrorCode.AI_TIMEOUT.value
 
-    async def test_unknown_requested_generator_rejected(self):
+    async def test_unknown_requested_generator_is_domain_error(self):
+        """Недопустимый генератор — доменный отказ, а не raw ValueError.
+
+        Оркестратор — application-level boundary: он обязан отвечать одинаково
+        любому вызывающему слою, а не только HTTP-слою с pydantic-валидацией.
+        """
+        orchestrator, repo = _orchestrator(
+            deterministic_generator=FakeGenerator("deterministic")
+        )
+
+        with pytest.raises(GenerationFailedError) as exc:
+            await orchestrator.generate(_request(requested_generator="magic"))
+
+        assert (
+            exc.value.generation_error_code
+            == GenerationErrorCode.VALIDATION_FAILED.value
+        )
+        # Отказ контракта не должен создавать программу.
+        assert repo.programs == []
+
+    async def test_unknown_generator_error_is_not_value_error(self):
+        """Regression: наружу уходит доменный контракт, а не raw ValueError.
+
+        `GenerationFailedError` не наследует `ValueError`, поэтому вызывающий
+        слой не может случайно поймать его общим `except ValueError` и не
+        получит 500 вместо 4xx.
+        """
         orchestrator, _ = _orchestrator(
             deterministic_generator=FakeGenerator("deterministic")
         )
 
-        with pytest.raises(ValueError):
+        with pytest.raises(GenerationFailedError):
             await orchestrator.generate(_request(requested_generator="magic"))
+
+        assert not issubclass(GenerationFailedError, ValueError)
+
+    async def test_invalid_generator_creates_no_job(self):
+        """Отказ контракта происходит до создания operational-записи."""
+        jobs = _RecordingJobService()
+        orchestrator, repo = _orchestrator(
+            deterministic_generator=FakeGenerator("deterministic")
+        )
+        orchestrator._generation_jobs = jobs  # noqa: SLF001 — подмена в тесте
+
+        with pytest.raises(GenerationFailedError):
+            await orchestrator.generate(_request(requested_generator="magic"))
+
+        assert jobs.calls == 0
+        assert repo.programs == []
 
     async def test_result_reports_strategy_and_status(self):
         """Результат самодостаточен: стратегия и статус доступны вызывающему."""
@@ -648,6 +715,60 @@ class TestRuntimeFallbackClassification:
         info = (await orchestrator.generate(_request())).program.generation
 
         assert info.fallback_reason_code == "ai_runtime_failure"
+
+    async def test_rate_limit_is_not_generic_runtime_failure(self):
+        """Конкретная причина не деградирует в общий сбой (Phase 1.2-C).
+
+        До объединения классификаций rate limit получал конкретный
+        `GenerationErrorCode`, но общий `ai_runtime_failure` в журнале
+        администратора.
+        """
+        ai = FakeGenerator(
+            "ai", fail=True, fail_exception=AIRateLimitError("too many requests")
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate(_request())).program.generation
+
+        assert info.fallback_reason_code == "ai_rate_limited"
+
+    async def test_connection_failure_is_not_generic_runtime_failure(self):
+        ai = FakeGenerator(
+            "ai", fail=True, fail_exception=AIConnectionError("connection reset")
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        info = (await orchestrator.generate(_request())).program.generation
+
+        assert info.fallback_reason_code == "ai_connection_failed"
+
+    async def test_fallback_reason_matches_job_error_code(self):
+        """Журнал администратора и код отказа описывают одну причину.
+
+        Это и есть свойство, которое раньше нарушалось: две независимые таблицы
+        классификации давали разные ответы на одно исключение.
+        """
+        ai = FakeGenerator(
+            "ai", fail=True, fail_exception=AIRateLimitError("too many requests")
+        )
+        orchestrator, _ = _orchestrator(
+            ai_generator=ai,
+            deterministic_generator=FakeGenerator("deterministic"),
+            gate=GateDecision(allowed=True),
+        )
+
+        result = await orchestrator.generate(_request())
+
+        code = classify_error(AIRateLimitError("x"))
+        assert result.fallback_reason_code == fallback_reason_for_code(code).value
 
     async def test_validation_failure_is_classified(self):
         ai = FakeGenerator("ai", invalid=True)

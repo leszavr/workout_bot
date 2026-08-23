@@ -34,13 +34,17 @@ from src.application.programs.orchestrator import (
     OrchestratorResult,
 )
 from src.domain.auth import AdminRole
-from src.domain.generation import GenerationErrorCode, GenerationTrigger
+from src.domain.generation import (
+    GenerationErrorCode,
+    GenerationTrigger,
+    safe_error_message,
+)
 from src.domain.program import WorkoutProgram
 from src.errors import (
     GenerationAlreadyRunningError,
     GenerationFailedError,
+    IdempotencyKeyConflictError,
     ProgramGenerationError,
-    ProgramValidationError,
 )
 from src.infrastructure.persistence.postgres.db import get_session_factory
 from src.infrastructure.persistence.postgres.models import (
@@ -611,7 +615,10 @@ async def list_ai_providers(_: Annotated[AuthenticatedUser, Depends(require_view
 @router.post(
     "/profiles/{profile_id}/programs/generate",
     responses={
-        409: {"description": "Generation for this profile is already running"},
+        409: {
+            "description": "Generation is already running, or the idempotency key "
+            "was reused with different request parameters"
+        },
         422: {"description": "Generation or validation failed"},
         502: {"description": "AI service call failed"},
     },
@@ -631,7 +638,9 @@ async def generate_program(
 
     Идемпотентность серверная: повторный запрос той же логической генерации не
     создаёт вторую программу. Пока предыдущий запрос выполняется, повтор
-    получает 409, а не второй job.
+    получает 409, а не второй job. Тот же 409 возвращается, если `idempotency_key`
+    переиспользован с другим генератором: отдать программу от прежнего
+    генератора значило бы отменить явный выбор администратора.
     """
     request = body or GenerateProgramRequest()
     orchestrator = build_generation_orchestrator()
@@ -645,12 +654,12 @@ async def generate_program(
                 client_idempotency_key=request.idempotency_key,
             )
         )
-    except GenerationAlreadyRunningError as exc:
+    except (GenerationAlreadyRunningError, IdempotencyKeyConflictError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except GenerationFailedError as exc:
         raise _generation_http_error(exc) from exc
-    except (ProgramGenerationError, ProgramValidationError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProgramGenerationError as exc:
+        raise HTTPException(status_code=422, detail=safe_error_message(exc)) from exc
     return {
         "program": result.program.model_dump(mode="json"),
         "generation": _generation_summary(result),
@@ -687,14 +696,20 @@ def _generation_http_error(exc: GenerationFailedError) -> HTTPException:
 
     Слой API не разбирает внутренние типы исключений AI Gateway: решение
     принимается по коду, который оркестратор зафиксировал в момент отказа.
+
+    Текст проходит `safe_error_message` ещё раз: сообщение отказа собирается из
+    причин попыток (ошибка провайдера, detail readiness gate, сообщения
+    валидатора), и слой, отдающий его наружу, не должен полагаться на то, что
+    каждый источник уже был очищен.
     """
+    message = safe_error_message(exc)
     if exc.generation_error_code in _AI_ERROR_CODES:
         return HTTPException(
             status_code=502,
-            detail=f"Не удалось получить ответ от ИИ: {exc}. "
+            detail=f"Не удалось получить ответ от ИИ: {message}. "
             "Программу можно собрать алгоритмом подбора.",
         )
-    return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=422, detail=message)
 
 
 def _generation_summary(result: OrchestratorResult) -> dict:
@@ -702,6 +717,12 @@ def _generation_summary(result: OrchestratorResult) -> dict:
 
     Наружу отдаются только статус, попытки, код ошибки и фактическая стратегия:
     internal id записи и idempotency key клиенту не нужны.
+
+    Контракт полей: `job_id`, `attempts`, `last_error_code` nullable, потому что
+    job-контур опционален на уровне application-слоя (оркестратор работает и без
+    него). `status` не nullable: успешный ответ этого endpoint'а всегда означает
+    завершённую генерацию, и клиенту не нужно различать «job не создавался» и
+    «job успешен» — оба случая для него одинаковы.
     """
     job = result.job
     return {

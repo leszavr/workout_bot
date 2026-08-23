@@ -48,6 +48,7 @@ from src.domain.profile import FitnessProfile
 from src.errors import (
     GenerationAlreadyRunningError,
     GenerationFailedError,
+    IdempotencyKeyConflictError,
     ProgramGenerationError,
 )
 from src.infrastructure.config import DATABASE_URL
@@ -81,6 +82,21 @@ async def engine():
 @pytest.fixture
 async def sessions(engine):
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+@pytest.fixture
+async def second_sessions():
+    """Второй независимый engine.
+
+    Нужен там, где проверяется именно DB-level взаимное исключение: с общим
+    engine два запроса делят пул соединений, и результат мог бы объясняться
+    поведением пула, а не гарантией PostgreSQL.
+    """
+    engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
 
 
 @pytest.fixture(autouse=True)
@@ -450,6 +466,161 @@ class TestIdempotencyBoundary:
         )
 
         assert await _count_jobs(sessions, profile.profile_id) == 2
+
+
+class TestIdempotencyKeyParameterConflict:
+    """Ключ с несовместимыми параметрами (Phase 1.2-C).
+
+    Клиентский ключ означает «это тот же запрос». Если генератор другой,
+    утверждение неверно: отдать программу победителя нельзя (она собрана другим
+    генератором — это отмена явного выбора администратора), создать второй job
+    под тем же ключом тоже нельзя (это разрушает DB-enforced идемпотентность).
+    """
+
+    async def test_same_key_different_generator_conflicts(self, sessions):
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}key-conflict")
+        key = "client-conflict"
+        deterministic = _orchestrator(sessions)
+        ai = _orchestrator(
+            sessions,
+            primary="ai",
+            ai_generator=_StubAIGenerator(DeterministicProgramGenerator()),
+        )
+
+        first = await deterministic.generate(
+            _admin_request(profile.profile_id, key=key)
+        )
+
+        with pytest.raises(IdempotencyKeyConflictError):
+            await ai.generate(
+                GenerationRequest(
+                    profile_id=profile.profile_id,
+                    trigger=GenerationTrigger.ADMIN_REQUEST,
+                    requested_generator="ai",
+                    allow_fallback=False,
+                    client_idempotency_key=key,
+                )
+            )
+
+        # Ни второй job, ни вторая программа; программа победителя не тронута.
+        assert await _count_jobs(sessions, profile.profile_id) == 1
+        assert await _count_programs(sessions, profile.profile_id) == 1
+        jobs = await GenerationJobRepository(sessions).list_for_profile(
+            profile.profile_id
+        )
+        assert jobs[0].requested_generator == "deterministic"
+        assert jobs[0].program_id == first.program.program_id
+
+    async def test_failed_job_same_key_different_generator_conflicts(self, sessions):
+        """Провалившийся job тоже занимает ключ."""
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}key-conflict-failed")
+        key = "client-conflict-failed"
+        failing = _orchestrator(sessions, deterministic=_FailingGenerator())
+
+        with pytest.raises(ProgramGenerationError):
+            await failing.generate(_admin_request(profile.profile_id, key=key))
+
+        with pytest.raises(IdempotencyKeyConflictError):
+            await _orchestrator(
+                sessions,
+                primary="ai",
+                ai_generator=_StubAIGenerator(DeterministicProgramGenerator()),
+            ).generate(
+                GenerationRequest(
+                    profile_id=profile.profile_id,
+                    trigger=GenerationTrigger.ADMIN_REQUEST,
+                    requested_generator="ai",
+                    allow_fallback=False,
+                    client_idempotency_key=key,
+                )
+            )
+
+        assert await _count_jobs(sessions, profile.profile_id) == 1
+        assert await _count_programs(sessions, profile.profile_id) == 0
+
+    async def test_concurrent_conflicting_generators_on_independent_engines(
+        self, sessions, second_sessions
+    ):
+        """Гонка на двух независимых engine: победитель один, второй — конфликт.
+
+        Сессии берутся из разных engine, поэтому взаимное исключение обеспечивает
+        именно PostgreSQL (UNIQUE по ключу), а не общий пул или Python-примитив.
+        """
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}key-conflict-race")
+        key = "client-conflict-race"
+
+        results = await asyncio.gather(
+            _orchestrator(sessions).generate(
+                _admin_request(profile.profile_id, key=key)
+            ),
+            _orchestrator(
+                second_sessions,
+                primary="ai",
+                ai_generator=_StubAIGenerator(DeterministicProgramGenerator()),
+            ).generate(
+                GenerationRequest(
+                    profile_id=profile.profile_id,
+                    trigger=GenerationTrigger.ADMIN_REQUEST,
+                    requested_generator="ai",
+                    allow_fallback=False,
+                    client_idempotency_key=key,
+                )
+            ),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if not isinstance(r, BaseException)]
+        conflicts = [
+            r for r in results if isinstance(r, IdempotencyKeyConflictError)
+        ]
+        # Проигравший мог застать победителя ещё активным: тогда он получает
+        # отказ «уже выполняется». Оба варианта не создают вторую генерацию.
+        running = [
+            r for r in results if isinstance(r, GenerationAlreadyRunningError)
+        ]
+        assert len(successes) == 1
+        assert len(conflicts) + len(running) == 1
+        assert await _count_jobs(sessions, profile.profile_id) == 1
+        assert await _count_programs(sessions, profile.profile_id) == 1
+
+    async def test_same_key_same_generator_still_reuses(self, sessions):
+        """Regression: совместимый повтор по-прежнему отдаёт готовую программу."""
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}key-same-gen")
+        key = "client-conflict-ok"
+        orchestrator = _orchestrator(sessions)
+
+        first = await orchestrator.generate(_admin_request(profile.profile_id, key=key))
+        second = await orchestrator.generate(
+            _admin_request(profile.profile_id, key=key)
+        )
+
+        assert second.reused_existing is True
+        assert second.program.program_id == first.program.program_id
+        assert await _count_jobs(sessions, profile.profile_id) == 1
+        assert await _count_programs(sessions, profile.profile_id) == 1
+
+    async def test_auto_generation_ignores_generator_change(self, sessions):
+        """Серверный ключ попытки конфликтом не считается.
+
+        Ключ `profile:trigger:attempt` вызывающая сторона не выбирала: смена
+        генератора здесь означает изменение конфигурации приложения между
+        запусками, а не противоречивый запрос.
+        """
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}auto-gen-change")
+
+        first = await _orchestrator(sessions).generate(
+            _auto_request(profile.profile_id, reuse_existing=False)
+        )
+        second = await _orchestrator(
+            sessions,
+            primary="ai",
+            ai_generator=_StubAIGenerator(DeterministicProgramGenerator()),
+        ).generate(_auto_request(profile.profile_id, reuse_existing=False))
+
+        assert second.reused_existing is True
+        assert second.program.program_id == first.program.program_id
+        assert await _count_jobs(sessions, profile.profile_id) == 1
+        assert await _count_programs(sessions, profile.profile_id) == 1
 
     async def test_repeated_successful_request_reuses_program(self, sessions):
         """Повтор успешного запроса не создаёт вторую программу."""
