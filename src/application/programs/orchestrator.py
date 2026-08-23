@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from src.application.programs.filtering import ExerciseFilter
+from src.application.programs.generation_jobs import GenerationJobService
 from src.application.programs.generator import (
     DeterministicProgramGenerator,
     ProgramGenerator,
@@ -48,6 +49,7 @@ from src.domain.ai.errors import (
     AITimeoutError,
 )
 from src.domain.enums import GenerationSource, ProgramStatus
+from src.domain.generation import GenerationJob, GenerationTrigger
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 from src.domain.profile import FitnessProfile
 from src.domain.program import WorkoutProgram
@@ -102,6 +104,8 @@ class OrchestratorResult:
     safe_pool: SafeExercisePool
     fallback_used: bool = False
     reused_existing: bool = False
+    # Заполняется, когда генерация шла под persistent job (Phase 1.2-B).
+    job: GenerationJob | None = None
 
 
 @dataclass
@@ -142,6 +146,7 @@ class ProgramGenerationOrchestrator:
         validator: ProgramValidator | None = None,
         ai_readiness_gate: Callable[[], Awaitable[GateDecision]] | None = None,
         fallback_recorder: Callable[[FallbackEvent], Awaitable[None]] | None = None,
+        generation_jobs: GenerationJobService | None = None,
     ) -> None:
         if primary_generator not in VALID_GENERATORS:
             raise ValueError(f"Недопустимый primary_generator: {primary_generator}")
@@ -160,17 +165,29 @@ class ProgramGenerationOrchestrator:
         self._validator = validator or ProgramValidator()
         self._ai_gate = ai_readiness_gate
         self._fallback_recorder = fallback_recorder
+        self._generation_jobs = generation_jobs
 
     # --- public API -------------------------------------------------------------
 
     async def generate(
-        self, profile_id: str, *, reuse_existing: bool = False
+        self,
+        profile_id: str,
+        *,
+        reuse_existing: bool = False,
+        trigger: GenerationTrigger = GenerationTrigger.AUTO_FINALIZATION,
+        client_idempotency_key: str | None = None,
     ) -> OrchestratorResult:
         """Основной сценарий pipeline.
 
         reuse_existing=True (автозапуск после finalize): если у профиля уже
         есть валидная программа — возвращает её без новой генерации,
         повторный finalize не создаёт дубликаты.
+
+        Phase 1.2-B: при настроенном `generation_jobs` генерация выполняется под
+        persistent job. Проверка reuse_existing остаётся быстрым путём, но
+        защиту от параллельных дубликатов обеспечивает уже не она, а
+        PostgreSQL: два одновременных запроса, оба не увидевшие готовой
+        программы, создают ровно один job.
         """
         profile = await self._profiles.get(profile_id)
         if profile is None:
@@ -187,18 +204,47 @@ class ProgramGenerationOrchestrator:
                         "version": existing.version,
                     },
                 )
-                empty_pool = ExerciseCandidatePool(
-                    profile_id=profile_id,
-                    total_exercises=existing.generation.candidate_pool_total or 0,
-                )
-                empty_safe = SafeExercisePool(profile_id=profile_id)
-                return OrchestratorResult(
-                    program=existing,
-                    candidate_pool=empty_pool,
-                    safe_pool=empty_safe,
-                    reused_existing=True,
-                )
+                return self._reused_result(profile_id, existing)
 
+        if self._generation_jobs is None:
+            return await self._generate(profile, profile_id)
+
+        run = await self._generation_jobs.run(
+            profile_id=profile_id,
+            trigger=trigger,
+            requested_generator=self._primary,
+            client_idempotency_key=client_idempotency_key,
+            operation=lambda: self._generate(profile, profile_id),
+        )
+        if run.duplicate and run.existing_program is not None:
+            result = self._reused_result(profile_id, run.existing_program)
+            result.job = run.job
+            return result
+        if run.result is None:
+            # Контракт `run`: либо duplicate с готовой программой, либо result.
+            raise ProgramGenerationError("Генерация не вернула результат")
+        run.result.job = run.job
+        return run.result
+
+    # --- internals --------------------------------------------------------------
+
+    def _reused_result(
+        self, profile_id: str, program: WorkoutProgram
+    ) -> OrchestratorResult:
+        """Результат без новой генерации: пулы не пересчитывались."""
+        return OrchestratorResult(
+            program=program,
+            candidate_pool=ExerciseCandidatePool(
+                profile_id=profile_id,
+                total_exercises=program.generation.candidate_pool_total or 0,
+            ),
+            safe_pool=SafeExercisePool(profile_id=profile_id),
+            reused_existing=True,
+        )
+
+    async def _generate(
+        self, profile: FitnessProfile, profile_id: str
+    ) -> OrchestratorResult:
         catalog = await self._exercises.list(limit=CATALOG_FETCH_LIMIT)
         catalog_ids = {e.external_id for e in catalog}
         candidate_pool = await self._filter.select_candidates(profile, catalog)
@@ -221,8 +267,6 @@ class ProgramGenerationOrchestrator:
             safe_pool=safe_pool,
             fallback_used=fallback_used,
         )
-
-    # --- internals --------------------------------------------------------------
 
     def _resolve_generator(self, name: str) -> ProgramGenerator | None:
         if name == GENERATOR_DETERMINISTIC:

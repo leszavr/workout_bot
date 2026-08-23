@@ -203,9 +203,15 @@ class TestDelivery:
 
 
 class FakeOrchestrator:
-    def __init__(self, program: WorkoutProgram | None, fail: bool = False) -> None:
+    def __init__(
+        self,
+        program: WorkoutProgram | None,
+        fail: bool = False,
+        already_running: bool = False,
+    ) -> None:
         self.program = program
         self.fail = fail
+        self.already_running = already_running
         self.calls = 0
 
     async def generate(self, profile_id: str, *, reuse_existing: bool = False):
@@ -213,6 +219,10 @@ class FakeOrchestrator:
         from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 
         self.calls += 1
+        if self.already_running:
+            from src.errors import GenerationAlreadyRunningError
+
+            raise GenerationAlreadyRunningError("уже выполняется")
         if self.fail:
             from src.errors import ProgramGenerationError
 
@@ -225,7 +235,7 @@ class FakeOrchestrator:
 
 
 class TestPipelineService:
-    def _pipeline(self, *, generation_fail=False, delivery=None):
+    def _pipeline(self, *, generation_fail=False, delivery=None, already_running=False):
         program = _program()
         alerts: list[ProgramAlert] = []
 
@@ -233,7 +243,9 @@ class TestPipelineService:
             alerts.append(alert)
 
         pipeline = ProgramPipelineService(
-            orchestrator=FakeOrchestrator(program, fail=generation_fail),
+            orchestrator=FakeOrchestrator(
+                program, fail=generation_fail, already_running=already_running
+            ),
             delivery_service=delivery,
             alert_service=ProgramAlertService(alert_sender),
         )
@@ -277,3 +289,14 @@ class TestPipelineService:
         result = await pipeline.run_for_user(profile_id="p1", chat_id=None)
         assert result.outcome is PipelineOutcome.DELIVERED
         assert result.program is program
+
+    async def test_duplicate_run_does_not_alert_admin(self):
+        """Дубликат запуска — не сбой: администратора не будим."""
+        pipeline, _, alerts = self._pipeline(already_running=True)
+
+        result = await pipeline.run_for_user(profile_id="p1", chat_id="1")
+
+        assert result.outcome is PipelineOutcome.GENERATION_IN_PROGRESS
+        assert result.program is None
+        assert "уже формируется" in result.user_message
+        assert alerts == []

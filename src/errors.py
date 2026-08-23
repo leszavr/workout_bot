@@ -42,6 +42,14 @@ class ProgramGenerationError(WorkoutBotError):
     """Не удалось сгенерировать программу (пустой пул, неверный профиль)."""
 
 
+class GenerationAlreadyRunningError(WorkoutBotError):
+    """Та же логическая генерация уже выполняется.
+
+    Отдельный тип, потому что это не ошибка: повторный запрос корректно
+    отклонён серверной идемпотентностью, а не провалился.
+    """
+
+
 class ProgramValidationError(WorkoutBotError):
     """Программа не прошла валидацию."""
 

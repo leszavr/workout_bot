@@ -365,6 +365,15 @@ export interface ProgramResponse {
 
 export interface GenerateResponse {
   program: ProgramDetail;
+  // Operational-состояние генерации (Phase 1.2-B): повторный запрос той же
+  // логической генерации не создаёт вторую программу.
+  generation: {
+    reused_existing: boolean;
+    job_id: string | null;
+    status: string | null;
+    attempts: number | null;
+    last_error_code: string | null;
+  };
   pool_stats: {
     total_exercises: number;
     candidates_included: number;

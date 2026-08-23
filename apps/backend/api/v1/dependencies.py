@@ -9,6 +9,7 @@ import httpx
 from src.application.ai.program_generator import AIProgramGenerator, PromptLoader
 from src.application.media.service import ExerciseMediaService
 from src.application.programs.filtering import ExerciseFilter
+from src.application.programs.generation_jobs import GenerationJobService
 from src.application.programs.generator import DeterministicProgramGenerator
 from src.application.programs.html_service import ProgramHtmlService
 from src.application.programs.orchestrator import (
@@ -35,12 +36,29 @@ from src.infrastructure.persistence.postgres.exercise_media_repository import (
 from src.infrastructure.persistence.postgres.exercise_repository import (
     ExerciseRepository,
 )
+from src.infrastructure.persistence.postgres.generation_job_repository import (
+    GenerationJobRepository,
+)
 from src.infrastructure.persistence.postgres.profile_repository import (
     PostgresProfileRepository,
 )
 from src.infrastructure.persistence.postgres.program_repository import (
     PostgresProgramRepository,
 )
+
+
+def build_generation_job_service() -> GenerationJobService:
+    """Persistent состояние генерации (Phase 1.2-B).
+
+    Идемпотентность и переходы состояния обеспечивает PostgreSQL, поэтому
+    сервис получает те же session factory и репозиторий программ, что и
+    остальной контур генерации.
+    """
+    session_factory = get_session_factory()
+    return GenerationJobService(
+        repository=GenerationJobRepository(session_factory),
+        program_repository=PostgresProgramRepository(session_factory),
+    )
 
 
 def build_program_service(generator_type: str = "deterministic") -> ProgramService:
@@ -64,6 +82,8 @@ def build_program_service(generator_type: str = "deterministic") -> ProgramServi
         exercise_filter=ExerciseFilter(),
         safety_engine=SafetyEngine(),
         validator=ProgramValidator(),
+        generation_jobs=build_generation_job_service(),
+        requested_generator=generator_type,
     )
 
 
@@ -91,6 +111,7 @@ def build_generation_orchestrator(
         validator=ProgramValidator(),
         ai_readiness_gate=_workout_generation_gate,
         fallback_recorder=_record_generation_fallback,
+        generation_jobs=build_generation_job_service(),
     )
 
 

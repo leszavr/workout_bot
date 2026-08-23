@@ -148,6 +148,7 @@ def cleanup_program_test_data():
         from src.infrastructure.persistence.postgres.db import get_session_factory
         from src.infrastructure.persistence.postgres.models import (
             ConsentRow,
+            GenerationJobRow,
             ProfileRow,
             UserRow,
             WorkoutProgramRow,
@@ -163,6 +164,13 @@ def cleanup_program_test_data():
                     )
                 ).scalars().all()
                 if profile_ids:
+                    # Operational-записи генерации ссылаются на программы,
+                    # поэтому удаляются первыми.
+                    await session.execute(
+                        delete(GenerationJobRow).where(
+                            GenerationJobRow.profile_id.in_(profile_ids)
+                        )
+                    )
                     await session.execute(
                         delete(WorkoutProgramRow).where(
                             WorkoutProgramRow.profile_id.in_(profile_ids)
@@ -232,6 +240,62 @@ def test_generate_program(client: TestClient, auth_headers: dict):
     assert body["program"]["profile_id"] == profile_id
     assert body["pool_stats"]["safe_allowed"] > 0
     assert body["pool_stats"]["total_exercises"] >= 873
+    # Operational-состояние генерации доступно вызывающему (Phase 1.2-B).
+    assert body["generation"]["status"] == "succeeded"
+    assert body["generation"]["attempts"] == 1
+    assert body["generation"]["reused_existing"] is False
+    assert body["generation"]["last_error_code"] is None
+
+
+def test_generate_program_with_same_idempotency_key_reuses_program(
+    client: TestClient, auth_headers: dict
+):
+    """Повтор того же логического запроса не создаёт вторую программу."""
+    profile_id = "test-api-prog-idem"
+    _create_test_profile(client, profile_id)
+    payload = {"generator": "deterministic", "idempotency_key": "api-test-key-1"}
+
+    first = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json=payload,
+    )
+    second = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate",
+        headers=auth_headers,
+        json=payload,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["generation"]["reused_existing"] is True
+    assert (
+        second.json()["program"]["program_id"] == first.json()["program"]["program_id"]
+    )
+    assert second.json()["program"]["version"] == first.json()["program"]["version"]
+
+    programs = client.get(
+        f"/api/v1/profiles/{profile_id}/programs", headers=auth_headers
+    ).json()
+    assert programs["total"] == 1
+
+
+def test_generate_program_without_key_creates_new_version(
+    client: TestClient, auth_headers: dict
+):
+    """Явный повторный запрос администратора — законная новая генерация."""
+    profile_id = "test-api-prog-explicit"
+    _create_test_profile(client, profile_id)
+
+    first = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+    second = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+
+    assert second["generation"]["reused_existing"] is False
+    assert second["program"]["version"] == first["program"]["version"] + 1
 
 
 def test_generate_program_missing_profile(client: TestClient, auth_headers: dict):

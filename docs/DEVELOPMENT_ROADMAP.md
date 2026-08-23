@@ -49,11 +49,28 @@
       (`FSMStorageError` → error router), а не к молчаливой потере ответа;
 - [x] Redis добавлен в docker compose и CI, тесты FSM выполняются реально.
 
-#### 1.2-B — Generation domain state
-- [ ] формализовать persistent generation status model;
-- [ ] определить idempotency boundary/key;
-- [ ] persistence для generation jobs/state;
-- [ ] acceptance duplicate generation requests.
+#### 1.2-B — Generation domain state: DONE
+- [x] формализована persistent generation status model: `generation_jobs`,
+      состояния `PENDING → RUNNING → SUCCEEDED|FAILED`, переходы контролируются
+      условным `UPDATE`, запрещённые переходы отклоняются;
+- [x] idempotency boundary: одна логическая генерация = (profile_id, бизнес-событие,
+      номер попытки); ключ строится детерминированно, вызывающая сторона может
+      задать свой; enforced через `UNIQUE(idempotency_key)` +
+      `INSERT ... ON CONFLICT DO NOTHING`, а не проверкой в Python;
+- [x] persistence для generation jobs: Alembic `0008`, FK на профиль (CASCADE) и
+      на версию программы (SET NULL), индексы под чтение по профилю/статусу;
+- [x] acceptance duplicate generation requests: последовательный повтор и два
+      параллельных запроса дают один job и одну программу; повторный запрос при
+      активной генерации получает 409, а не второй job;
+- [x] AI-вызов вынесен за границы транзакции: state-переходы идут короткими
+      транзакциями до и после генерации;
+- [x] в job не попадают промпт, ответ провайдера, ключи и PII — только стабильный
+      код ошибки и безопасное краткое описание.
+
+**Осознанное ограничение:** retry не реализован. `RETRY_WAIT` и переход
+`FAILED → PENDING/RUNNING` зарезервированы для 1.2-D: статус без обработчика
+оставлял бы job в состоянии, из которого его никто не выводит. Recovery stale
+`RUNNING` после падения процесса тоже относится к 1.2-D.
 
 #### 1.2-C — Generation Orchestrator
 - [ ] единый `ProgramGenerationOrchestrator`;
@@ -64,7 +81,9 @@
 #### 1.2-D — Worker / retry / recovery
 - [ ] фоновые jobs;
 - [ ] централизованный retry/backoff;
-- [ ] retryable vs non-retryable errors;
+- [ ] retryable vs non-retryable errors (классификация уже есть в
+      `GenerationErrorCode`/`GenerationErrorKind`, не хватает исполнителя);
+- [ ] статус `RETRY_WAIT` и переход `FAILED → PENDING/RUNNING`;
 - [ ] stale `RUNNING` recovery после restart/crash;
 - [ ] acceptance worker/process crash.
 

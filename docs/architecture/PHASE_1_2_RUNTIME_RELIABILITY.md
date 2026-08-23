@@ -91,6 +91,41 @@ RUNNING
 
 `FAILED` означает окончательную неуспешную попытку, но не потерю данных: состояние должно быть диагностируемым и, если ошибка retryable, поддерживать повторную обработку.
 
+### 5.1 Реализовано в 1.2-B
+
+Таблица `generation_jobs` (`GenerationJobRow`), домен — `src/domain/generation.py`,
+репозиторий — `src/infrastructure/persistence/postgres/generation_job_repository.py`,
+application-слой — `src/application/programs/generation_jobs.py`.
+
+Фактическая state machine:
+
+```text
+PENDING → RUNNING → SUCCEEDED
+                 └→ FAILED
+```
+
+| Из | В | Разрешён |
+| --- | --- | --- |
+| PENDING | RUNNING | да |
+| RUNNING | SUCCEEDED | да |
+| RUNNING | FAILED | да |
+| PENDING | SUCCEEDED / FAILED | нет |
+| SUCCEEDED | любое | нет |
+| FAILED | любое | нет (`FAILED → PENDING/RUNNING` зарезервировано для 1.2-D) |
+
+`RETRY_WAIT` не введён сознательно: планировщика повторов ещё нет, и статус без
+обработчика оставлял бы job в состоянии, из которого его никто не выводит. Он
+появляется вместе с worker/retry (1.2-D).
+
+Класс ошибки (`GenerationErrorKind`) вычисляется по стабильному коду
+(`GenerationErrorCode`), сохранённому в момент отказа: конфигурация, валидация и
+отсутствующие данные — `non_retryable`; сеть, таймауты, rate limit и сбой
+persistence — `transient`. Retry по этой классификации в 1.2-B не выполняется.
+
+Сохраняются только код ошибки и короткое безопасное описание: промпт, ответ
+провайдера, ключи и заголовки авторизации в job не попадают (перед записью
+сообщение проходит редактирование секретов).
+
 ## 6. Delivery state
 
 Generation и delivery — две разные операции.
@@ -143,6 +178,57 @@ Telegram handlers и Admin API не должны самостоятельно с
 - повторный запрос после `SUCCEEDED`;
 - повтор после process crash;
 - повтор delivery после неизвестного результата Telegram call.
+
+### 8.1 Выбранная boundary (1.2-B)
+
+**Одна логическая генерация определяется как: (profile_id, бизнес-событие
+генерации, номер попытки этого события).** Ключ строится детерминированно:
+`{trigger}:{profile_id}:{attempt}`; вызывающая сторона может задать вместо этого
+свой ключ, и тогда он нормализуется в `client:{profile_id}:{key}`.
+
+Почему не `profile_id`:
+
+- одна анкета законно имеет несколько программ — `workout_programs` версионирует
+  их по `(program_id, version)`, историю не перезаписывает, и админ-API
+  сознательно позволяет собрать новую версию;
+- автоматическая генерация после подтверждения анкеты и явный запрос
+  администратора — разные бизнес-события: повтор одного не должен подавлять
+  другое, поэтому триггер входит в идентичность;
+- «попытка» нужна, чтобы после неудачи можно было законно повторить генерацию,
+  не смешивая её с предыдущим отказом.
+
+Номер попытки считается по числу исчерпанных job того же триггера:
+
+- автогенерация: исчерпанным считается только `FAILED` (успех означает, что
+  программа уже есть, и повторный finalize обязан вернуть её, а не собрать
+  вторую). Исключение — успешный job, потерявший ссылку на программу: иначе
+  автогенерация оказалась бы заблокированной навсегда;
+- запрос администратора: исчерпан любой завершённый job, потому что администратор
+  просит именно новую программу.
+
+Идемпотентность обеспечивает PostgreSQL: `UNIQUE(idempotency_key)` +
+`INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`. Проверки «если нет — создай»
+на стороне приложения нет: она не защищает несколько backend-процессов.
+
+Concurrency: два параллельных запроса одной логической генерации получают
+одинаковый ключ; вставку выигрывает один, второй читает победителя. Если job
+активен, повторный запрос получает `GenerationAlreadyRunningError` (HTTP 409) и
+второй генерации не запускает. Advisory lock не потребовался: уникальности ключа
+и условного `UPDATE ... WHERE status = :expected` достаточно.
+
+Границы транзакций: длительный AI-вызов не выполняется внутри транзакции.
+
+```text
+tx: определить номер попытки
+tx: создать job (ON CONFLICT DO NOTHING) → PENDING
+tx: PENDING → RUNNING
+-- вне транзакции: генерация (AI/deterministic) + сохранение программы
+tx: RUNNING → SUCCEEDED | FAILED
+```
+
+Связь с программой: `GenerationJob.program_id/program_version` ссылаются на
+конкретную версию `workout_programs` (`ON DELETE SET NULL`). При отказе программа
+не создаётся, фиктивной записи ради хранения ошибки нет.
 
 ## 9. Retry policy
 
@@ -214,6 +300,12 @@ Redis-backed FSM и restart-safe questionnaire.
 ### 1.2-B — Generation domain state
 
 Persistent generation state/job, status model и idempotency boundary.
+
+**Статус: DONE.** Введены `generation_jobs`, state machine, DB-enforced
+idempotency и интеграция в существующие точки генерации (`ProgramService` для
+Admin API, `ProgramGenerationOrchestrator` для Telegram). Retry, worker и
+recovery по-прежнему не реализованы: stale `RUNNING` после падения процесса
+остаётся открытым и закрывается в 1.2-D.
 
 ### 1.2-C — Generation Orchestrator
 

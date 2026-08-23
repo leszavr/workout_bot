@@ -26,6 +26,7 @@ from src.application.programs.telegram_delivery import ProgramDeliveryService
 from src.domain.enums import ProgramDeliveryStatus
 from src.domain.program import WorkoutProgram
 from src.errors import (
+    GenerationAlreadyRunningError,
     HtmlRenderError,
     ProgramDeliveryError,
     ProgramGenerationError,
@@ -39,6 +40,9 @@ logger = logging.getLogger(__name__)
 class PipelineOutcome(StrEnum):
     DELIVERED = "delivered"
     GENERATION_FAILED = "generation_failed"
+    # Та же логическая генерация уже выполняется другим запросом/процессом.
+    # Это не ошибка: повторный запуск корректно отклонён идемпотентностью.
+    GENERATION_IN_PROGRESS = "generation_in_progress"
     RENDER_FAILED = "render_failed"
     DELIVERY_FAILED = "delivery_failed"
 
@@ -72,6 +76,19 @@ class ProgramPipelineService:
         try:
             result = await self._orchestrator.generate(
                 profile_id, reuse_existing=reuse_existing
+            )
+        except GenerationAlreadyRunningError:
+            # Дубликат запуска (двойной клик, параллельный процесс): вторую
+            # генерацию не начинаем и администратора не будим.
+            logger.info(
+                "event=pipeline_generation_already_running",
+                extra={"profile_id": profile_id},
+            )
+            return PipelineResult(
+                outcome=PipelineOutcome.GENERATION_IN_PROGRESS,
+                user_message=(
+                    "Программа уже формируется. Пришлём её, как только будет готова."
+                ),
             )
         except (ProgramGenerationError, ProgramPersistenceError) as exc:
             logger.error(
