@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -20,6 +20,9 @@ from src.infrastructure.persistence.postgres.models import (
     AdminIdentityRow,
     AdminUserRow,
 )
+
+
+_LAST_ADMIN_LOCK_KEY = "workout_bot.admin_users.last_admin_guard"
 
 
 def _persistence_error(exc: SQLAlchemyError, what: str) -> ProfilePersistenceError:
@@ -123,6 +126,61 @@ class AdminUserRepository:
         except SQLAlchemyError as exc:
             raise _persistence_error(exc, "Не удалось обновить пользователя") from exc
 
+    async def update_guarded_last_admin(self, user_id: int, **fields) -> AdminUser | None:
+        """Атомарно меняет пользователя, не допуская потери последнего admin.
+
+        PostgreSQL advisory lock сериализует все операции, которые могут
+        изменить количество активных администраторов, в том числе между
+        несколькими backend-процессами/инстансами.
+        """
+        if not fields:
+            return await self.get(user_id)
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                        {"lock_key": _LAST_ADMIN_LOCK_KEY},
+                    )
+                    row = (
+                        await session.execute(
+                            select(AdminUserRow)
+                            .where(AdminUserRow.id == user_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if row is None:
+                        return None
+                    if row.role == AdminRole.ADMIN.value and row.is_active:
+                        remaining = (
+                            await session.execute(
+                                select(func.count())
+                                .select_from(AdminUserRow)
+                                .where(
+                                    AdminUserRow.role == AdminRole.ADMIN.value,
+                                    AdminUserRow.is_active.is_(True),
+                                    AdminUserRow.id != user_id,
+                                )
+                            )
+                        ).scalar_one()
+                        becoming_non_admin = fields.get("role") not in (None, AdminRole.ADMIN.value)
+                        becoming_inactive = fields.get("is_active") is False
+                        if (becoming_non_admin or becoming_inactive) and remaining == 0:
+                            raise ProfilePersistenceError(
+                                "Нельзя изменить последнего активного администратора"
+                            )
+                    for key, value in fields.items():
+                        setattr(row, key, value)
+                    await session.flush()
+                    await session.refresh(row)
+                    return self._to_domain(row)
+        except IntegrityError as exc:
+            raise ProfilePersistenceError(
+                "Нарушение уникальности логина при обновлении пользователя"
+            ) from exc
+        except SQLAlchemyError as exc:
+            raise _persistence_error(exc, "Не удалось обновить пользователя") from exc
+
     async def delete(self, user_id: int) -> bool:
         """Удаляет пользователя вместе с его внешними идентичностями (CASCADE)."""
         try:
@@ -135,11 +193,52 @@ class AdminUserRepository:
         except SQLAlchemyError as exc:
             raise _persistence_error(exc, "Не удалось удалить пользователя") from exc
 
+    async def delete_guarded_last_admin(self, user_id: int) -> bool:
+        """Атомарно удаляет пользователя с защитой последнего admin."""
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                        {"lock_key": _LAST_ADMIN_LOCK_KEY},
+                    )
+                    row = (
+                        await session.execute(
+                            select(AdminUserRow)
+                            .where(AdminUserRow.id == user_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if row is None:
+                        return False
+                    if row.role == AdminRole.ADMIN.value and row.is_active:
+                        remaining = (
+                            await session.execute(
+                                select(func.count())
+                                .select_from(AdminUserRow)
+                                .where(
+                                    AdminUserRow.role == AdminRole.ADMIN.value,
+                                    AdminUserRow.is_active.is_(True),
+                                    AdminUserRow.id != user_id,
+                                )
+                            )
+                        ).scalar_one()
+                        if remaining == 0:
+                            raise ProfilePersistenceError(
+                                "Нельзя удалить последнего активного администратора"
+                            )
+                    result = await session.execute(
+                        delete(AdminUserRow).where(AdminUserRow.id == user_id)
+                    )
+                    return bool(result.rowcount)
+        except SQLAlchemyError as exc:
+            raise _persistence_error(exc, "Не удалось удалить пользователя") from exc
+
     async def count_active_admins(self, exclude_user_id: int | None = None) -> int:
         """Сколько активных администраторов останется без указанного пользователя.
 
-        Используется, чтобы не допустить состояния «в системе не осталось
-        ни одного администратора».
+        Используется для предварительной проверки на уровне сервиса. Критическая
+        проверка перед изменением выполняется атомарными guarded-методами выше.
         """
         query = (
             select(func.count())
