@@ -78,14 +78,21 @@ async def cleanup_ai_api_data():
                         select(AIProviderRow.id).where(AIProviderRow.slug.like("apitest-%"))
                     )
                 ).scalars().all()
+                # Ссылки на секреты только своих подключений: чужие ключи
+                # трогать нельзя. Раньше здесь удалялись все записи по маске
+                # `ai-endpoint-%`, то есть ключи доступа реальных подключений
+                # разработки — после прогона тестов провайдеры отвечали 401.
+                secret_refs: list[str] = []
                 if provider_ids:
-                    endpoint_ids = (
+                    endpoint_rows = (
                         await session.execute(
-                            select(AIEndpointRow.id).where(
-                                AIEndpointRow.provider_id.in_(provider_ids)
-                            )
+                            select(
+                                AIEndpointRow.id, AIEndpointRow.secret_reference
+                            ).where(AIEndpointRow.provider_id.in_(provider_ids))
                         )
-                    ).scalars().all()
+                    ).all()
+                    endpoint_ids = [row[0] for row in endpoint_rows]
+                    secret_refs = [row[1] for row in endpoint_rows if row[1]]
                     if endpoint_ids:
                         model_ids = (
                             await session.execute(
@@ -122,9 +129,12 @@ async def cleanup_ai_api_data():
                 await session.execute(
                     delete(AIProviderRow).where(AIProviderRow.slug.like("apitest-%"))
                 )
-                await session.execute(
-                    delete(AISecretRow).where(AISecretRow.reference.like("ai-endpoint-%"))
-                )
+                if secret_refs:
+                    await session.execute(
+                        delete(AISecretRow).where(
+                            AISecretRow.reference.in_(secret_refs)
+                        )
+                    )
                 await session.execute(
                     delete(AIAuditEventRow).where(
                         AIAuditEventRow.entity_type.in_(
@@ -288,12 +298,11 @@ def test_full_crud_and_secret_safety(client: TestClient, auth_headers: dict):
     assert response.status_code == 200
     assert len(response.json()["bindings"]) == 2
 
-    # Список задач содержит все типы.
+    # Список задач содержит только реализованные системой типы.
     response = client.get("/api/v1/admin/ai/tasks", headers=auth_headers)
     assert response.status_code == 200
     task_types = {t["task_type"] for t in response.json()["items"]}
-    assert "workout_generation" in task_types
-    assert "user_chat" in task_types
+    assert task_types == {"workout_generation"}
 
     # --- Модель, привязанную к задаче, нельзя удалить ---
     response = client.delete(f"/api/v1/admin/ai/models/{model_a_id}", headers=auth_headers)
@@ -356,19 +365,14 @@ def test_readiness_requires_auth(client: TestClient):
     assert client.get("/api/v1/admin/ai/readiness").status_code == 401
 
 
-def test_readiness_reports_protocols_and_strategy(client: TestClient, auth_headers: dict):
-    """Отчёт готовности сообщает поддерживаемые протоколы и стратегию генерации."""
+def test_readiness_reports_checklist_and_strategy(client: TestClient, auth_headers: dict):
+    """Отчёт готовности возвращает полный чек-лист и стратегию генерации."""
     response = client.get("/api/v1/admin/ai/readiness", headers=auth_headers)
     assert response.status_code == 200, response.text
     report = response.json()
 
     assert report["task_type"] == "workout_generation"
     assert isinstance(report["ready"], bool)
-    protocols = {p["value"]: p["supported"] for p in report["protocols"]}
-    assert protocols["openai_compatible"] is True
-    # Адаптеров для этих протоколов нет — UI обязан это видеть.
-    assert protocols["anthropic"] is False
-    assert protocols["custom"] is False
     assert "primary_generator" in report["generation"]
     keys = {c["key"] for c in report["checks"]}
     assert {
@@ -464,7 +468,7 @@ def test_task_cannot_be_enabled_with_disabled_model(client: TestClient, auth_hea
         json={"enabled": True, "model_ids": [model_id]},
     )
     assert response.status_code == 422
-    assert "отключена" in response.json()["detail"]
+    assert "выключена" in response.json()["detail"]
 
     # Выключенную задачу с той же моделью сохранить можно: это не ложное обещание.
     response = client.put(
@@ -520,7 +524,7 @@ def test_task_cannot_be_enabled_with_unknown_prompt_version(
         json={"enabled": True, "model_ids": [model_id], "prompt_version": 99},
     )
     assert response.status_code == 422
-    assert "v99" in response.json()["detail"]
+    assert "№99" in response.json()["detail"]
 
 
 def test_disabled_provider_not_leaked_in_responses(client: TestClient, auth_headers: dict):
@@ -896,3 +900,182 @@ def test_fallback_events_endpoint_returns_list(client: TestClient, auth_headers:
     body = response.json()
     assert "items" in body and "total" in body
     assert all(i["event_type"] == "ai_generation_fallback" for i in body["items"])
+
+
+# --- Выбор моделей из списка сервиса ---------------------------------------------------
+#
+# Идентификаторы моделей больше не вводятся руками: список запрашивается у
+# самого сервиса, администратор отмечает нужные.
+
+
+def _provider_with_endpoint(client: TestClient, auth_headers: dict) -> int:
+    """Создаёт сервис с подключением и возвращает id подключения."""
+    provider = client.post(
+        "/api/v1/admin/ai/providers",
+        headers=auth_headers,
+        json={"name": "Discovery", "slug": "apitest-discovery"},
+    ).json()
+    endpoint = client.post(
+        f"/api/v1/admin/ai/providers/{provider['id']}/endpoints",
+        headers=auth_headers,
+        json={
+            "name": "Main EP",
+            "base_url": "https://ai.apitest.example/v1",
+            "api_key": REAL_SECRET,
+        },
+    ).json()
+    return endpoint["id"]
+
+
+def test_available_models_requires_auth(client: TestClient):
+    assert client.get("/api/v1/admin/ai/endpoints/1/available-models").status_code == 401
+
+
+def test_available_models_unknown_endpoint_returns_404(
+    client: TestClient, auth_headers: dict
+):
+    response = client.get(
+        "/api/v1/admin/ai/endpoints/99999999/available-models", headers=auth_headers
+    )
+    assert response.status_code == 404
+
+
+def test_available_models_marks_already_added(
+    client: TestClient, auth_headers: dict, monkeypatch
+):
+    endpoint_id = _provider_with_endpoint(client, auth_headers)
+    client.post(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models",
+        headers=auth_headers,
+        json={"model_id": "vendor/already:free", "display_name": "уже есть"},
+    )
+
+    from src.application.ai import gateway as gateway_module
+    from src.infrastructure.ai.adapters import DiscoveredModel
+
+    async def fake_discover(self, endpoint_pk: int):  # noqa: ANN001
+        assert endpoint_pk == endpoint_id
+        return [
+            DiscoveredModel(model_id="vendor/already:free", display_name="already"),
+            DiscoveredModel(model_id="vendor/fresh:free", display_name="fresh"),
+        ]
+
+    monkeypatch.setattr(gateway_module.AIGateway, "discover_models", fake_discover)
+
+    response = client.get(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/available-models",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    assert [i["model_id"] for i in items] == [
+        "vendor/already:free",
+        "vendor/fresh:free",
+    ]
+    assert items[0]["already_added"] is True
+    assert items[1]["already_added"] is False
+    _assert_no_secret_leak(response)
+
+
+def test_available_models_provider_failure_is_502(
+    client: TestClient, auth_headers: dict, monkeypatch
+):
+    """Сбой сервиса — не ошибка запроса администратора."""
+    endpoint_id = _provider_with_endpoint(client, auth_headers)
+
+    from src.application.ai import gateway as gateway_module
+    from src.domain.ai.errors import AIProviderError
+
+    async def failing(self, endpoint_pk: int):  # noqa: ANN001
+        raise AIProviderError("Провайдер вернул 503", status_code=503)
+
+    monkeypatch.setattr(gateway_module.AIGateway, "discover_models", failing)
+
+    response = client.get(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/available-models",
+        headers=auth_headers,
+    )
+    assert response.status_code == 502
+    assert "503" in response.json()["detail"]
+
+
+def test_bulk_add_models_skips_duplicates(client: TestClient, auth_headers: dict):
+    endpoint_id = _provider_with_endpoint(client, auth_headers)
+
+    first = client.post(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models/bulk",
+        headers=auth_headers,
+        json={"model_ids": ["vendor/a:free", "b-model"]},
+    )
+    assert first.status_code == 201, first.text
+    body = first.json()
+    assert [m["model_id"] for m in body["added"]] == ["vendor/a:free", "b-model"]
+    # Имя для показа выводится из идентификатора, сам идентификатор не меняется.
+    assert body["added"][0]["display_name"] == "a"
+    assert body["skipped"] == []
+
+    # Повторный выбор той же модели — ожидаемая ситуация, а не ошибка.
+    second = client.post(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models/bulk",
+        headers=auth_headers,
+        json={"model_ids": ["vendor/a:free", "c-model"]},
+    )
+    assert second.status_code == 201
+    assert [m["model_id"] for m in second.json()["added"]] == ["c-model"]
+    assert second.json()["skipped"] == ["vendor/a:free"]
+
+    listed = client.get(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models", headers=auth_headers
+    ).json()
+    assert {m["model_id"] for m in listed["items"]} == {
+        "vendor/a:free",
+        "b-model",
+        "c-model",
+    }
+
+
+def test_bulk_add_unknown_endpoint_returns_404(client: TestClient, auth_headers: dict):
+    response = client.post(
+        "/api/v1/admin/ai/endpoints/99999999/models/bulk",
+        headers=auth_headers,
+        json={"model_ids": ["x"]},
+    )
+    assert response.status_code == 404
+
+
+def test_probe_models_does_not_persist_key(
+    client: TestClient, auth_headers: dict, monkeypatch
+):
+    """Список моделей доступен до создания подключения; ключ не сохраняется."""
+    from src.application.ai import gateway as gateway_module
+    from src.infrastructure.ai.adapters import DiscoveredModel
+
+    seen: dict = {}
+
+    async def fake_probe(self, *, protocol, base_url, api_key, timeout_seconds=30):  # noqa: ANN001
+        seen["base_url"] = base_url
+        seen["api_key"] = api_key
+        return [DiscoveredModel(model_id="vendor/probe:free", display_name="probe")]
+
+    monkeypatch.setattr(gateway_module.AIGateway, "probe_models", fake_probe)
+
+    response = client.post(
+        "/api/v1/admin/ai/probe-models",
+        headers=auth_headers,
+        json={"base_url": "https://new.apitest.example/v1", "api_key": REAL_SECRET},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [i["model_id"] for i in response.json()["items"]] == ["vendor/probe:free"]
+    assert seen["base_url"] == "https://new.apitest.example/v1"
+    assert seen["api_key"] == REAL_SECRET
+    # Ключ передан только в запрос к сервису и не вернулся клиенту.
+    _assert_no_secret_leak(response)
+
+
+def test_probe_models_requires_auth(client: TestClient):
+    response = client.post(
+        "/api/v1/admin/ai/probe-models", json={"base_url": "https://x.example/v1"}
+    )
+    assert response.status_code == 401

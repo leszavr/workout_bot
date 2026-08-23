@@ -1,14 +1,15 @@
 "use client";
 
-// Смена собственного пароля.
+// Смена своего пароля.
 //
 // Эта же страница обслуживает обязательную смену: если администратор выдал
-// временный пароль, API закрыт до его замены, и api-клиент приводит сюда
-// автоматически. Поэтому страница не должна зависеть от других запросов.
+// временный пароль, остальные разделы закрыты, и клиент приводит сюда сам.
+// Поэтому страница не зависит от других запросов.
 
 import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
+import { Card, Field, Notice } from "@/components/ui/Primitives";
 import { authApi, getToken } from "@/lib/api";
 import { useCurrentUser } from "@/lib/session";
 
@@ -29,10 +30,13 @@ export default function ChangePasswordPage() {
 
   const tooShort = newPassword.length > 0 && newPassword.length < MIN_PASSWORD_LENGTH;
   const mismatch = repeat.length > 0 && newPassword !== repeat;
+  const sameAsOld =
+    newPassword.length > 0 && newPassword === currentPassword;
   const canSubmit =
     currentPassword.length > 0 &&
     newPassword.length >= MIN_PASSWORD_LENGTH &&
     newPassword === repeat &&
+    !sameAsOld &&
     !saving;
 
   const submit = async () => {
@@ -56,101 +60,100 @@ export default function ChangePasswordPage() {
     <div className="app-shell">
       <AppNav />
       <main className="main">
-        <h1 className="page-title">Смена пароля</h1>
+        <div className="page-head">
+          <h1 className="page-title">Смена пароля</h1>
+        </div>
 
-        {loading && <p className="muted">Загрузка...</p>}
+        {loading && (
+          <Card>
+            <p className="muted" style={{ margin: 0 }}>
+              Загрузка…
+            </p>
+          </Card>
+        )}
 
         {user?.is_env_admin && (
-          <div className="card">
+          <Card title="Пароль задан в настройках сервера">
             <p style={{ marginTop: 0 }}>
-              Вы вошли аварийным администратором. Его логин и пароль задаются
-              переменными окружения <code>ADMIN_LOGIN</code> и{" "}
-              <code>ADMIN_PASSWORD</code>, поэтому сменить пароль через интерфейс
-              нельзя — измените значение в конфигурации сервера.
+              Вы вошли администратором, логин и пароль которого прописаны в
+              настройках сервера. Сменить его через интерфейс нельзя — значение
+              меняется в конфигурации.
             </p>
-            <p className="muted" style={{ marginBottom: 0 }}>
-              Для повседневной работы создайте обычного пользователя в разделе
+            <p className="field-hint" style={{ marginBottom: 0 }}>
+              Для повседневной работы создайте обычную учётную запись в разделе
               «Пользователи».
             </p>
-          </div>
+          </Card>
         )}
 
         {user && !user.is_env_admin && (
-          <div className="card" style={{ maxWidth: 520 }}>
+          <div style={{ maxWidth: 520 }}>
             {user.must_change_password && !done && (
-              <div className="error" style={{ marginBottom: 12 }}>
-                Пароль был выдан администратором как временный. Смените его,
-                чтобы получить доступ к остальным разделам.
-              </div>
+              <Notice tone="warn" title="Нужно сменить пароль">
+                Текущий пароль выдал администратор как временный. Пока вы его не
+                смените, остальные разделы недоступны.
+              </Notice>
             )}
-            {done && (
-              <div className="badge confirmed" style={{ marginBottom: 12 }}>
-                Пароль изменён
-              </div>
-            )}
-            {error && <div className="error" style={{ marginBottom: 12 }}>{error}</div>}
+            {done && <Notice tone="ok">Пароль изменён.</Notice>}
+            {error && <div className="error">{error}</div>}
 
-            <div style={{ display: "grid", gap: 12 }}>
-              <label>
-                Текущий пароль
-                <input
-                  type="password"
-                  value={currentPassword}
-                  onChange={(e) => setCurrentPassword(e.target.value)}
-                  autoComplete="current-password"
-                  aria-label="Текущий пароль"
-                />
-              </label>
-              <label>
-                Новый пароль
-                <input
-                  type="password"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  autoComplete="new-password"
-                  aria-label="Новый пароль"
-                />
-              </label>
-              <label>
-                Повторите новый пароль
-                <input
-                  type="password"
-                  value={repeat}
-                  onChange={(e) => setRepeat(e.target.value)}
-                  autoComplete="new-password"
-                  aria-label="Повторите новый пароль"
-                />
-              </label>
+            <Card>
+              <div className="stack">
+                <Field label="Текущий пароль">
+                  <input
+                    type="password"
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    autoComplete="current-password"
+                    aria-label="Текущий пароль"
+                  />
+                </Field>
 
-              {/* Подсказки показываются до отправки, а не после отказа сервера. */}
-              {tooShort && (
-                <p className="error" style={{ margin: 0 }}>
-                  Минимум {MIN_PASSWORD_LENGTH} символов.
-                </p>
-              )}
-              {mismatch && (
-                <p className="error" style={{ margin: 0 }}>
-                  Пароли не совпадают.
-                </p>
-              )}
-              {!tooShort && !mismatch && (
-                <p className="muted" style={{ margin: 0 }}>
-                  Минимум {MIN_PASSWORD_LENGTH} символов. Новый пароль должен
-                  отличаться от текущего.
-                </p>
-              )}
-
-              <div>
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={submit}
-                  disabled={!canSubmit}
+                <Field
+                  label="Новый пароль"
+                  hint={`Не меньше ${MIN_PASSWORD_LENGTH} символов.`}
+                  error={
+                    tooShort
+                      ? `Не меньше ${MIN_PASSWORD_LENGTH} символов`
+                      : sameAsOld
+                        ? "Новый пароль должен отличаться от текущего"
+                        : undefined
+                  }
                 >
-                  {saving ? "Сохранение..." : "Сменить пароль"}
-                </button>
+                  <input
+                    type="password"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    autoComplete="new-password"
+                    aria-label="Новый пароль"
+                  />
+                </Field>
+
+                <Field
+                  label="Новый пароль ещё раз"
+                  error={mismatch ? "Пароли не совпадают" : undefined}
+                >
+                  <input
+                    type="password"
+                    value={repeat}
+                    onChange={(e) => setRepeat(e.target.value)}
+                    autoComplete="new-password"
+                    aria-label="Повторите новый пароль"
+                  />
+                </Field>
+
+                <div className="button-row">
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={submit}
+                    disabled={!canSubmit}
+                  >
+                    {saving ? "Сохраняем…" : "Сменить пароль"}
+                  </button>
+                </div>
               </div>
-            </div>
+            </Card>
           </div>
         )}
       </main>

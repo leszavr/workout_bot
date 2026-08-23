@@ -23,12 +23,7 @@ from src.application.auth.service import (
     AdminUserError,
     LastAdminError,
 )
-from src.domain.auth import (
-    MIN_PASSWORD_LENGTH,
-    AdminRole,
-    AdminUser,
-    AuthProvider,
-)
+from src.domain.auth import MIN_PASSWORD_LENGTH, AdminRole, AdminUser
 from src.errors import ProfilePersistenceError
 
 router = APIRouter(prefix="/api/v1/admin/users")
@@ -56,21 +51,6 @@ class UserPatch(BaseModel):
     display_name: str | None = Field(default=None, max_length=120)
     role: AdminRole | None = None
     is_active: bool | None = None
-
-
-class IdentityLink(BaseModel):
-    """Привязка аккаунта внешнего провайдера (Яндекс/VK/MAX)."""
-
-    model_config = ConfigDict(extra="forbid")
-    provider: AuthProvider
-    provider_user_id: str = Field(min_length=1, max_length=191)
-
-
-class IdentityOut(BaseModel):
-    id: int
-    provider: str
-    provider_user_id: str
-    created_at: str | None = None
 
 
 class UserOut(BaseModel):
@@ -213,75 +193,3 @@ async def reset_password(
     except AdminUserError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return PasswordResetOut(login=user.login, temporary_password=temporary)
-
-
-# --- Внешние идентичности (задел под Яндекс/VK/MAX) --------------------------------
-
-
-@router.get("/{user_id}/identities", responses=_NOT_FOUND)
-async def list_identities(
-    user_id: int, _: Annotated[AuthenticatedUser, Depends(require_admin)]
-) -> dict:
-    service = build_admin_user_service()
-    if await service.get_user(user_id) is None:
-        raise HTTPException(status_code=404, detail=_USER_NOT_FOUND)
-    items = await service.list_identities(user_id)
-    return {
-        "total": len(items),
-        "items": [
-            IdentityOut(
-                id=i.id or 0,
-                provider=i.provider.value,
-                provider_user_id=i.provider_user_id,
-                created_at=_iso(i.created_at),
-            )
-            for i in items
-        ],
-    }
-
-
-@router.post(
-    "/{user_id}/identities", status_code=201, responses={**_NOT_FOUND, **_CONFLICT}
-)
-async def link_identity(
-    user_id: int,
-    body: IdentityLink,
-    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
-) -> IdentityOut:
-    """Привязывает аккаунт внешнего провайдера.
-
-    Сам OAuth-флоу не реализован: привязка выполняется администратором
-    вручную. Схема и контракт при подключении флоу не изменятся.
-    """
-    try:
-        identity = await build_admin_user_service().link_identity(
-            user_id,
-            provider=body.provider,
-            provider_user_id=body.provider_user_id,
-            actor=admin.login,
-        )
-    except AdminUserError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ProfilePersistenceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return IdentityOut(
-        id=identity.id or 0,
-        provider=identity.provider.value,
-        provider_user_id=identity.provider_user_id,
-        created_at=_iso(identity.created_at),
-    )
-
-
-@router.delete(
-    "/{user_id}/identities/{identity_id}", status_code=204, responses=_NOT_FOUND
-)
-async def unlink_identity(
-    user_id: int,
-    identity_id: int,
-    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
-) -> None:
-    unlinked = await build_admin_user_service().unlink_identity(
-        identity_id, actor=admin.login
-    )
-    if not unlinked:
-        raise HTTPException(status_code=404, detail="Identity not found")

@@ -18,7 +18,7 @@ import time
 
 from src.application.ai.selection import ModelCandidate, ModelSelector
 from src.domain.ai.config import AIUsageRecord
-from src.domain.ai.enums import AIUsageStatus
+from src.domain.ai.enums import AIProtocol, AIUsageStatus
 from src.domain.ai.errors import (
     AIConfigurationError,
     AIError,
@@ -26,6 +26,7 @@ from src.domain.ai.errors import (
 from src.domain.ai.gateway import AIMessage, AIRequest, AIResponse
 from src.infrastructure.ai.adapters import (
     AdapterRequest,
+    DiscoveredModel,
     EndpointConnection,
     ProviderAdapterRegistry,
 )
@@ -94,7 +95,9 @@ class AIGateway:
         last_error: AIError | None = None
         for candidate in candidates:
             try:
-                return await self._execute(candidate, adapter_request, request)
+                return await self._execute(
+                    candidate, adapter_request, request, config.timeout_seconds
+                )
             except AIError as exc:
                 last_error = exc
                 logger.warning(
@@ -111,6 +114,7 @@ class AIGateway:
         candidate: ModelCandidate,
         adapter_request: AdapterRequest,
         request: AIRequest,
+        timeout_seconds: int,
     ) -> AIResponse:
         adapter = self._registry.get(candidate.provider.protocol)
         api_key = None
@@ -120,7 +124,11 @@ class AIGateway:
         connection = EndpointConnection(
             base_url=candidate.endpoint.base_url,
             api_key=api_key,
-            timeout_seconds=candidate.endpoint.timeout_seconds,
+            # Сколько ждать ответа, задаёт настройка задачи: именно её видит и
+            # меняет администратор. Таймаут подключения в интерфейс не выведен,
+            # поэтому опираться на него значило бы обрывать запрос раньше
+            # выставленного срока.
+            timeout_seconds=timeout_seconds,
             max_retries=candidate.endpoint.max_retries,
         )
 
@@ -193,6 +201,56 @@ class AIGateway:
         except Exception:  # noqa: BLE001 — usage не должен ломать основной поток
             logger.exception("Не удалось сохранить AI usage record")
 
+    async def discover_models(self, endpoint_id: int) -> list[DiscoveredModel]:
+        """Модели, о которых сообщает сам сервис.
+
+        Нужна, чтобы администратор выбирал модель из списка, а не переписывал
+        идентификатор из документации руками. Ничего не сохраняет: это
+        справочный запрос, решение о добавлении принимает администратор.
+        """
+        endpoint = await self._endpoints.get(endpoint_id)
+        if endpoint is None:
+            raise AIConfigurationError("Подключение не найдено")
+        provider = await self._providers.get(endpoint.provider_id)
+        if provider is None:
+            raise AIConfigurationError("Сервис для этого подключения не найден")
+
+        api_key = None
+        if endpoint.secret_reference:
+            api_key = await self._secrets.get(endpoint.secret_reference)
+        return await self.probe_models(
+            protocol=provider.protocol,
+            base_url=endpoint.base_url,
+            api_key=api_key,
+            timeout_seconds=endpoint.timeout_seconds,
+        )
+
+    async def probe_models(
+        self,
+        *,
+        protocol: AIProtocol,
+        base_url: str,
+        api_key: str | None,
+        timeout_seconds: int = 30,
+    ) -> list[DiscoveredModel]:
+        """Список моделей по ещё не сохранённым параметрам подключения.
+
+        Нужна на этапе первичной настройки: администратор должен выбрать
+        модель из списка до того, как в системе появится подключение.
+        Переданный ключ здесь не сохраняется и не логируется.
+        """
+        adapter = self._registry.get(protocol)
+        connection = EndpointConnection(
+            base_url=base_url,
+            api_key=api_key,
+            timeout_seconds=min(timeout_seconds, 30),
+            # Справочный GET дешёвый, а случайные отказы контура перед сервисом
+            # встречаются регулярно. Пара повторов надёжнее, чем предлагать
+            # администратору нажимать кнопку заново.
+            max_retries=2,
+        )
+        return await adapter.list_models(connection)
+
     async def test_endpoint(self, endpoint_id: int) -> dict:
         """Connection test: минимальный нейтральный запрос без персональных данных.
 
@@ -201,10 +259,10 @@ class AIGateway:
         """
         endpoint = await self._endpoints.get(endpoint_id)
         if endpoint is None:
-            raise AIConfigurationError("Эндпоинт не найден")
+            raise AIConfigurationError("Подключение не найдено")
         provider = await self._providers.get(endpoint.provider_id)
         if provider is None:
-            raise AIConfigurationError("Провайдер эндпоинта не найден")
+            raise AIConfigurationError("Сервис для этого подключения не найден")
 
         models = await self._models.list_for_endpoint(endpoint_id)
         model_id = models[0].model_id if models else "ping"
@@ -219,8 +277,10 @@ class AIGateway:
             connection = EndpointConnection(
                 base_url=endpoint.base_url,
                 api_key=api_key,
-                timeout_seconds=min(endpoint.timeout_seconds, 15),
-                max_retries=0,  # тест не должен повторять запросы
+                timeout_seconds=min(endpoint.timeout_seconds, 30),
+                # Пара повторов: случайный отказ контура перед сервисом не
+                # должен показываться администратору как «связи нет».
+                max_retries=2,
             )
             ping = AdapterRequest(
                 messages=[AIMessage(role="user", content="ping")],
@@ -244,7 +304,7 @@ class AIGateway:
             **base,
             "success": True,
             "latency_ms": int((time.monotonic() - started) * 1000),
-            "message": "Connection successful",
+            "message": "Связь установлена, сервис отвечает",
         }
 
     async def _record_test_result(

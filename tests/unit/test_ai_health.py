@@ -314,7 +314,7 @@ async def test_provider_without_endpoints_is_not_tested():
     report = await _service(endpoints=[], models=[]).report()
 
     assert report.providers[0].health == "not_tested"
-    assert "нет эндпоинтов" in (report.providers[0].reason or "")
+    assert "нет адресов подключения" in (report.providers[0].reason or "")
 
 
 # --- Availability модели ----------------------------------------------------------
@@ -445,9 +445,7 @@ async def test_report_never_exposes_secrets():
 async def test_protocols_expose_adapter_support():
     report = await _service().report()
 
-    supported = {p["value"]: p["supported"] for p in report.protocols}
-    assert supported["openai_compatible"] is True
-    assert supported["anthropic"] is False
+    assert report.providers[0].protocol_supported is True
 
 
 # --- Активное обновление -----------------------------------------------------------

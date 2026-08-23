@@ -34,6 +34,7 @@ from src.domain.ai.enums import (
 )
 from src.domain.ai.errors import AIConfigurationError
 from src.infrastructure.ai.adapters import ProviderAdapterRegistry
+from src.infrastructure.ai.secrets import SecretStore
 from src.infrastructure.persistence.postgres.ai_repository import (
     AIEndpointRepository,
     AIModelRepository,
@@ -49,6 +50,13 @@ STATUS_MISSING = "missing"
 STATUS_FAILED = "failed"
 
 GENERATOR_AI = "ai"
+
+# Названия генераторов для текстов, которые видит администратор.
+_GENERATOR_LABELS = {GENERATOR_AI: "ИИ", "deterministic": "алгоритм"}
+
+
+def _generator_label(name: str) -> str:
+    return _GENERATOR_LABELS.get(name, name)
 
 
 @dataclass(frozen=True)
@@ -104,7 +112,6 @@ class AIReadinessReport:
     ready: bool
     checks: list[ReadinessCheck] = field(default_factory=list)
     chain: list[ChainEntry] = field(default_factory=list)
-    protocols: list[dict] = field(default_factory=list)
     generation: dict = field(default_factory=dict)
 
 
@@ -119,6 +126,7 @@ class AIReadinessService:
         prompts: PromptTemplateRepository,
         selector: ModelSelector,
         adapter_registry: ProviderAdapterRegistry,
+        secret_store: SecretStore | None = None,
         primary_generator: str = GENERATOR_AI,
         fallback_generator: str = "deterministic",
         auto_generate_after_finalize: bool = True,
@@ -130,6 +138,7 @@ class AIReadinessService:
         self._prompts = prompts
         self._selector = selector
         self._registry = adapter_registry
+        self._secrets = secret_store
         self._primary_generator = primary_generator
         self._fallback_generator = fallback_generator
         self._auto_generate = auto_generate_after_finalize
@@ -162,7 +171,7 @@ class AIReadinessService:
         checks = [
             self._check_provider(providers, usable_providers, supported),
             self._check_endpoint(usable_providers, endpoints),
-            self._check_api_key(focus_endpoint),
+            await self._check_api_key(focus_endpoint),
             self._check_connection(focus_endpoint),
             self._check_models(endpoints, models),
             await self._check_task_models(task_type, config, candidates),
@@ -180,9 +189,6 @@ class AIReadinessService:
             ready=ready,
             checks=checks,
             chain=[self._chain_entry(c) for c in candidates],
-            protocols=[
-                {"value": p.value, "supported": p in supported} for p in AIProtocol
-            ],
             generation={
                 "primary_generator": self._primary_generator,
                 "fallback_generator": self._fallback_generator,
@@ -215,7 +221,7 @@ class AIReadinessService:
             return RuntimeGateDecision(
                 allowed=False,
                 reason=AIFallbackReason.TASK_NOT_READY,
-                detail="AI-конфигурация не готова",
+                detail="Настройки ИИ не готовы",
             )
         first = blocking[0]
         reason = (
@@ -282,37 +288,38 @@ class AIReadinessService:
         if usable:
             return ReadinessCheck(
                 key="provider",
-                title="Провайдер",
+                title="Сервис ИИ",
                 status=STATUS_OK,
-                detail=", ".join(f"{p.name} ({p.protocol.value})" for p in usable),
+                detail=", ".join(p.name for p in usable),
             )
         if not providers:
             return ReadinessCheck(
                 key="provider",
-                title="Провайдер",
+                title="Сервис ИИ",
                 status=STATUS_MISSING,
-                detail="Провайдер не создан",
-                action="Создайте провайдера с поддерживаемым протоколом",
+                detail="Сервис ИИ не добавлен",
+                action="Добавьте сервис ИИ",
                 reason_code=AIFallbackReason.AI_NOT_CONFIGURED.value,
             )
         unsupported = [p for p in providers if p.protocol not in supported]
         if unsupported and not [p for p in providers if p.protocol in supported]:
             return ReadinessCheck(
                 key="provider",
-                title="Провайдер",
+                title="Сервис ИИ",
                 status=STATUS_FAILED,
-                detail="Все провайдеры используют протокол без адаптера: "
-                + ", ".join(sorted({p.protocol.value for p in unsupported})),
-                action="Создайте провайдера с протоколом "
-                + ", ".join(sorted(p.value for p in supported)),
+                detail="Ни один добавленный сервис не использует поддерживаемый "
+                "способ подключения: "
+                + ", ".join(sorted({p.name for p in unsupported})),
+                action="Добавьте сервис заново — система работает с поставщиками, "
+                "совместимыми с OpenAI API",
                 reason_code=AIFallbackReason.UNSUPPORTED_PROTOCOL.value,
             )
         return ReadinessCheck(
             key="provider",
-            title="Провайдер",
+            title="Сервис ИИ",
             status=STATUS_MISSING,
-            detail="Все подходящие провайдеры отключены",
-            action="Включите провайдера",
+            detail="Все подходящие сервисы выключены",
+            action="Включите сервис ИИ",
             reason_code=AIFallbackReason.PROVIDER_UNAVAILABLE.value,
         )
 
@@ -322,52 +329,69 @@ class AIReadinessService:
         if endpoints:
             return ReadinessCheck(
                 key="endpoint",
-                title="Эндпоинт",
+                title="Подключение",
                 status=STATUS_OK,
                 detail=", ".join(f"{e.name} → {e.base_url}" for e in endpoints),
             )
         if not usable_providers:
             return ReadinessCheck(
                 key="endpoint",
-                title="Эндпоинт",
+                title="Подключение",
                 status=STATUS_MISSING,
-                detail="Нет провайдера, к которому можно добавить эндпоинт",
-                action="Сначала создайте провайдера",
+                detail="Нет сервиса, к которому можно добавить подключение",
+                action="Сначала добавьте сервис ИИ",
                 reason_code=AIFallbackReason.AI_NOT_CONFIGURED.value,
             )
         return ReadinessCheck(
             key="endpoint",
-            title="Эндпоинт",
+            title="Подключение",
             status=STATUS_MISSING,
-            detail="Включённого эндпоинта нет",
-            action="Создайте или включите эндпоинт с базовым URL провайдера",
+            detail="Нет включённого подключения",
+            action="Добавьте адрес подключения из документации поставщика",
             reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
         )
 
-    def _check_api_key(self, endpoint: AIEndpoint | None) -> ReadinessCheck:
+    async def _check_api_key(self, endpoint: AIEndpoint | None) -> ReadinessCheck:
         if endpoint is None:
             return ReadinessCheck(
                 key="api_key",
-                title="API-ключ",
+                title="Ключ доступа",
                 status=STATUS_MISSING,
-                detail="Нет эндпоинта для проверки",
-                action="Создайте эндпоинт",
+                detail="Нет подключения, которое можно проверить",
+                action="Добавьте подключение",
                 blocking=False,
             )
         if endpoint.secret_reference:
+            # Ссылка на ключ и сам ключ — разные вещи. Ключ может исчезнуть из
+            # хранилища (миграция, очистка, смена ключа шифрования), и тогда
+            # запросы получают 401, хотя чек-лист показывал «ключ сохранён».
+            if self._secrets is not None and not await self._secrets.exists(
+                endpoint.secret_reference
+            ):
+                return ReadinessCheck(
+                    key="api_key",
+                    title="Ключ доступа",
+                    status=STATUS_FAILED,
+                    detail=(
+                        f"Для подключения «{endpoint.name}» ключ помечен как "
+                        "сохранённый, но в хранилище его нет"
+                    ),
+                    action="Сохраните ключ доступа заново",
+                    blocking=False,
+                )
             return ReadinessCheck(
                 key="api_key",
-                title="API-ключ",
+                title="Ключ доступа",
                 status=STATUS_OK,
-                detail=f"Ключ сохранён для эндпоинта «{endpoint.name}»",
+                detail=f"Ключ сохранён для подключения «{endpoint.name}»",
                 blocking=False,
             )
         return ReadinessCheck(
             key="api_key",
-            title="API-ключ",
+            title="Ключ доступа",
             status=STATUS_WARNING,
-            detail=f"Для эндпоинта «{endpoint.name}» ключ не задан",
-            action="Сохраните ключ, если провайдер требует авторизацию",
+            detail=f"Для подключения «{endpoint.name}» ключ не задан",
+            action="Сохраните ключ, если поставщик требует авторизацию",
             blocking=False,
         )
 
@@ -375,36 +399,40 @@ class AIReadinessService:
         if endpoint is None:
             return ReadinessCheck(
                 key="connection",
-                title="Проверка подключения",
+                title="Связь с сервисом",
                 status=STATUS_MISSING,
-                detail="Нет эндпоинта для проверки",
-                action="Создайте эндпоинт",
+                detail="Нет подключения, которое можно проверить",
+                action="Добавьте подключение",
                 reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
             )
         if endpoint.last_test_status == AIUsageStatus.SUCCESS.value:
-            when = endpoint.last_test_at.isoformat() if endpoint.last_test_at else "—"
+            when = (
+                endpoint.last_test_at.strftime("%d.%m.%Y %H:%M")
+                if endpoint.last_test_at
+                else "время неизвестно"
+            )
             return ReadinessCheck(
                 key="connection",
-                title="Проверка подключения",
+                title="Связь с сервисом",
                 status=STATUS_OK,
-                detail=f"Успешно: {when}",
+                detail=f"Связь есть, последняя проверка: {when}",
             )
         if endpoint.last_test_status == AIUsageStatus.ERROR.value:
             return ReadinessCheck(
                 key="connection",
-                title="Проверка подключения",
+                title="Связь с сервисом",
                 status=STATUS_FAILED,
-                detail=f"Последняя проверка эндпоинта «{endpoint.name}» завершилась "
+                detail=f"Последняя проверка подключения «{endpoint.name}» завершилась "
                 f"ошибкой: {endpoint.last_test_error_type or 'неизвестная ошибка'}",
-                action="Исправьте URL/ключ/модель и выполните проверку снова",
+                action="Исправьте адрес, ключ или название модели и проверьте связь снова",
                 reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
             )
         return ReadinessCheck(
             key="connection",
-            title="Проверка подключения",
+            title="Связь с сервисом",
             status=STATUS_MISSING,
-            detail=f"Подключение эндпоинта «{endpoint.name}» ни разу не проверялось",
-            action="Нажмите «Проверить подключение» до включения задачи",
+            detail=f"Связь с подключением «{endpoint.name}» ещё не проверяли",
+            action="Нажмите «Проверить связь» до включения задачи",
             reason_code=AIFallbackReason.CONNECTION_NOT_TESTED.value,
         )
 
@@ -423,16 +451,16 @@ class AIReadinessService:
                 key="model",
                 title="Модель",
                 status=STATUS_MISSING,
-                detail="Нет эндпоинта, на котором можно объявить модель",
-                action="Сначала создайте эндпоинт",
+                detail="Нет подключения, на котором можно добавить модель",
+                action="Сначала добавьте подключение",
                 reason_code=AIFallbackReason.ENDPOINT_UNAVAILABLE.value,
             )
         return ReadinessCheck(
             key="model",
             title="Модель",
             status=STATUS_MISSING,
-            detail="Включённых моделей нет",
-            action="Создайте или включите модель с идентификатором провайдера",
+            detail="Нет включённых моделей",
+            action="Добавьте модель, указав её название у поставщика",
             reason_code=AIFallbackReason.MODEL_UNAVAILABLE.value,
         )
 
@@ -461,17 +489,17 @@ class AIReadinessService:
                 key="task_models",
                 title="Модели задачи",
                 status=STATUS_FAILED,
-                detail="Модели привязаны, но ни одна не доступна: отключена модель, "
-                "эндпоинт или провайдер, либо протокол без адаптера",
-                action="Включите нужную модель и её эндпоинт/провайдера",
+                detail="Модели привязаны, но ни одна не доступна: выключена модель, "
+                "подключение или сервис, либо способ подключения не поддерживается",
+                action="Включите нужную модель, её подключение и сервис",
                 reason_code=AIFallbackReason.MODEL_UNAVAILABLE.value,
             )
         return ReadinessCheck(
             key="task_models",
             title="Модели задачи",
             status=STATUS_MISSING,
-            detail=f"Для задачи «{task_type.value}» не выбрана ни одна модель",
-            action="Выберите основную модель в карточке задачи",
+            detail="Для задачи не выбрана ни одна модель",
+            action="Выберите основную модель в настройках задачи",
             reason_code=AIFallbackReason.MODEL_UNAVAILABLE.value,
         )
 
@@ -487,8 +515,8 @@ class AIReadinessService:
             key="task_enabled",
             title="Задача включена",
             status=STATUS_MISSING,
-            detail="Задача выключена: AI не будет вызван",
-            action="Отметьте «включена» и сохраните задачу",
+            detail="Задача выключена: к ИИ обращаться не будем",
+            action="Включите использование ИИ и сохраните задачу",
             reason_code=AIFallbackReason.TASK_DISABLED.value,
         )
 
@@ -500,44 +528,47 @@ class AIReadinessService:
         if available:
             return ReadinessCheck(
                 key="prompt",
-                title="Промпт",
+                title="Инструкция для ИИ",
                 status=STATUS_OK,
                 detail=detail,
             )
         return ReadinessCheck(
             key="prompt",
-            title="Промпт",
+            title="Инструкция для ИИ",
             status=STATUS_FAILED,
             detail=detail,
-            action="Укажите существующую версию промпта или создайте новую",
+            action="Укажите существующую версию инструкции",
             reason_code=AIFallbackReason.TASK_NOT_READY.value,
         )
 
     def _check_generation_strategy(self) -> ReadinessCheck:
         primary = self._primary_generator
         fallback = self._fallback_generator
-        detail = f"primary: {primary}, fallback: {fallback}"
+        detail = (
+            f"основной генератор — {_generator_label(primary)}, "
+            f"резервный — {_generator_label(fallback)}"
+        )
         if GENERATOR_AI not in (primary, fallback):
             return ReadinessCheck(
                 key="generation_strategy",
-                title="Стратегия генерации",
+                title="Порядок сборки программ",
                 status=STATUS_FAILED,
-                detail=f"AI не участвует в генерации программ ({detail})",
-                action="Задайте PROGRAM_PRIMARY_GENERATOR=ai в конфигурации сервера",
+                detail=f"ИИ не участвует в сборке программ ({detail})",
+                action="Укажите ИИ основным генератором в настройках сервера",
                 reason_code=AIFallbackReason.GENERATOR_NOT_CONFIGURED.value,
             )
         if primary != GENERATOR_AI:
             return ReadinessCheck(
                 key="generation_strategy",
-                title="Стратегия генерации",
+                title="Порядок сборки программ",
                 status=STATUS_WARNING,
-                detail=f"AI используется только как резервный генератор ({detail})",
-                action="Для генерации через AI задайте PROGRAM_PRIMARY_GENERATOR=ai",
+                detail=f"ИИ используется только как резервный генератор ({detail})",
+                action="Чтобы программы собирал ИИ, сделайте его основным генератором",
                 blocking=False,
             )
         return ReadinessCheck(
             key="generation_strategy",
-            title="Стратегия генерации",
+            title="Порядок сборки программ",
             status=STATUS_OK,
             detail=detail,
         )
@@ -575,25 +606,22 @@ class AIReadinessService:
         """None — модель пригодна; иначе человекочитаемая причина."""
         model = await self._models.get(model_pk)
         if model is None:
-            return f"модель pk={model_pk} не найдена"
+            return "выбранная модель не найдена"
         label = f"модель «{model.display_name}»"
         if not model.enabled:
-            return f"{label} отключена"
+            return f"{label} выключена"
         endpoint = await self._endpoints.get(model.endpoint_id)
         if endpoint is None:
-            return f"{label}: эндпоинт не найден"
+            return f"{label}: подключение не найдено"
         if not endpoint.enabled:
-            return f"{label}: эндпоинт «{endpoint.name}» отключён"
+            return f"{label}: подключение «{endpoint.name}» выключено"
         provider = await self._providers.get(endpoint.provider_id)
         if provider is None:
-            return f"{label}: провайдер не найден"
+            return f"{label}: сервис не найден"
         if not provider.enabled:
-            return f"{label}: провайдер «{provider.name}» отключён"
+            return f"{label}: сервис «{provider.name}» выключен"
         if provider.protocol not in supported:
-            return (
-                f"{label}: протокол «{provider.protocol.value}» не поддерживается "
-                "(адаптер не зарегистрирован)"
-            )
+            return f"{label}: такой способ подключения система не поддерживает"
         return None
 
     async def _resolve_prompt(
@@ -603,17 +631,19 @@ class AIReadinessService:
         if version is not None:
             template = await self._prompts.get(task_type, version)
             if template is not None and template.enabled:
-                return True, f"версия v{version} из базы данных"
+                return True, f"версия №{version} из базы данных"
         file_version = version or 1
         directory = PROMPTS_DIR / f"v{file_version}"
         if (directory / "system.txt").exists() and (
             directory / "user_template.txt"
         ).exists():
-            return True, f"версия v{file_version} из файлов промптов"
+            return True, f"версия №{file_version} из файлов проекта"
         db_versions = await self._prompts.list_for_task(task_type)
-        available = ", ".join(f"v{t.version}" for t in db_versions if t.enabled) or "нет"
+        available = (
+            ", ".join(f"№{t.version}" for t in db_versions if t.enabled) or "нет"
+        )
         return False, (
-            f"промпт версии v{file_version} не найден ни в базе данных, ни в файлах "
+            f"инструкции версии №{file_version} нет ни в базе данных, ни в файлах "
             f"(версии в базе: {available})"
         )
 

@@ -1,14 +1,22 @@
 "use client";
 
-// AI Infrastructure Health Dashboard.
+// Состояние подключений к ИИ.
 //
-// Компонент НЕ хранит собственный список провайдеров и моделей и не выводит
-// состояние сам: дерево и все статусы приходят готовыми из
-// GET /admin/ai/infrastructure-health. Поэтому новый провайдер или модель
-// появляются здесь без изменений в этом файле.
+// Дерево «сервис → подключение → модели» строится из фактической настройки:
+// компонент не хранит собственных списков и ничего не придумывает. Если
+// сервисов не создано — показывается пустое состояние, а не выдуманные
+// примеры.
 
 import { useCallback, useEffect, useState } from "react";
 
+import {
+  Card,
+  Empty,
+  Skeleton,
+  Status,
+  Tag,
+  moment,
+} from "@/components/ui/Primitives";
 import {
   AIHealthEndpoint,
   AIHealthModel,
@@ -18,22 +26,17 @@ import {
 } from "@/lib/api";
 import {
   aiAvailabilityLabel,
-  aiHealthBadgeClass,
   aiHealthLabel,
-  aiProtocolLabel,
   aiTaskLabel,
+  healthTone,
 } from "@/lib/labels";
 
-// Дешёвый GET без обращений к провайдерам: подхватывает изменения, сделанные
-// из другой сессии, и результат последних реальных AI-вызовов.
+// Чтение состояния дешёвое (без обращений к сервисам ИИ), поэтому обновляем
+// его периодически: так видны изменения, сделанные из другой сессии.
 const AUTO_REFRESH_MS = 60_000;
 
-function formatMoment(value: string | null): string {
-  return value ? new Date(value).toLocaleString("ru-RU") : "—";
-}
-
 export default function AIInfrastructureHealthPanel(props: Readonly<{
-  // Меняется после каждой CRUD-операции: дашборд синхронизируется с backend.
+  // Растёт после каждого изменения настроек — панель не показывает устаревшее.
   reloadKey: number;
   onError: (message: string) => void;
 }>) {
@@ -65,7 +68,7 @@ export default function AIInfrastructureHealthPanel(props: Readonly<{
     return () => window.clearInterval(timer);
   }, [load]);
 
-  // Активная проверка: минимальный ping включённых эндпоинтов, не генерация.
+  // Активная проверка: короткий тестовый запрос, не создание программы.
   const runCheck = async () => {
     setChecking(true);
     try {
@@ -78,88 +81,105 @@ export default function AIInfrastructureHealthPanel(props: Readonly<{
     }
   };
 
-  return (
-    <div className="card">
-      <div className="toolbar" style={{ alignItems: "center" }}>
-        <h2 className="section-title" style={{ marginTop: 0, marginBottom: 0 }}>
-          Состояние AI-инфраструктуры
-        </h2>
-        <button type="button" onClick={() => load()} disabled={loading}>
-          Обновить данные
-        </button>
-        <button type="button" className="primary" onClick={runCheck} disabled={checking}>
-          {checking ? "Проверка подключений..." : "Проверить подключения"}
-        </button>
-        {report && (
-          <span className="muted">
-            данные на {formatMoment(report.generated_at)}
-          </span>
-        )}
-      </div>
-      <p className="muted" style={{ marginTop: 0 }}>
-        Список строится из фактической конфигурации. «Проверить подключения»
-        выполняет короткий тест включённых эндпоинтов — не генерацию программы.
-      </p>
+  const actions = (
+    <>
+      {report && (
+        <span className="field-hint">данные на {moment(report.generated_at)}</span>
+      )}
+      <button
+        type="button"
+        className="small"
+        onClick={() => load()}
+        disabled={loading}
+      >
+        Обновить
+      </button>
+      <button
+        type="button"
+        className="small primary"
+        onClick={runCheck}
+        disabled={checking}
+      >
+        {checking ? "Проверяем…" : "Проверить связь"}
+      </button>
+    </>
+  );
 
-      {loading && <p className="muted">Загрузка состояния...</p>}
-      {failure && <div className="error">Не удалось получить состояние: {failure}</div>}
+  return (
+    <Card
+      title="Состояние подключений"
+      description="Список строится из ваших настроек. «Проверить связь» отправляет короткий тестовый запрос — программу это не создаёт."
+      actions={actions}
+    >
+      {loading && <Skeleton rows={3} />}
+
+      {failure && (
+        <div className="error">Не удалось получить состояние: {failure}</div>
+      )}
 
       {report && !loading && (
         <>
-          <HealthSummary report={report} />
           {report.providers.length === 0 ? (
-            <p className="muted">
-              Провайдеров нет. Создайте провайдера — он появится здесь автоматически.
-            </p>
+            <Empty
+              title="Сервисы ИИ не подключены"
+              hint="Пока подключений нет, программы собирает алгоритмический генератор. Добавьте подключение на вкладке «Подключения» — оно сразу появится здесь."
+            />
           ) : (
-            report.providers.map((provider) => (
-              <ProviderCard key={provider.id ?? provider.slug} provider={provider} />
-            ))
+            <>
+              <Summary report={report} />
+              {report.providers.map((provider) => (
+                <ProviderBlock
+                  key={provider.id ?? provider.slug}
+                  provider={provider}
+                />
+              ))}
+            </>
           )}
         </>
       )}
-    </div>
+    </Card>
   );
 }
 
-function HealthSummary(props: Readonly<{ report: AIInfrastructureHealth }>) {
+function Summary(props: Readonly<{ report: AIInfrastructureHealth }>) {
   const { summary } = props.report;
   return (
-    <div className="toolbar" style={{ alignItems: "center" }}>
-      <span className="muted">
-        провайдеров: {summary.providers_healthy} из {summary.providers_total} работают
-      </span>
-      <span className="muted">эндпоинтов: {summary.endpoints_total}</span>
-      <span className="muted">
-        моделей доступно: {summary.models_available} из {summary.models_total}
-      </span>
-      <span className="muted">
-        задействовано задачами: {summary.models_in_active_use}
-      </span>
+    <div className="kv" style={{ marginBottom: 20 }}>
+      <div className="k">Сервисы</div>
+      <div>
+        работают {summary.providers_healthy} из {summary.providers_total}
+      </div>
+      <div className="k">Модели</div>
+      <div>
+        доступны {summary.models_available} из {summary.models_total}
+      </div>
+      <div className="k">Задействованы задачами</div>
+      <div>{summary.models_in_active_use}</div>
     </div>
   );
 }
 
-function ProviderCard(props: Readonly<{ provider: AIHealthProvider }>) {
+function ProviderBlock(props: Readonly<{ provider: AIHealthProvider }>) {
   const { provider } = props;
   return (
-    <div className="card" style={{ padding: 14 }}>
-      <div className="toolbar" style={{ alignItems: "center" }}>
+    <div className="subcard">
+      <div className="inline-list">
         <strong>{provider.name}</strong>
-        <span className={aiHealthBadgeClass(provider.health)}>
+        <Status tone={healthTone(provider.health)}>
           {aiHealthLabel(provider.health)}
-        </span>
-        <span className="badge">{aiProtocolLabel(provider.protocol)}</span>
-        {/* Конфигурационное состояние отдельно от инфраструктурного. */}
-        <span className={provider.enabled ? "badge confirmed" : "badge draft"}>
-          {provider.enabled ? "включён" : "отключён"}
-        </span>
-        <span className="muted">slug: {provider.slug}</span>
+        </Status>
+        {!provider.enabled && <Tag>выключен вручную</Tag>}
       </div>
-      {provider.reason && <p className="muted">{provider.reason}</p>}
+      {provider.reason && (
+        <p className="field-hint" style={{ marginTop: 6 }}>
+          {provider.reason}
+        </p>
+      )}
 
       {provider.endpoints.length === 0 ? (
-        <p className="muted">Эндпоинтов нет.</p>
+        <p className="field-hint" style={{ marginTop: 10 }}>
+          У сервиса нет подключений — обращаться некуда.
+        </p>
       ) : (
         provider.endpoints.map((endpoint) => (
           <EndpointBlock key={endpoint.id ?? endpoint.name} endpoint={endpoint} />
@@ -172,54 +192,49 @@ function ProviderCard(props: Readonly<{ provider: AIHealthProvider }>) {
 function EndpointBlock(props: Readonly<{ endpoint: AIHealthEndpoint }>) {
   const { endpoint } = props;
   return (
-    <div style={{ marginLeft: 16, marginTop: 12 }}>
-      <div className="toolbar" style={{ alignItems: "center" }}>
+    <div style={{ marginTop: 16 }}>
+      <div className="inline-list">
         <strong>{endpoint.name}</strong>
-        <span className={aiHealthBadgeClass(endpoint.health)}>
+        <Status tone={healthTone(endpoint.health)}>
           {aiHealthLabel(endpoint.health)}
-        </span>
-        <span className="muted">{endpoint.base_url}</span>
-        <span className={endpoint.enabled ? "badge confirmed" : "badge draft"}>
-          {endpoint.enabled ? "включён" : "отключён"}
-        </span>
-        <span className={endpoint.has_api_key ? "badge confirmed" : "badge draft"}>
-          {endpoint.has_api_key ? "ключ задан" : "ключ не задан"}
-        </span>
+        </Status>
+        {!endpoint.enabled && <Tag>выключено вручную</Tag>}
+        <Tag tone={endpoint.has_api_key ? "neutral" : "warn"}>
+          {endpoint.has_api_key ? "ключ сохранён" : "ключ не задан"}
+        </Tag>
       </div>
-      <p className="muted" style={{ marginTop: 4, marginBottom: 4 }}>
-        проверено: {formatMoment(endpoint.last_checked_at)}
-        {endpoint.last_check_error_type
-          ? ` · ошибка проверки: ${endpoint.last_check_error_type}`
-          : ""}
-        {endpoint.last_call_at
-          ? ` · последний вызов: ${formatMoment(endpoint.last_call_at)}`
-          : ""}
-        {endpoint.last_call_error_type
-          ? ` · ошибка вызова: ${endpoint.last_call_error_type}`
-          : ""}
+
+      <p className="field-hint" style={{ margin: "6px 0" }}>
+        Проверяли: {moment(endpoint.last_checked_at)}
+        {endpoint.last_check_error_type &&
+          ` · ошибка проверки: ${endpoint.last_check_error_type}`}
+        {endpoint.last_call_at &&
+          ` · последнее обращение: ${moment(endpoint.last_call_at)}`}
+        {endpoint.last_call_error_type &&
+          ` · ошибка обращения: ${endpoint.last_call_error_type}`}
       </p>
-      {endpoint.reason && <p className="muted">{endpoint.reason}</p>}
+      {endpoint.reason && <p className="field-hint">{endpoint.reason}</p>}
 
       {endpoint.models.length === 0 ? (
-        <p className="muted">Моделей нет.</p>
+        <p className="field-hint">Моделей не добавлено.</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Модель</th>
-              <th>Идентификатор</th>
-              <th>Конфигурация</th>
-              <th>Доступность</th>
-              <th>Используется задачами</th>
-              <th>Причина</th>
-            </tr>
-          </thead>
-          <tbody>
-            {endpoint.models.map((model) => (
-              <ModelRow key={model.id ?? model.model_id} model={model} />
-            ))}
-          </tbody>
-        </table>
+        <div className="table-wrap" style={{ marginTop: 10 }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Модель</th>
+                <th>Доступность</th>
+                <th>Используется</th>
+                <th>Примечание</th>
+              </tr>
+            </thead>
+            <tbody>
+              {endpoint.models.map((model) => (
+                <ModelRow key={model.id ?? model.model_id} model={model} />
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );
@@ -229,21 +244,21 @@ function ModelRow(props: Readonly<{ model: AIHealthModel }>) {
   const { model } = props;
   return (
     <tr>
-      <td>{model.display_name}</td>
-      <td className="muted">{model.model_id}</td>
       <td>
-        <span className={model.enabled ? "badge confirmed" : "badge draft"}>
-          {model.enabled ? "включена" : "отключена"}
-        </span>
+        <strong>{model.display_name}</strong>
+        <div className="field-hint">
+          <code>{model.model_id}</code>
+          {!model.enabled && " · выключена вручную"}
+        </div>
       </td>
       <td>
-        <span className={aiHealthBadgeClass(model.availability)}>
+        <Status tone={healthTone(model.availability)}>
           {aiAvailabilityLabel(model.availability)}
-        </span>
+        </Status>
       </td>
-      <td className="muted">
+      <td className="text-secondary">
         {model.tasks.length === 0
-          ? "—"
+          ? "не используется"
           : model.tasks
               .map(
                 (t) =>
@@ -253,7 +268,7 @@ function ModelRow(props: Readonly<{ model: AIHealthModel }>) {
               )
               .join("; ")}
       </td>
-      <td className="muted">{model.reason ?? "—"}</td>
+      <td className="text-secondary">{model.reason ?? "—"}</td>
     </tr>
   );
 }

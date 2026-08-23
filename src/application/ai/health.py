@@ -111,7 +111,6 @@ class ProviderHealth:
 class InfrastructureHealthReport:
     generated_at: str
     providers: list[ProviderHealth] = field(default_factory=list)
-    protocols: list[dict] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
 
 
@@ -221,9 +220,6 @@ class AIInfrastructureHealthService:
         return InfrastructureHealthReport(
             generated_at=datetime.now(timezone.utc).isoformat(),
             providers=providers,
-            protocols=[
-                {"value": p.value, "supported": p in supported} for p in AIProtocol
-            ],
             summary=self._summary(providers),
         )
 
@@ -241,26 +237,26 @@ class AIInfrastructureHealthService:
     ) -> tuple[AIHealthState, str | None]:
         """Health эндпоинта. Порядок проверок = порядок приоритета причин."""
         if not endpoint_enabled:
-            return AIHealthState.DISABLED, "Эндпоинт отключён в конфигурации"
+            return AIHealthState.DISABLED, "Подключение выключено вручную"
         if not provider_enabled:
-            return AIHealthState.DISABLED, "Провайдер отключён в конфигурации"
+            return AIHealthState.DISABLED, "Сервис выключен вручную"
         if not protocol_supported:
             return (
                 AIHealthState.UNSUPPORTED,
-                "Для протокола провайдера не зарегистрирован адаптер",
+                "Такой способ подключения система не поддерживает",
             )
         if last_test_status == AIUsageStatus.ERROR.value:
             return (
                 AIHealthState.UNAVAILABLE,
-                f"Проверка подключения завершилась ошибкой: "
+                f"Связь установить не удалось: "
                 f"{last_test_error_type or 'неизвестная ошибка'}",
             )
         if last_test_status != AIUsageStatus.SUCCESS.value:
-            return AIHealthState.NOT_TESTED, "Подключение ни разу не проверялось"
+            return AIHealthState.NOT_TESTED, "Связь ни разу не проверялась"
         if last_call and last_call.get("status") == AIUsageStatus.ERROR.value:
             return (
                 AIHealthState.DEGRADED,
-                f"Проверка подключения успешна, но последний AI-вызов упал: "
+                f"Связь есть, но последнее обращение к ИИ не удалось: "
                 f"{last_call.get('error_type') or 'неизвестная ошибка'}",
             )
         return AIHealthState.HEALTHY, None
@@ -278,7 +274,7 @@ class AIInfrastructureHealthService:
         состояния эндпоинта: администратор сам её выключил.
         """
         if not model_enabled:
-            return AIModelAvailability.DISABLED, "Модель отключена в конфигурации"
+            return AIModelAvailability.DISABLED, "Модель выключена вручную"
         mapping = {
             AIHealthState.DISABLED: AIModelAvailability.DISABLED,
             AIHealthState.UNSUPPORTED: AIModelAvailability.UNSUPPORTED,
@@ -301,25 +297,25 @@ class AIInfrastructureHealthService:
     ) -> tuple[AIHealthState, str | None]:
         """Агрегат по эндпоинтам: хотя бы один рабочий делает провайдера рабочим."""
         if not enabled:
-            return AIHealthState.DISABLED, "Провайдер отключён в конфигурации"
+            return AIHealthState.DISABLED, "Сервис выключен вручную"
         if not protocol_supported:
             return (
                 AIHealthState.UNSUPPORTED,
-                "Для протокола провайдера не зарегистрирован адаптер",
+                "Такой способ подключения система не поддерживает",
             )
         if not endpoints:
-            return AIHealthState.NOT_TESTED, "У провайдера нет эндпоинтов"
+            return AIHealthState.NOT_TESTED, "У сервиса нет адресов подключения"
 
         states = {e.health for e in endpoints}
         if AIHealthState.HEALTHY.value in states:
             return AIHealthState.HEALTHY, None
         if AIHealthState.DEGRADED.value in states:
-            return AIHealthState.DEGRADED, "Ни один эндпоинт не отвечает стабильно"
+            return AIHealthState.DEGRADED, "Ни одно подключение не отвечает стабильно"
         if AIHealthState.UNAVAILABLE.value in states:
-            return AIHealthState.UNAVAILABLE, "Все проверки подключения провалились"
+            return AIHealthState.UNAVAILABLE, "Связь не удалось установить ни по одному адресу"
         if AIHealthState.NOT_TESTED.value in states:
-            return AIHealthState.NOT_TESTED, "Подключение ни разу не проверялось"
-        return AIHealthState.DISABLED, "Все эндпоинты отключены"
+            return AIHealthState.NOT_TESTED, "Связь ни разу не проверялась"
+        return AIHealthState.DISABLED, "Все подключения выключены"
 
     # --- Вспомогательное ----------------------------------------------------------
 

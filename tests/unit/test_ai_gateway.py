@@ -20,12 +20,14 @@ from src.domain.ai.enums import AIProtocol, AITaskType
 from src.domain.ai.errors import (
     AIConfigurationError,
     AIProviderError,
+    AIUnsupportedProtocolError,
 )
 from src.domain.ai.gateway import AIMessage, AIRequest
 from src.infrastructure.ai.adapters import (
     AdapterRequest,
     AdapterResult,
     AIProviderAdapter,
+    DiscoveredModel,
     EndpointConnection,
     ProviderAdapterRegistry,
 )
@@ -369,3 +371,90 @@ async def test_connection_test_unknown_endpoint_raises():
     gateway, _, _ = _gateway(adapter)
     with pytest.raises(AIConfigurationError):
         await gateway.test_endpoint(999)
+
+
+# --- Список доступных моделей ---------------------------------------------------------
+#
+# Идентификаторы моделей администратор больше не переписывает из документации:
+# gateway спрашивает их у самого сервиса.
+
+
+class ListingAdapter(ScriptedAdapter):
+    """Адаптер, умеющий перечислять модели."""
+
+    def __init__(self, models: list[DiscoveredModel] | Exception) -> None:
+        super().__init__([])
+        self._models = models
+        self.connections: list[EndpointConnection] = []
+
+    async def list_models(self, connection: EndpointConnection):
+        self.connections.append(connection)
+        if isinstance(self._models, Exception):
+            raise self._models
+        return self._models
+
+
+async def test_discover_models_uses_endpoint_secret():
+    endpoint = AIEndpoint(
+        id=10,
+        provider_id=1,
+        name="E",
+        base_url="https://x.example/v1",
+        secret_reference="ref-1",
+    )
+    adapter = ListingAdapter([DiscoveredModel(model_id="m-1", display_name="m-1")])
+    gateway, _ = _test_gateway(adapter, endpoint)
+    # Секрет подставляет gateway: адаптер не знает, где он хранится.
+    await gateway._secrets.put("ref-1", REAL_SECRET)  # noqa: SLF001
+
+    models = await gateway.discover_models(10)
+
+    assert [m.model_id for m in models] == ["m-1"]
+    assert adapter.connections[0].api_key == REAL_SECRET
+    # Случайный отказ края повторяется внутри адаптера: администратор не должен
+    # видеть «список получить не удалось» там, где сервис доступен.
+    assert adapter.connections[0].max_retries >= 1
+
+
+async def test_discover_models_unknown_endpoint_raises():
+    adapter = ListingAdapter([])
+    gateway, _ = _test_gateway(
+        adapter, AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    )
+    with pytest.raises(AIConfigurationError):
+        await gateway.discover_models(999)
+
+
+async def test_probe_models_works_without_saved_endpoint():
+    """Первичная настройка: подключения ещё нет, а выбрать модель уже нужно."""
+    adapter = ListingAdapter(
+        [
+            DiscoveredModel(model_id="vendor/m-1:free", display_name="m-1"),
+            DiscoveredModel(model_id="m-2", display_name="m-2"),
+        ]
+    )
+    gateway, _ = _test_gateway(
+        adapter, AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    )
+
+    models = await gateway.probe_models(
+        protocol=AIProtocol.OPENAI_COMPATIBLE,
+        base_url="https://new.example/v1",
+        api_key=REAL_SECRET,
+    )
+
+    assert [m.model_id for m in models] == ["vendor/m-1:free", "m-2"]
+    assert adapter.connections[0].base_url == "https://new.example/v1"
+
+
+async def test_probe_models_unsupported_protocol_raises():
+    adapter = ListingAdapter([])
+    gateway, _ = _test_gateway(
+        adapter, AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    )
+    with pytest.raises(AIUnsupportedProtocolError):
+        await gateway.probe_models(
+            protocol=AIProtocol.ANTHROPIC,
+            base_url="https://new.example/v1",
+            api_key=None,
+        )

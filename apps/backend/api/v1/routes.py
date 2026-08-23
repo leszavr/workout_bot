@@ -20,13 +20,13 @@ from apps.backend.auth import (
     LoginRequest,
     TokenResponse,
     current_user,
-    env_admin_configured,
     issue_token,
     require_admin,
     require_viewer,
     verify_env_admin,
 )
 from src.application.auth.service import AdminUserError
+from src.domain.ai.errors import AIError
 from src.domain.auth import AdminRole
 from src.domain.program import WorkoutProgram
 from src.errors import ProgramGenerationError, ProgramValidationError
@@ -154,27 +154,6 @@ async def change_own_password(
         ),
         role=user.role.value,
     )
-
-
-@router.get("/auth/providers")
-async def auth_providers(
-    _: Annotated[AuthenticatedUser, Depends(current_user)],
-) -> dict:
-    """Доступные способы входа.
-
-    Внешние провайдеры (Яндекс, VK, MAX) заведены в схеме и домене, но
-    OAuth-флоу не реализованы, поэтому здесь они помечены как недоступные.
-    Интерфейс не должен предлагать неработающий способ входа.
-    """
-    return {
-        "password": True,
-        "env_admin": env_admin_configured(),
-        "external": [
-            {"provider": "yandex", "available": False},
-            {"provider": "vk", "available": False},
-            {"provider": "max", "available": False},
-        ],
-    }
 
 
 # --- Dashboard ----------------------------------------------------------------
@@ -618,6 +597,7 @@ async def list_ai_providers(_: Annotated[AuthenticatedUser, Depends(require_view
     responses={
         404: {"description": "Profile not found"},
         422: {"description": "Generation or validation failed"},
+        502: {"description": "AI service call failed"},
     },
 )
 async def generate_program(
@@ -625,7 +605,7 @@ async def generate_program(
     _: Annotated[AuthenticatedUser, Depends(require_admin)],
     body: GenerateProgramRequest | None = None,
 ) -> dict:
-    """Запуск генерации программы (deterministic или AI)."""
+    """Запуск сборки программы выбранным генератором."""
     request = body or GenerateProgramRequest()
     service = build_program_service(generator_type=request.generator)
     try:
@@ -634,6 +614,15 @@ async def generate_program(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ProgramValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AIError as exc:
+        # Сбой на стороне ИИ — не ошибка запроса. Администратор выбрал ИИ
+        # явно, поэтому молча подменять генератор нельзя: он должен увидеть
+        # причину и решить сам.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Не удалось получить ответ от ИИ: {exc}. "
+            "Программу можно собрать алгоритмом подбора.",
+        ) from exc
     return {
         "program": result.program.model_dump(mode="json"),
         "pool_stats": {

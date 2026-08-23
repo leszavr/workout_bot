@@ -27,8 +27,8 @@ from src.domain.ai.config import (
     AITaskModelBinding,
     PromptTemplate,
 )
-from src.domain.ai.enums import AIProtocol, AITaskType
-from src.domain.ai.errors import AIConfigurationError
+from src.domain.ai.enums import IMPLEMENTED_TASK_TYPES, AIProtocol, AITaskType
+from src.domain.ai.errors import AIConfigurationError, AIError
 from src.errors import ProfilePersistenceError, WorkoutBotError
 
 router = APIRouter(prefix="/api/v1/admin/ai")
@@ -60,7 +60,6 @@ class ProviderPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=100)
     slug: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9_-]+$")
-    protocol: AIProtocol | None = None
     enabled: bool | None = None
     priority: int | None = Field(default=None, ge=0, le=1000)
 
@@ -163,6 +162,33 @@ class ModelOut(BaseModel):
     supports_streaming: bool
     created_at: str | None = None
     updated_at: str | None = None
+
+
+class DiscoveredModelOut(BaseModel):
+    """Модель, предложенная самим сервисом (ещё не сохранённая)."""
+
+    model_config = ConfigDict(protected_namespaces=())
+    model_id: str
+    display_name: str
+    owned_by: str | None = None
+    # Уже добавлена на этом подключении: список должен показывать это сразу.
+    already_added: bool = False
+
+
+class ModelsBulkAdd(BaseModel):
+    """Выбранные из списка сервиса модели."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+    model_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class ModelsProbe(BaseModel):
+    """Параметры ещё не сохранённого подключения для запроса списка моделей."""
+
+    model_config = ConfigDict(extra="forbid")
+    base_url: str = Field(min_length=8, max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    protocol: AIProtocol = AIProtocol.OPENAI_COMPATIBLE
 
 
 class TaskConfigPut(BaseModel):
@@ -279,6 +305,16 @@ async def _endpoint_out(components, endpoint: AIEndpoint) -> EndpointOut:
     )
 
 
+def _display_name(model_id: str) -> str:
+    """Читаемое имя из идентификатора модели: «vendor/name:free» → «name».
+
+    Логика та же, что при разборе списка моделей сервиса: администратор
+    выбирает модели галочками, отдельного поля имени в этом сценарии нет.
+    """
+    name = model_id.split("/")[-1]
+    return name.split(":")[0] or model_id
+
+
 def _model_out(model: AIModel) -> ModelOut:
     return ModelOut(
         id=model.id or 0,
@@ -345,8 +381,6 @@ async def patch_provider(
 ) -> ProviderOut:
     components = build_ai_components()
     fields = body.model_dump(exclude_none=True)
-    if "protocol" in fields:
-        fields["protocol"] = fields["protocol"].value
     try:
         updated = await components.admin.update_provider(provider_id, actor=admin.login, **fields)
     except ProfilePersistenceError as exc:
@@ -515,6 +549,101 @@ async def create_model(
     return _model_out(created)
 
 
+@router.post("/probe-models", responses={502: {"description": "Provider call failed"}})
+async def probe_models(
+    body: ModelsProbe, _: Annotated[AuthenticatedUser, Depends(require_admin)]
+) -> dict:
+    """Список моделей по введённым адресу и ключу, до создания подключения.
+
+    Нужно на первичной настройке: модель выбирается из списка сервиса, а не
+    переписывается из документации. Переданный ключ не сохраняется.
+    """
+    components = build_ai_components()
+    try:
+        discovered = await components.gateway.probe_models(
+            protocol=body.protocol,
+            base_url=body.base_url,
+            api_key=body.api_key,
+        )
+    except AIError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Не удалось получить список моделей: {exc}",
+        ) from exc
+    items = [
+        DiscoveredModelOut(
+            model_id=m.model_id, display_name=m.display_name, owned_by=m.owned_by
+        )
+        for m in discovered
+    ]
+    return {"total": len(items), "items": items}
+
+
+@router.get("/endpoints/{endpoint_id}/available-models", responses={**_NOT_FOUND, 502: {"description": "Provider call failed"}})
+async def discover_endpoint_models(
+    endpoint_id: int, _: Annotated[AuthenticatedUser, Depends(require_admin)]
+) -> dict:
+    """Модели, которые сервис отдаёт сам (справочный запрос к провайдеру).
+
+    Ничего не сохраняет: администратор выбирает нужные и добавляет их
+    отдельным действием. Уже добавленные помечаются, чтобы список не
+    предлагал дубликаты.
+    """
+    components = build_ai_components()
+    if await components.endpoints.get(endpoint_id) is None:
+        raise HTTPException(status_code=404, detail=_ENDPOINT_NOT_FOUND)
+    try:
+        discovered = await components.gateway.discover_models(endpoint_id)
+    except AIConfigurationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AIError as exc:
+        # Сбой на стороне сервиса — не ошибка запроса администратора.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Не удалось получить список моделей: {exc}",
+        ) from exc
+
+    saved = {m.model_id for m in await components.models.list_for_endpoint(endpoint_id)}
+    items = [
+        DiscoveredModelOut(
+            model_id=m.model_id,
+            display_name=m.display_name,
+            owned_by=m.owned_by,
+            already_added=m.model_id in saved,
+        )
+        for m in discovered
+    ]
+    return {"total": len(items), "items": items}
+
+
+@router.post("/endpoints/{endpoint_id}/models/bulk", status_code=201, responses=_NOT_FOUND_CONFLICT)
+async def add_models_bulk(
+    endpoint_id: int,
+    body: ModelsBulkAdd,
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> dict:
+    """Добавляет отмеченные в списке модели одним действием."""
+    components = build_ai_components()
+    if await components.endpoints.get(endpoint_id) is None:
+        raise HTTPException(status_code=404, detail=_ENDPOINT_NOT_FOUND)
+
+    # Имя для показа выводим из идентификатора: отдельного ввода на каждую
+    # модель в списочном выборе нет, переименовать можно потом.
+    pairs = [(mid.strip(), _display_name(mid.strip())) for mid in body.model_ids if mid.strip()]
+    if not pairs:
+        raise HTTPException(status_code=422, detail="Не выбрано ни одной модели")
+    try:
+        created, skipped = await components.admin.add_models(
+            endpoint_id, pairs, actor=admin.login
+        )
+    except ProfilePersistenceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "added": [_model_out(m) for m in created],
+        "skipped": skipped,
+    }
+
+
 @router.patch("/models/{model_pk}", responses=_NOT_FOUND_CONFLICT)
 async def patch_model(
     model_pk: int,
@@ -581,12 +710,16 @@ def _task_item(task_type: AITaskType, config: AITaskConfig | None, bindings: lis
 
 @router.get("/tasks")
 async def list_tasks(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
-    """Все типы задач: существующие конфигурации + дефолты для остальных."""
+    """Задачи, которые система действительно выполняет.
+
+    Нереализованные типы наружу не выдаются: настройка, которая ни на что не
+    влияет, только путает администратора.
+    """
     components = build_ai_components()
     configs = await components.tasks.list()
     by_type = {c.task_type: c for c in configs}
     items: list[dict] = []
-    for task_type in AITaskType:
+    for task_type in sorted(IMPLEMENTED_TASK_TYPES, key=lambda t: t.value):
         config = by_type.get(task_type)
         bindings = (
             await components.tasks.list_bindings(config.id)
@@ -597,10 +730,23 @@ async def list_tasks(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -
     return {"total": len(items), "items": items}
 
 
+def _ensure_task_implemented(task_type: AITaskType) -> None:
+    """Нереализованную задачу нельзя ни читать, ни настраивать.
+
+    Иначе в системе появляется конфигурация, которую никогда никто не вызовет.
+    """
+    if task_type not in IMPLEMENTED_TASK_TYPES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Задача «{task_type.value}» системой не выполняется",
+        )
+
+
 @router.get("/tasks/{task_type}", responses=_NOT_FOUND)
 async def get_task(
     task_type: AITaskType, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> TaskConfigOut:
+    _ensure_task_implemented(task_type)
     components = build_ai_components()
     config, bindings = await components.admin.get_task(task_type)
     if config is None:
@@ -634,6 +780,7 @@ async def put_task(
     body: TaskConfigPut,
     admin: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> TaskConfigOut:
+    _ensure_task_implemented(task_type)
     components = build_ai_components()
     config = AITaskConfig(
         task_type=task_type,

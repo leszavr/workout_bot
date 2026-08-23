@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 from src.application.ai.program_context import (
@@ -44,6 +45,12 @@ AI_GENERATOR_VERSION = "ai-1.0.0"
 
 # Максимальное количество repair-попыток (не бесконечный цикл!)
 MAX_REPAIR_ATTEMPTS = 2
+
+# Предельное время всей генерации, включая повторы внутри адаптера, перебор
+# моделей и repair-запросы. Без общего бюджета таймауты перемножаются
+# (попытки × таймаут × repair) и запрос «висит» минутами: администратор в
+# интерфейсе видит зависание вместо понятного отказа.
+DEFAULT_TOTAL_BUDGET_SECONDS = 240
 
 # Путь к файлам промптов (fallback, если в БД нет)
 PROMPTS_DIR = Path(__file__).parent.parent.parent.parent / "prompts" / "program_generator"
@@ -134,11 +141,13 @@ class AIProgramGenerator:
         prompt_loader: PromptLoader,
         validator: ProgramValidator | None = None,
         max_repair_attempts: int = MAX_REPAIR_ATTEMPTS,
+        total_budget_seconds: int = DEFAULT_TOTAL_BUDGET_SECONDS,
     ) -> None:
         self._gateway = gateway
         self._prompts = prompt_loader
         self._validator = validator or ProgramValidator()
         self._max_repair_attempts = max_repair_attempts
+        self._total_budget_seconds = total_budget_seconds
 
     async def generate(
         self,
@@ -147,6 +156,8 @@ class AIProgramGenerator:
         prompt_version: int | None = None,
     ) -> WorkoutProgram:
         """Генерирует программу через AI с валидацией и repair."""
+        deadline = time.monotonic() + self._total_budget_seconds
+
         # 1. Создаём минимизированный контекст (без персональных данных)
         context = build_generation_context(profile, pool)
 
@@ -179,7 +190,7 @@ class AIProgramGenerator:
 
         # 5. Парсим и валидируем
         program = await self._parse_and_validate(
-            response, context, pool, profile, actual_version
+            response, context, pool, profile, actual_version, deadline
         )
 
         # 6. Заполняем AI-метаданные
@@ -199,6 +210,7 @@ class AIProgramGenerator:
         pool: SafeExercisePool,
         profile: FitnessProfile,
         prompt_version: int,
+        deadline: float | None = None,
     ) -> WorkoutProgram:
         """Парсинг JSON + валидация + repair при ошибках."""
         parser = AIOutputParser()
@@ -244,6 +256,18 @@ class AIProgramGenerator:
                         str(exc),
                     )
                     raise
+
+                # Исправлять ответ имеет смысл только если на это осталось
+                # время: иначе администратор ждёт заведомо безнадёжный запрос.
+                if deadline is not None and time.monotonic() >= deadline:
+                    logger.error(
+                        "Время на AI-генерацию исчерпано, исправление не запрашивается: %s",
+                        str(exc),
+                    )
+                    raise ProgramGenerationError(
+                        f"Отведённое время на генерацию через ИИ исчерпано. "
+                        f"Последняя ошибка: {exc}"
+                    ) from exc
 
                 # Repair attempt
                 logger.warning(

@@ -52,7 +52,17 @@ function parseErrorBody(status: number, body: string): ApiError {
   return new ApiError(status, body);
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Предел ожидания ответа. Без него сборка программы через ИИ выглядит как
+// зависший интерфейс: кнопка крутится, пока сервер перебирает попытки.
+const DEFAULT_TIMEOUT_MS = 30_000;
+// Сборка программы идёт дольше обычного запроса: ИИ пишет ответ минуты.
+const LONG_TIMEOUT_MS = 300_000;
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
+): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(init?.headers as Record<string, string>),
@@ -60,7 +70,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: "no-store" });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (controller.signal.aborted) {
+      throw new ApiError(
+        408,
+        `Сервер не ответил за ${Math.round(timeoutMs / 1000)} с. Повторите попытку.`
+      );
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (response.status === 401) {
     clearToken();
@@ -120,23 +150,10 @@ export interface AdminUserItem {
   updated_at: string | null;
 }
 
-export interface AdminIdentityItem {
-  id: number;
-  provider: string;
-  provider_user_id: string;
-  created_at: string | null;
-}
-
 export interface PasswordResetResult {
   login: string;
   temporary_password: string;
   must_change_password: boolean;
-}
-
-export interface AuthProvidersInfo {
-  password: boolean;
-  env_admin: boolean;
-  external: Array<{ provider: string; available: boolean }>;
 }
 
 export async function login(
@@ -157,7 +174,6 @@ export async function login(
 
 export const authApi = {
   me: () => request<CurrentUser>("/api/v1/auth/me"),
-  providers: () => request<AuthProvidersInfo>("/api/v1/auth/providers"),
   changePassword: async (currentPassword: string, newPassword: string) => {
     const body = await request<{ access_token: string; role: string }>(
       "/api/v1/auth/change-password",
@@ -191,22 +207,6 @@ export const usersApi = {
   resetPassword: (id: number) =>
     request<PasswordResetResult>(`/api/v1/admin/users/${id}/reset-password`, {
       method: "POST",
-    }),
-  identities: (id: number) =>
-    request<ListResponse<AdminIdentityItem>>(
-      `/api/v1/admin/users/${id}/identities`
-    ),
-  linkIdentity: (id: number, provider: string, providerUserId: string) =>
-    request<AdminIdentityItem>(`/api/v1/admin/users/${id}/identities`, {
-      method: "POST",
-      body: JSON.stringify({
-        provider,
-        provider_user_id: providerUserId,
-      }),
-    }),
-  unlinkIdentity: (userId: number, identityId: number) =>
-    request<void>(`/api/v1/admin/users/${userId}/identities/${identityId}`, {
-      method: "DELETE",
     }),
 };
 
@@ -424,6 +424,13 @@ export interface AIModelItem {
   updated_at: string | null;
 }
 
+export interface AIDiscoveredModel {
+  model_id: string;
+  display_name: string;
+  owned_by: string | null;
+  already_added: boolean;
+}
+
 export interface AITaskBinding {
   id: number;
   task_config_id: number;
@@ -482,7 +489,6 @@ export interface AIReadinessReport {
   ready: boolean;
   checks: AIReadinessCheck[];
   chain: AIReadinessChainEntry[];
-  protocols: Array<{ value: string; supported: boolean }>;
   generation: {
     primary_generator: string;
     fallback_generator: string;
@@ -579,7 +585,6 @@ export interface AIHealthProvider {
 export interface AIInfrastructureHealth {
   generated_at: string;
   providers: AIHealthProvider[];
-  protocols: Array<{ value: string; supported: boolean }>;
   summary: {
     providers_total: number;
     providers_healthy: number;
@@ -648,9 +653,11 @@ export const aiApi = {
       { method: "PUT", body: JSON.stringify({ api_key: apiKey }) }
     ),
   testEndpoint: (id: number) =>
-    request<AIEndpointTestResult>(`/api/v1/admin/ai/endpoints/${id}/test`, {
-      method: "POST",
-    }),
+    request<AIEndpointTestResult>(
+      `/api/v1/admin/ai/endpoints/${id}/test`,
+      { method: "POST" },
+      60_000
+    ),
   models: (endpointId: number) =>
     request<ListResponse<AIModelItem>>(
       `/api/v1/admin/ai/endpoints/${endpointId}/models`
@@ -660,6 +667,29 @@ export const aiApi = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  // Список моделей приходит от самого сервиса: запрос уходит наружу, поэтому
+  // ждём дольше обычного.
+  availableModels: (endpointId: number) =>
+    request<ListResponse<AIDiscoveredModel>>(
+      `/api/v1/admin/ai/endpoints/${endpointId}/available-models`,
+      undefined,
+      60_000
+    ),
+  addModelsBulk: (endpointId: number, modelIds: string[]) =>
+    request<{ added: AIModelItem[]; skipped: string[] }>(
+      `/api/v1/admin/ai/endpoints/${endpointId}/models/bulk`,
+      { method: "POST", body: JSON.stringify({ model_ids: modelIds }) }
+    ),
+  // Список моделей по введённым адресу и ключу, до создания подключения.
+  probeModels: (baseUrl: string, apiKey?: string) =>
+    request<ListResponse<AIDiscoveredModel>>(
+      "/api/v1/admin/ai/probe-models",
+      {
+        method: "POST",
+        body: JSON.stringify({ base_url: baseUrl, api_key: apiKey || null }),
+      },
+      60_000
+    ),
   patchModel: (id: number, body: Record<string, unknown>) =>
     request<AIModelItem>(`/api/v1/admin/ai/models/${id}`, {
       method: "PATCH",
@@ -755,10 +785,11 @@ export const api = {
   profilePrograms: (profileId: string) =>
     request<ListResponse<ProgramListItem>>(`/api/v1/profiles/${profileId}/programs`),
   generateProgram: (profileId: string, generator: "deterministic" | "ai" = "deterministic") =>
-    request<GenerateResponse>(`/api/v1/profiles/${profileId}/programs/generate`, {
-      method: "POST",
-      body: JSON.stringify({ generator }),
-    }),
+    request<GenerateResponse>(
+      `/api/v1/profiles/${profileId}/programs/generate`,
+      { method: "POST", body: JSON.stringify({ generator }) },
+      LONG_TIMEOUT_MS
+    ),
   aiProviders: () =>
     request<ListResponse<AIProviderForUI>>("/api/v1/ai/providers"),
 };

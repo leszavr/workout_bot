@@ -1,13 +1,14 @@
 "use client";
 
-// Журнал fallback: отвечает на эксплуатационный вопрос «почему программа
-// сгенерирована детерминированным генератором, хотя AI включён?».
+// Почему программа собрана без ИИ.
 //
-// Данные приходят из существующего журнала событий AI-контура
-// (GET /admin/ai/fallback-events) — отдельной подсистемы под это нет.
+// Отвечает на эксплуатационный вопрос: «ИИ включён, а программа
+// алгоритмическая — почему?». Различает два случая: до ИИ дело не дошло
+// (настройка) и обращение было, но не удалось.
 
 import { useCallback, useEffect, useState } from "react";
 
+import { Card, Empty, Skeleton, Status, Tag, moment } from "@/components/ui/Primitives";
 import { AIFallbackEventItem, aiApi } from "@/lib/api";
 import { aiFallbackReasonLabel, generatorLabel } from "@/lib/labels";
 
@@ -22,8 +23,7 @@ export default function AIFallbackEvents(props: Readonly<{
 
   const load = useCallback(async () => {
     try {
-      const data = await aiApi.fallbackEvents();
-      setItems(data.items);
+      setItems((await aiApi.fallbackEvents()).items);
       setFailure("");
     } catch (e) {
       setFailure((e as Error).message);
@@ -37,75 +37,76 @@ export default function AIFallbackEvents(props: Readonly<{
   }, [load, reloadKey]);
 
   return (
-    <div className="card">
-      <div className="toolbar" style={{ alignItems: "center" }}>
-        <h2 className="section-title" style={{ marginTop: 0, marginBottom: 0 }}>
-          Почему AI не сработал (fallback)
-        </h2>
-        <button type="button" onClick={() => load()} disabled={loading}>
+    <Card
+      title="Программы, собранные без ИИ"
+      description="«Обращались к ИИ: нет» — настройка была нерабочей, запрос не отправляли. «Да» — запрос ушёл, но ответа не получили."
+      actions={
+        <button
+          type="button"
+          className="small"
+          onClick={() => load()}
+          disabled={loading}
+        >
           Обновить
         </button>
-      </div>
-      <p className="muted" style={{ marginTop: 0 }}>
-        «AI не вызывался» — конфигурация была заведомо нерабочей, запрос не
-        отправлялся. «AI вызывался» — попытка была и завершилась ошибкой.
-      </p>
-
-      {loading && <p className="muted">Загрузка журнала...</p>}
+      }
+    >
+      {loading && <Skeleton rows={2} />}
       {failure && <div className="error">Не удалось загрузить журнал: {failure}</div>}
 
       {!loading && !failure && items.length === 0 && (
-        <p className="muted">
-          Fallback не происходил: программы генерировались запрошенным генератором.
-        </p>
+        <Empty
+          title="Таких случаев не было"
+          hint="Все программы собирались тем генератором, который запрашивала система."
+        />
       )}
 
       {items.length > 0 && (
-        <table>
-          <thead>
-            <tr>
-              <th>Время</th>
-              <th>Запрошен</th>
-              <th>Фактически</th>
-              <th>Причина</th>
-              <th>AI вызывался</th>
-              <th>Детали</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((item) => (
-              <tr key={item.id}>
-                <td className="muted">
-                  {item.created_at
-                    ? new Date(item.created_at).toLocaleString("ru-RU")
-                    : "—"}
-                </td>
-                <td>
-                  {item.metadata.requested_generator
-                    ? generatorLabel(item.metadata.requested_generator)
-                    : "—"}
-                </td>
-                <td>
-                  {item.metadata.actual_generator
-                    ? generatorLabel(item.metadata.actual_generator)
-                    : "—"}
-                </td>
-                <td>
-                  <span className="badge draft">
-                    {item.metadata.reason_code
-                      ? aiFallbackReasonLabel(item.metadata.reason_code)
-                      : "неизвестно"}
-                  </span>
-                </td>
-                <td className="muted">
-                  {item.metadata.ai_attempted ? "да" : "нет"}
-                </td>
-                <td className="muted">{item.metadata.detail ?? "—"}</td>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Когда</th>
+                <th>Запрашивали</th>
+                <th>Собрал</th>
+                <th>Причина</th>
+                <th>Обращались к ИИ</th>
+                <th>Подробности</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {items.map((item) => (
+                <tr key={item.id}>
+                  <td className="text-secondary">{moment(item.created_at)}</td>
+                  <td>
+                    {item.metadata.requested_generator
+                      ? generatorLabel(item.metadata.requested_generator)
+                      : "—"}
+                  </td>
+                  <td>
+                    {item.metadata.actual_generator
+                      ? generatorLabel(item.metadata.actual_generator)
+                      : "—"}
+                  </td>
+                  <td>
+                    <Status tone="warn">
+                      {item.metadata.reason_code
+                        ? aiFallbackReasonLabel(item.metadata.reason_code)
+                        : "причина неизвестна"}
+                    </Status>
+                  </td>
+                  <td>
+                    <Tag tone={item.metadata.ai_attempted ? "info" : "neutral"}>
+                      {item.metadata.ai_attempted ? "да" : "нет"}
+                    </Tag>
+                  </td>
+                  <td className="text-secondary">{item.metadata.detail ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
-    </div>
+    </Card>
   );
 }

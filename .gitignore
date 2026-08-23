@@ -25,5 +25,7 @@ data/*
 # Next.js frontend
 apps/web/node_modules/
 apps/web/.next/
+apps/web/.next-check/
 apps/web/.env.local
 apps/web/next-env.d.ts
+apps/web/tsconfig.tsbuildinfo

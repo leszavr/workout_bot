@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 import apps.backend.auth as auth_module
 from apps.backend.main import app
@@ -118,6 +118,54 @@ def _token(client: TestClient, login: str, password: str) -> str:
     return response.json()["access_token"]
 
 
+@pytest.fixture
+async def sole_database_admin():
+    """Гарантирует, что кроме тестовых в БД нет активных администраторов.
+
+    Защита «нельзя понизить последнего администратора» считает всех активных
+    админов в базе. В общей базе разработки живут посторонние учётные записи
+    (их создаёт обычная работа с интерфейсом), поэтому тестовый админ
+    последним не оказывается и проверка не срабатывает — тест падал не из-за
+    кода, а из-за состояния базы.
+
+    Посторонние записи не удаляются: они временно деактивируются и
+    восстанавливаются после теста, даже если тест упал.
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine(DATABASE_URL)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _set_active(user_ids: list[int], active: bool) -> None:
+        if not user_ids:
+            return
+        async with sessions() as session:
+            async with session.begin():
+                await session.execute(
+                    update(AdminUserRow)
+                    .where(AdminUserRow.id.in_(user_ids))
+                    .values(is_active=active)
+                )
+
+    async with sessions() as session:
+        foreign_ids = (
+            await session.execute(
+                select(AdminUserRow.id).where(
+                    AdminUserRow.role == "admin",
+                    AdminUserRow.is_active.is_(True),
+                    AdminUserRow.login.not_like(f"{PREFIX}%"),
+                )
+            )
+        ).scalars().all()
+
+    await _set_active(list(foreign_ids), False)
+    try:
+        yield
+    finally:
+        await _set_active(list(foreign_ids), True)
+        await engine.dispose()
+
+
 def _headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
@@ -208,16 +256,6 @@ def test_auth_endpoints_require_token(client: TestClient):
     assert client.get("/api/v1/auth/me").status_code == 401
     assert client.get("/api/v1/admin/users").status_code == 401
 
-
-def test_auth_providers_reports_external_as_unavailable(
-    client: TestClient, admin_headers: dict
-):
-    """Интерфейс не должен предлагать неработающий способ входа."""
-    body = client.get("/api/v1/auth/providers", headers=admin_headers).json()
-
-    assert body["password"] is True
-    providers = {p["provider"]: p["available"] for p in body["external"]}
-    assert providers == {"yandex": False, "vk": False, "max": False}
 
 
 # --- CRUD -------------------------------------------------------------------------
@@ -549,7 +587,9 @@ def test_cannot_delete_own_account(client: TestClient, admin_headers: dict):
     assert "собственную" in response.json()["detail"]
 
 
-def test_cannot_demote_last_database_admin(client: TestClient, admin_headers: dict):
+def test_cannot_demote_last_database_admin(
+    client: TestClient, admin_headers: dict, sole_database_admin
+):
     """Единственный админ в БД не может понизить себя до viewer."""
     user = _create_user(client, admin_headers, login=f"{PREFIX}-only", role="admin")
     token = _token(client, f"{PREFIX}-only", STRONG_PASSWORD)
@@ -564,6 +604,112 @@ def test_cannot_demote_last_database_admin(client: TestClient, admin_headers: di
     assert "администратор" in response.json()["detail"]
 
 
+def test_cannot_deactivate_last_database_admin(
+    client: TestClient, admin_headers: dict, sole_database_admin
+):
+    """Отключение последнего администратора тоже заперло бы систему."""
+    user = _create_user(client, admin_headers, login=f"{PREFIX}-onlyoff", role="admin")
+
+    response = client.patch(
+        f"/api/v1/admin/users/{user['id']}",
+        headers=admin_headers,
+        json={"is_active": False},
+    )
+
+    assert response.status_code == 409
+    assert "администратор" in response.json()["detail"]
+
+
+def test_cannot_delete_last_database_admin(
+    client: TestClient, admin_headers: dict, sole_database_admin
+):
+    """Удаление последнего администратора запрещено на сервере."""
+    user = _create_user(client, admin_headers, login=f"{PREFIX}-onlydel", role="admin")
+
+    response = client.delete(
+        f"/api/v1/admin/users/{user['id']}", headers=admin_headers
+    )
+
+    assert response.status_code == 409
+    assert "администратор" in response.json()["detail"]
+
+
+def test_adding_users_does_not_break_admin_protection(
+    client: TestClient, admin_headers: dict, sole_database_admin
+):
+    """Состав пользователей меняется — защита продолжает работать по факту.
+
+    Проверяется весь путь: последнего админа понизить нельзя, после появления
+    второго — можно, а когда второй остаётся единственным, запрет включается
+    снова уже для него.
+    """
+    first = _create_user(client, admin_headers, login=f"{PREFIX}-flow1", role="admin")
+    blocked = client.patch(
+        f"/api/v1/admin/users/{first['id']}",
+        headers=admin_headers,
+        json={"role": "viewer"},
+    )
+    assert blocked.status_code == 409
+
+    second = _create_user(client, admin_headers, login=f"{PREFIX}-flow2", role="admin")
+    allowed = client.patch(
+        f"/api/v1/admin/users/{first['id']}",
+        headers=admin_headers,
+        json={"role": "viewer"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["role"] == "viewer"
+
+    # Теперь единственный админ — второй, и запрет распространяется на него.
+    blocked_again = client.patch(
+        f"/api/v1/admin/users/{second['id']}",
+        headers=admin_headers,
+        json={"role": "viewer"},
+    )
+    assert blocked_again.status_code == 409
+
+
+def test_viewer_users_do_not_count_as_admin_protection(
+    client: TestClient, admin_headers: dict, sole_database_admin
+):
+    """Наблюдатели не защищают от потери админского доступа."""
+    admin = _create_user(client, admin_headers, login=f"{PREFIX}-cnt-a", role="admin")
+    _create_user(client, admin_headers, login=f"{PREFIX}-cnt-v1", role="viewer")
+    _create_user(client, admin_headers, login=f"{PREFIX}-cnt-v2", role="viewer")
+
+    response = client.patch(
+        f"/api/v1/admin/users/{admin['id']}",
+        headers=admin_headers,
+        json={"role": "viewer"},
+    )
+
+    assert response.status_code == 409
+
+
+def test_disabled_admin_does_not_count_as_protection_via_api(
+    client: TestClient, admin_headers: dict, sole_database_admin
+):
+    """Отключённый администратор не является доступом."""
+    active = _create_user(client, admin_headers, login=f"{PREFIX}-act", role="admin")
+    disabled = _create_user(client, admin_headers, login=f"{PREFIX}-dis", role="admin")
+    assert (
+        client.patch(
+            f"/api/v1/admin/users/{disabled['id']}",
+            headers=admin_headers,
+            json={"is_active": False},
+        ).status_code
+        == 200
+    )
+
+    response = client.patch(
+        f"/api/v1/admin/users/{active['id']}",
+        headers=admin_headers,
+        json={"role": "viewer"},
+    )
+
+    assert response.status_code == 409
+
+
 def test_second_admin_allows_demotion(client: TestClient, admin_headers: dict):
     first = _create_user(client, admin_headers, login=f"{PREFIX}-a1", role="admin")
     _create_user(client, admin_headers, login=f"{PREFIX}-a2", role="admin")
@@ -576,71 +722,3 @@ def test_second_admin_allows_demotion(client: TestClient, admin_headers: dict):
 
     assert response.status_code == 200
     assert response.json()["role"] == "viewer"
-
-
-# --- Внешние идентичности --------------------------------------------------------------
-
-
-def test_identity_can_be_linked_and_unlinked(client: TestClient, admin_headers: dict):
-    """Задел под Яндекс/VK/MAX: привязка работает на уровне данных."""
-    user = _create_user(client, admin_headers, login=f"{PREFIX}-ident")
-
-    linked = client.post(
-        f"/api/v1/admin/users/{user['id']}/identities",
-        headers=admin_headers,
-        json={"provider": "yandex", "provider_user_id": "ya-account-1"},
-    )
-    assert linked.status_code == 201
-    assert linked.json()["provider"] == "yandex"
-
-    listing = client.get(
-        f"/api/v1/admin/users/{user['id']}/identities", headers=admin_headers
-    )
-    assert listing.json()["total"] == 1
-
-    assert (
-        client.delete(
-            f"/api/v1/admin/users/{user['id']}/identities/{linked.json()['id']}",
-            headers=admin_headers,
-        ).status_code
-        == 204
-    )
-
-
-def test_same_provider_account_cannot_be_linked_twice(
-    client: TestClient, admin_headers: dict
-):
-    """Один аккаунт провайдера не должен давать доступ к двум пользователям."""
-    first = _create_user(client, admin_headers, login=f"{PREFIX}-i1")
-    second = _create_user(client, admin_headers, login=f"{PREFIX}-i2")
-    payload = {"provider": "vk", "provider_user_id": "vk-shared"}
-
-    assert (
-        client.post(
-            f"/api/v1/admin/users/{first['id']}/identities",
-            headers=admin_headers,
-            json=payload,
-        ).status_code
-        == 201
-    )
-    response = client.post(
-        f"/api/v1/admin/users/{second['id']}/identities",
-        headers=admin_headers,
-        json=payload,
-    )
-
-    assert response.status_code == 409
-
-
-def test_password_is_rejected_as_external_provider(
-    client: TestClient, admin_headers: dict
-):
-    user = _create_user(client, admin_headers, login=f"{PREFIX}-pwdprov")
-
-    response = client.post(
-        f"/api/v1/admin/users/{user['id']}/identities",
-        headers=admin_headers,
-        json={"provider": "password", "provider_user_id": "x"},
-    )
-
-    assert response.status_code == 400

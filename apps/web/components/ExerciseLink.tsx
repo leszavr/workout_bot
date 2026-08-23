@@ -5,13 +5,17 @@ import { useEffect, useState } from "react";
 
 import { api } from "@/lib/api";
 
-// Кэш external_id → внутренний id, чтобы не запрашивать одно упражнение дважды.
-const idCache = new Map<string, number | null>();
+// Кэш external_id → название и внутренний id: одно упражнение встречается
+// в программе несколько раз, запрашивать его повторно не нужно.
+const cache = new Map<string, { id: number; name: string } | null>();
 
 /**
- * Ссылка на карточку упражнения по каноническому external_id.
- * Программы ссылаются на external_id; карточка упражнения живёт по /exercises/{id}.
- * Компонент резолвит id один раз и рендерит обычную ссылку.
+ * Ссылка на карточку упражнения по его коду в справочнике.
+ *
+ * В программе упражнение хранится кодом вида `barbell_squat`. Показывать
+ * такой код администратору бессмысленно, поэтому компонент подставляет
+ * человеческое название, а код оставляет только как запасной вариант,
+ * если упражнения в каталоге уже нет.
  */
 export default function ExerciseLink({
   externalId,
@@ -22,30 +26,36 @@ export default function ExerciseLink({
   readonly source?: string;
   readonly children: React.ReactNode;
 }) {
-  const [internalId, setInternalId] = useState<number | null | undefined>(
-    idCache.get(externalId)
-  );
+  const [resolved, setResolved] = useState<
+    { id: number; name: string } | null | undefined
+  >(cache.get(externalId));
 
   useEffect(() => {
-    if (internalId !== undefined) return;
+    if (resolved !== undefined) return;
     let cancelled = false;
     api
       .exerciseByExternalId(externalId, source)
       .then((ex) => {
-        idCache.set(externalId, ex.id);
-        if (!cancelled) setInternalId(ex.id);
+        const entry = { id: ex.id, name: ex.name_ru || ex.name };
+        cache.set(externalId, entry);
+        if (!cancelled) setResolved(entry);
       })
       .catch(() => {
-        idCache.set(externalId, null);
-        if (!cancelled) setInternalId(null);
+        cache.set(externalId, null);
+        if (!cancelled) setResolved(null);
       });
     return () => {
       cancelled = true;
     };
-  }, [externalId, source, internalId]);
+  }, [externalId, source, resolved]);
 
-  if (internalId === undefined || internalId === null) {
-    return <span>{children}</span>;
+  if (resolved === undefined) {
+    return <span className="muted">{children}</span>;
   }
-  return <Link href={`/exercises/${internalId}`}>{children}</Link>;
+  if (resolved === null) {
+    return (
+      <span title="Упражнения больше нет в каталоге">{children}</span>
+    );
+  }
+  return <Link href={`/exercises/${resolved.id}`}>{resolved.name}</Link>;
 }

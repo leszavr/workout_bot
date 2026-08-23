@@ -157,7 +157,8 @@ class TestGenerator:
         pool = _diverse_pool()
         pool.active_restrictions = [MovementRestriction.AVOID_DEEP_KNEE_FLEXION]
         program = await generator.generate(profile, pool)
-        assert any("avoid_deep_knee_flexion" in n for n in program.safety_notes)
+        # В программе — формулировка для человека, а не код ограничения.
+        assert any("без глубокого сгибания колен" in n for n in program.safety_notes)
 
 
 class TestValidator:

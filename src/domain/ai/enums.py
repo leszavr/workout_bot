@@ -5,15 +5,29 @@ from enum import StrEnum
 
 
 class AIProtocol(StrEnum):
-    """Протокол интеграции. Модель/бренд НЕ являются типом интеграции."""
+    """Протокол интеграции. Модель/бренд НЕ являются типом интеграции.
+
+    Реализован только `openai_compatible`. Остальные значения оставлены,
+    потому что могут встречаться в уже сохранённых строках базы: убрать их
+    из enum — значит получить ошибку чтения такой записи. В интерфейсе они
+    не предлагаются, а сервер не даёт включить задачу на протоколе без
+    адаптера.
+    """
 
     OPENAI_COMPATIBLE = "openai_compatible"
-    ANTHROPIC = "anthropic"  # задел на будущее, адаптера пока нет
-    CUSTOM = "custom"  # задел на будущее, адаптера пока нет
+    ANTHROPIC = "anthropic"
+    CUSTOM = "custom"
 
 
 class AITaskType(StrEnum):
-    """Типы AI-задач. Сейчас реально используется только workout_generation."""
+    """Типы AI-задач.
+
+    Значения оставлены для совместимости с сохранёнными строками, но
+    системой поддерживается только `workout_generation` (см.
+    `IMPLEMENTED_TASK_TYPES`). Всё остальное не показывается в интерфейсе
+    и не принимается на запись: настройка, которая ни на что не влияет,
+    вредна.
+    """
 
     WORKOUT_GENERATION = "workout_generation"
     PROGRAM_ADJUSTMENT = "program_adjustment"
@@ -21,6 +35,11 @@ class AITaskType(StrEnum):
     EXERCISE_EXPLANATION = "exercise_explanation"
     USER_CHAT = "user_chat"
     FEEDBACK_ANALYSIS = "feedback_analysis"
+
+
+# Задачи, которые код действительно выполняет. Единственный источник истины
+# для API и интерфейса: остальные типы наружу не выдаются.
+IMPLEMENTED_TASK_TYPES = frozenset({AITaskType.WORKOUT_GENERATION})
 
 
 class AIUsageStatus(StrEnum):

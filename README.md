@@ -34,6 +34,17 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 
 После первого запуска выполнить миграции и импорт каталога/медиа. Подробные инструкции и проверки — в `docs/OPERATIONS.md` и `.env.example`.
 
+## Локальная разработка
+
+Окружением управляет `./workout-manager.sh`: поднимает PostgreSQL и MinIO, backend и веб-интерфейс, показывает логи и состояние.
+
+```bash
+./workout-manager.sh start     # логи в терминале, Ctrl+C останавливает службы
+./workout-manager.sh status    # что запущено и к какой базе подключён backend
+./workout-manager.sh doctor    # проверка окружения перед работой
+./workout-manager.sh help      # все команды
+```
+
 ## Основные сервисы
 
 | Сервис | Адрес |
@@ -47,7 +58,8 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 ## Тесты
 
 ```bash
-pytest
+./workout-manager.sh test        # весь набор
+./workout-manager.sh test unit   # только unit-тесты, без БД
 ```
 
-Интеграционные тесты PostgreSQL/API требуют запущенной БД и `DATABASE_URL`.
+Интеграционные тесты работают с реальной PostgreSQL и удаляют свои данные, поэтому им нужна отдельная база: адрес задаётся в `TEST_DATABASE_URL`. Запуск по рабочей базе скрипт не выполнит.
