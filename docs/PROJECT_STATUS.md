@@ -34,9 +34,7 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - token accounting и audit events;
 - Admin API/UI.
 
-**Важно:** рабочая AI-конфигурация должна быть создана отдельно. С Phase 1.1
-интерфейс `/ai` показывает, чего именно не хватает, и не даёт включить задачу
-в заведомо нерабочем состоянии.
+**Важно:** рабочая AI-конфигурация должна быть создана отдельно. С Phase 1.1 интерфейс `/ai` показывает, чего именно не хватает, и не даёт включить задачу в заведомо нерабочем состоянии.
 
 ### Этап 4 — AI Program Generator: ГОТОВО
 - минимизированный generation context без Telegram ID, имени и profile ID;
@@ -58,21 +56,16 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - rest timer в HTML.
 
 ### Phase 1.1 — AI configuration UX: ГОТОВО
-- отчёт готовности AI-задачи (`GET /api/v1/admin/ai/readiness`): чек-лист
-  шагов, эффективная цепочка моделей, фактическая стратегия генерации;
+- отчёт готовности AI-задачи (`GET /api/v1/admin/ai/readiness`): чек-лист шагов, эффективная цепочка моделей, фактическая стратегия генерации;
 - панель готовности на `/ai` (видно, будет ли AI реально вызван);
-- мастер «Быстрое подключение AI»: провайдер → эндпоинт с ключом → модель →
-  проверка подключения → включение задачи;
-- результат connection test сохраняется (`ai_endpoints.last_test_*`):
-  «не проверялось» и «проверка провалилась» — разные состояния;
-- серверный запрет включения задачи без работоспособной модели, с протоколом
-  без адаптера или с несуществующей версией промпта;
+- мастер «Быстрое подключение AI»: провайдер → эндпоинт с ключом → модель → проверка подключения → включение задачи;
+- результат connection test сохраняется (`ai_endpoints.last_test_*`): «не проверялось» и «проверка провалилась» — разные состояния;
+- серверный запрет включения задачи без работоспособной модели, с протоколом без адаптера или с несуществующей версией промпта;
 - журнал вызовов AI и журнал изменений конфигурации в UI;
 - протоколы без адаптера помечены и недоступны для выбора.
 
 ### Phase 1.1.1 — AI infrastructure management & reliability: ГОТОВО
-- readiness влияет на runtime и заведомо нерабочая AI-конфигурация сразу
-  переключается на deterministic generator;
+- readiness влияет на runtime и заведомо нерабочая AI-конфигурация сразу переключается на deterministic generator;
 - структурированные причины fallback и observability в админке;
 - динамический AI Infrastructure Health Dashboard;
 - configuration lifecycle provider/endpoint/model с safe delete;
@@ -82,32 +75,30 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - `admin_users` + `admin_identities`, scrypt-хеши, аварийный env-admin;
 - роли `admin` и `viewer`, серверная защита mutating endpoint'ов;
 - CRUD пользователей, смена своего пароля, одноразовый admin reset;
-- защита от потери доступа: нельзя понизить, отключить или удалить последнего
-  активного администратора, нельзя удалить себя;
-- критическая проверка последнего администратора атомарна и защищена
-  PostgreSQL transaction-scoped advisory lock;
-- для DB-пользователей JWT идентифицирует запись, а актуальные role/activity/
-  must_change_password читаются из БД на каждом защищённом запросе. Поэтому
-  деактивация, удаление и изменение роли действуют немедленно;
-- OAuth для Яндекс/VK/MAX подготовлен на уровне данных, но сами OAuth-флоу
-  не реализованы.
+- защита от потери доступа: нельзя понизить, отключить или удалить последнего активного администратора, нельзя удалить себя;
+- критическая проверка последнего администратора атомарна и защищена PostgreSQL transaction-scoped advisory lock;
+- для DB-пользователей JWT идентифицирует запись, а актуальные role/activity/must_change_password читаются из БД на каждом защищённом запросе. Поэтому деактивация, удаление и изменение роли действуют немедленно;
+- OAuth для Яндекс/VK/MAX подготовлен на уровне данных, но сами OAuth-флоу не реализованы.
+
+## Post-merge sanity audit — 23.08.2026
+
+После merge PR #5 `main` прошёл post-merge sanity audit:
+- финальный CI перед merge: backend, migrations и frontend — SUCCESS;
+- миграции проверены в цикле head → base → head;
+- acceptance fixes из PR #6 вошли в PR #5 до merge;
+- `PROJECT_STATUS.md` и `DEVELOPMENT_ROADMAP.md` синхронизированы с фактическим состоянием;
+- Issues #7 и #8 относились к промежуточным падениям CI и закрыты после исправлений.
 
 ## Открытые проблемы и риски
 
 ### P0 — до реального production
-1. Production hardening: Redis/устойчивое FSM storage, централизованные логи,
-   error tracking/metrics, backup/restore, rate limits и эксплуатационные процедуры.
+1. Production hardening: Redis/устойчивое FSM storage, централизованные логи, error tracking/metrics, backup/restore, rate limits и эксплуатационные процедуры.
 2. **Нет rate limiting на вход в админку** — перебор пароля остаётся задачей Phase 1.3.
-3. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа,
-   AI primary, deterministic fallback, delivery failure/retry.
+3. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа, AI primary, deterministic fallback, delivery failure/retry.
 4. Проверка безопасности production-конфигурации и секретов.
-5. Веб-кнопка `Generate Program` пока идёт по отдельному пути через
-   `ProgramService` без fallback/gate; требуется единая точка генерации через
-   `ProgramGenerationOrchestrator` (Phase 1.2).
-6. Часть интеграционных тестов требует каталога упражнений; CI засеивает его
-   автоматически.
-7. `alembic check` сообщает о косметическом расхождении ORM-моделей и миграций
-   (`unique=True` против UniqueConstraint); это существовало до текущего этапа.
+5. Веб-кнопка `Generate Program` пока идёт по отдельному пути через `ProgramService` без fallback/gate; требуется единая точка генерации через `ProgramGenerationOrchestrator` (Phase 1.2).
+6. Часть интеграционных тестов требует каталога упражнений; CI засеивает его автоматически.
+7. `alembic check` сообщает о косметическом расхождении ORM-моделей и миграций (`unique=True` против UniqueConstraint); это существовало до текущего этапа.
 
 ### P1 — продуктовый цикл
 - повторная/явная генерация и удобный статус программы;
@@ -133,7 +124,5 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 ## Следующий приоритет
 
-Phase 1.2: устойчивое FSM storage, restart/recovery, единая точка генерации,
-формальная generation/delivery status model и E2E idempotency/retry acceptance.
-Затем Phase 1.3: operations/security. Подробный порядок —
-`DEVELOPMENT_ROADMAP.md`.
+Phase 1.2: устойчивое FSM storage, restart/recovery, единая точка генерации, формальная generation/delivery status model и E2E idempotency/retry acceptance.
+Затем Phase 1.3: operations/security. Подробный порядок — `DEVELOPMENT_ROADMAP.md`.
