@@ -32,6 +32,22 @@ def client():
         yield c
 
 
+@pytest.fixture(scope="module", autouse=True)
+def reset_engine_after_module():
+    """Сбрасывает глобальный engine после модуля.
+
+    TestClient держит свой event loop и закрывает его при выходе, а engine —
+    глобальный: соединения из его пула остаются привязанными к уже закрытому
+    loop'у. Следующий модуль с TestClient берёт то же соединение и падает на
+    «attached to a different loop». Сброс синхронный: закрывать соединения
+    здесь уже нечем, поэтому состояние просто обнуляется.
+    """
+    yield
+    from src.infrastructure.persistence.postgres.db import reset_engine_state
+
+    reset_engine_state()
+
+
 @pytest.fixture(autouse=True)
 async def cleanup():
     from sqlalchemy import delete, select
