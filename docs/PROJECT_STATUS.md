@@ -89,6 +89,23 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - `PROJECT_STATUS.md` и `DEVELOPMENT_ROADMAP.md` синхронизированы с фактическим состоянием;
 - Issues #7 и #8 относились к промежуточным падениям CI и закрыты после исправлений.
 
+## Phase 1.2 — Reliability: DESIGN BASELINE APPROVED
+
+23.08.2026 зафиксирован архитектурный design review в `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`.
+
+Целевой runtime: Persistent FSM → Finalization → Generation Job → AI/Deterministic → Validation → persisted Program → Delivery Job → Telegram. PostgreSQL остаётся source of truth для бизнес-состояния, Redis используется для устойчивого runtime/transient state.
+
+Ключевые решения:
+- generation и delivery — отдельные persistent операции;
+- единый `ProgramGenerationOrchestrator` для Telegram и Admin API;
+- idempotency boundary для генерации и доставки;
+- централизованные retry/recovery правила;
+- stale `RUNNING` jobs должны восстанавливаться после restart/crash;
+- веб-кнопка Generate Program должна использовать тот же orchestration path;
+- Phase 1.2 разбита на 1.2-A…1.2-G: FSM, generation state, orchestrator, worker/retry/recovery, delivery, admin visibility, E2E acceptance.
+
+**Следующий рабочий этап:** Phase 1.2-A — Persistent FSM.
+
 ## Открытые проблемы и риски
 
 ### P0 — до реального production
@@ -124,5 +141,4 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 ## Следующий приоритет
 
-Phase 1.2: устойчивое FSM storage, restart/recovery, единая точка генерации, формальная generation/delivery status model и E2E idempotency/retry acceptance.
-Затем Phase 1.3: operations/security. Подробный порядок — `DEVELOPMENT_ROADMAP.md`.
+Phase 1.2-A: Persistent FSM. Подробный design baseline — `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`; порядок дальнейших работ — `DEVELOPMENT_ROADMAP.md`.
