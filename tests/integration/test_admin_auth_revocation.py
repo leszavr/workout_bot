@@ -75,6 +75,9 @@ def _create(client: TestClient, admin_token: str, login: str, role: str = "admin
 
 def test_deactivation_revokes_existing_token_immediately(client: TestClient):
     env_token = _login(client, ENV_LOGIN, ENV_PASSWORD)
+    # Env-admin is an emergency account and has no row in admin_users. Create a
+    # second DB admin so the target admin is not the last DB admin.
+    _create(client, env_token, f"{PREFIX}-keeper")
     user = _create(client, env_token, f"{PREFIX}-disabled")
     user_token = _login(client, user["login"], USER_PASSWORD)
 
@@ -94,6 +97,7 @@ def test_deactivation_revokes_existing_token_immediately(client: TestClient):
 
 def test_role_demotion_revokes_existing_write_privilege_immediately(client: TestClient):
     env_token = _login(client, ENV_LOGIN, ENV_PASSWORD)
+    _create(client, env_token, f"{PREFIX}-keeper")
     user = _create(client, env_token, f"{PREFIX}-demoted")
     user_token = _login(client, user["login"], USER_PASSWORD)
 
