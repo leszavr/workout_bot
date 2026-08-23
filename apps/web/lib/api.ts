@@ -20,10 +20,36 @@ export function clearToken(): void {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  // Заполняется для 409 при удалении: что именно блокирует операцию.
+  blockers?: AIDeleteBlocker[];
+  constructor(status: number, message: string, blockers?: AIDeleteBlocker[]) {
     super(message);
     this.status = status;
+    this.blockers = blockers;
   }
+}
+
+// FastAPI отдаёт ошибку в поле detail: строкой либо объектом с блокерами.
+// Без разбора UI показал бы пользователю сырой JSON.
+function parseErrorBody(status: number, body: string): ApiError {
+  if (!body) return new ApiError(status, `Ошибка ${status}`);
+  try {
+    const parsed = JSON.parse(body) as {
+      detail?: string | { message?: string; blockers?: AIDeleteBlocker[] };
+    };
+    const detail = parsed.detail;
+    if (typeof detail === "string") return new ApiError(status, detail);
+    if (detail && typeof detail === "object") {
+      return new ApiError(
+        status,
+        detail.message || `Ошибка ${status}`,
+        detail.blockers
+      );
+    }
+  } catch {
+    // Не JSON — показываем тело как есть.
+  }
+  return new ApiError(status, body);
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -43,8 +69,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw new ApiError(response.status, detail || `Ошибка ${response.status}`);
+    throw parseErrorBody(response.status, detail);
   }
+  // 204 No Content: тела нет, парсить нечего.
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
@@ -310,6 +338,7 @@ export interface AIReadinessCheck {
   detail: string;
   action: string | null;
   blocking: boolean;
+  reason_code: string | null;
 }
 
 export interface AIReadinessChainEntry {
@@ -368,6 +397,92 @@ export interface AIPromptItem {
   name: string;
   enabled: boolean;
   created_at: string | null;
+}
+
+// --- Infrastructure health (Phase 1.1.1) -----------------------------------------
+// Дерево строится backend'ом из реальной конфигурации. Frontend НЕ хранит
+// собственный список провайдеров и моделей и ничего не выводит сам.
+
+export interface AIHealthTaskUsage {
+  task_type: string;
+  task_enabled: boolean;
+  is_primary: boolean;
+  priority: number;
+}
+
+export interface AIHealthModel {
+  id: number | null;
+  model_id: string;
+  display_name: string;
+  enabled: boolean;
+  availability: string;
+  reason: string | null;
+  in_active_use: boolean;
+  tasks: AIHealthTaskUsage[];
+}
+
+export interface AIHealthEndpoint {
+  id: number | null;
+  name: string;
+  base_url: string;
+  enabled: boolean;
+  has_api_key: boolean;
+  health: string;
+  reason: string | null;
+  last_checked_at: string | null;
+  last_check_status: string | null;
+  last_check_error_type: string | null;
+  last_call_at: string | null;
+  last_call_status: string | null;
+  last_call_error_type: string | null;
+  models: AIHealthModel[];
+}
+
+export interface AIHealthProvider {
+  id: number | null;
+  name: string;
+  slug: string;
+  protocol: string;
+  protocol_supported: boolean;
+  enabled: boolean;
+  health: string;
+  reason: string | null;
+  endpoints: AIHealthEndpoint[];
+}
+
+export interface AIInfrastructureHealth {
+  generated_at: string;
+  providers: AIHealthProvider[];
+  protocols: Array<{ value: string; supported: boolean }>;
+  summary: {
+    providers_total: number;
+    providers_healthy: number;
+    endpoints_total: number;
+    models_total: number;
+    models_available: number;
+    models_in_active_use: number;
+  };
+}
+
+export interface AIFallbackEventItem {
+  id: number;
+  event_type: string;
+  created_at: string | null;
+  metadata: {
+    requested_generator?: string;
+    actual_generator?: string;
+    reason_code?: string;
+    detail?: string;
+    ai_attempted?: boolean;
+  };
+}
+
+export interface AIDeleteBlocker {
+  type: string;
+  task_type?: string;
+  task_enabled?: boolean;
+  model_id?: number;
+  detail: string;
 }
 
 export const aiApi = {
@@ -438,6 +553,17 @@ export const aiApi = {
     ),
   usage: () => request<ListResponse<AIUsageItem>>("/api/v1/admin/ai/usage"),
   audit: () => request<ListResponse<AIAuditItem>>("/api/v1/admin/ai/audit"),
+  fallbackEvents: () =>
+    request<ListResponse<AIFallbackEventItem>>(
+      "/api/v1/admin/ai/fallback-events"
+    ),
+  infrastructureHealth: () =>
+    request<AIInfrastructureHealth>("/api/v1/admin/ai/infrastructure-health"),
+  refreshInfrastructureHealth: () =>
+    request<AIInfrastructureHealth>(
+      "/api/v1/admin/ai/infrastructure-health/refresh",
+      { method: "POST" }
+    ),
   prompts: (taskType = "workout_generation") =>
     request<ListResponse<AIPromptItem> & { next_version: number }>(
       `/api/v1/admin/ai/prompts/${taskType}`

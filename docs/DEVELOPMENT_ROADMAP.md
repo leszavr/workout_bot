@@ -1,6 +1,7 @@
 # Development Roadmap
 
-**Базовая точка:** завершены этапы 1–5. План строится от фактического состояния репозитория на 21.08.2026.
+**Базовая точка:** завершены этапы 1–5, Phase 1.1 и Phase 1.1.1. План строится
+от фактического состояния репозитория на 22.08.2026.
 
 ## Phase 0 — Documentation baseline: DONE
 - [x] зафиксировать архитектуру;
@@ -30,13 +31,45 @@
 проверки закрыто мастером и статусом готовности, а сервер жёстко отклоняет
 только детерминированно нерабочие конфигурации.
 
+### 1.1.1 AI infrastructure management & reliability: DONE
+- [x] readiness влияет на runtime: `AIReadinessService.runtime_gate()` перед
+      AI-попыткой; при not ready AI не вызывается вообще;
+- [x] структурированные причины fallback (`AIFallbackReason`) с разделением
+      configuration (AI не вызывался) и runtime (AI вызывался и не смог);
+      код причины хранится в программе и в журнале;
+- [x] fallback observability: `GET /api/v1/admin/ai/fallback-events` и раздел
+      в админке — видно requested/actual generator, причину и был ли вызов;
+- [x] configuration lifecycle: view/create/edit/enable/disable/safe delete для
+      provider/endpoint/model в API и UI;
+- [x] safe delete с предварительной проверкой зависимостей: 409 с
+      машиночитаемым списком блокеров, без broken references; usage/audit
+      история сохраняется, секреты удаляемых эндпоинтов вычищаются;
+- [x] AI Infrastructure Health Dashboard: дерево provider → endpoint → model →
+      задачи строится динамически из конфигурации
+      (`GET /api/v1/admin/ai/infrastructure-health` + панель на `/ai`);
+- [x] разделены configuration state, infrastructure health и model
+      availability; семантика `enabled` vs `healthy` задокументирована;
+- [x] health не требует дорогих генераций: состояние читается из сохранённого
+      connection test и журнала вызовов, активная проверка — минимальный ping
+      по кнопке (`POST …/infrastructure-health/refresh`);
+- [x] CI в GitHub Actions на PR и push в `main`: backend-тесты на реальной
+      PostgreSQL, проверка миграций (head → base → head), frontend
+      lint/typecheck/build, авто-issue при падении.
+
+**Осознанное ограничение:** фоновых периодических health-проверок нет.
+В проекте нет планировщика и воркеров, вводить их ради опроса провайдеров
+несоразмерно задаче. Автоматически обновляется дешёвое чтение состояния
+(включая результаты реальных AI-вызовов), активная проверка выполняется по
+требованию администратора.
+
 ### 1.2 Reliability
 - [ ] заменить MemoryStorage на устойчивое production storage;
 - [ ] проверить restart/recovery сценарии;
 - [ ] формализовать generation/delivery status model;
 - [ ] E2E idempotency и retry acceptance;
 - [ ] единая точка генерации: веб-кнопка «Generate Program» должна идти через
-      `ProgramGenerationOrchestrator`, а не через отдельный путь без fallback.
+      `ProgramGenerationOrchestrator`, а не через отдельный путь без fallback
+      и без readiness gate.
 
 ### 1.3 Operations and security
 - [ ] structured logging и correlation IDs;

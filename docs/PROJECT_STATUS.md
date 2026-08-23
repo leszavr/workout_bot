@@ -1,6 +1,6 @@
 # Текущий статус проекта
 
-**Дата:** 21 августа 2026
+**Дата:** 22 августа 2026
 
 ## Кратко
 
@@ -71,15 +71,54 @@ Workout Bot — модульный монолит для Telegram: пользо�
   конфигурации в UI;
 - протоколы без адаптера помечены и недоступны для выбора.
 
+### Phase 1.1.1 — AI infrastructure management & reliability: ГОТОВО
+- readiness влияет на runtime: перед AI-попыткой
+  `ProgramGenerationOrchestrator` спрашивает
+  `AIReadinessService.runtime_gate()`; при заведомо нерабочей конфигурации
+  AI-запрос не выполняется вообще и сразу работает deterministic generator;
+- причины fallback структурированы (`AIFallbackReason`) и разделены на
+  configuration (AI не вызывался) и runtime (AI вызывался и не смог);
+  код причины хранится в `GenerationInfo.fallback_reason_code`;
+- журнал fallback в админке (`GET …/ai/fallback-events`): запрошенный и
+  фактический генератор, причина, признак «AI вызывался». Отвечает на вопрос
+  «почему программа детерминированная, хотя AI включён?»;
+- AI Infrastructure Health Dashboard (`GET …/ai/infrastructure-health` +
+  панель на `/ai`): дерево provider → endpoint → model → задачи строится
+  динамически из конфигурации, собственного реестра нет ни в backend, ни во
+  frontend;
+- разделены три состояния: configuration (`enabled`), infrastructure health
+  провайдера/эндпоинта и availability модели. Provider может быть healthy при
+  disabled-модели; при недоступном провайдере модели не выглядят доступными;
+- health считается из сохранённого connection test и последнего реального
+  AI-вызова, поэтому чтение состояния дешёвое; активная проверка — только по
+  кнопке и через существующий минимальный ping, без генерации программ;
+- lifecycle: view/create/edit/enable/disable/safe delete для провайдера,
+  эндпоинта и модели в API и UI;
+- safe delete проверяет зависимости заранее и возвращает 409 с машиночитаемым
+  списком блокеров; broken references не создаются, usage/audit-история не
+  удаляется, секреты удаляемых эндпоинтов вычищаются из SecretStore;
+- CI в GitHub Actions: backend-тесты на реальной PostgreSQL с засевом
+  каталога, проверка цепочки миграций (head → base → head), frontend
+  lint/typecheck/build; при падении на PR создаётся issue `ci-failure`.
+
 ## Открытые проблемы и риски
 
 ### P0 — до реального production
 1. Production hardening: Redis/устойчивое FSM storage, централизованные логи, error tracking/metrics, backup/restore, rate limits и эксплуатационные процедуры.
 2. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа, AI primary, deterministic fallback, delivery failure/retry.
 3. Проверка безопасности production-конфигурации и секретов.
-4. Три пути генерации программы: Telegram идёт через оркестратор с fallback,
-   веб-кнопка «Generate Program» — по отдельному пути без fallback. Требуется
-   единая точка генерации (Phase 1.2).
+4. Три пути генерации программы: Telegram идёт через оркестратор с fallback и
+   readiness gate, веб-кнопка «Generate Program» — по отдельному пути через
+   `ProgramService` без fallback и без gate. Требуется единая точка генерации
+   (Phase 1.2).
+5. Часть интеграционных тестов требует наполненного каталога упражнений из
+   внешнего репозитория `leszavr/workout`: на пустой базе они падают, а не
+   пропускаются. В CI каталог засевается явным шагом; локально это нужно
+   делать вручную.
+6. `alembic check` сообщает о расхождении ORM-моделей и миграций
+   (косметическое: `unique=True` на колонке даёт unique index, а в миграциях
+   объявлен UniqueConstraint). Это существовало до Phase 1.1.1 и в CI
+   не проверяется, чтобы не маскировать реальные проблемы фиктивной правкой.
 
 ### P1 — продуктовый цикл
 - повторная/явная генерация и удобный статус программы;
@@ -105,7 +144,9 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 ## Следующий приоритет
 
-Phase 1.1 (AI configuration UX) закрыта. Далее — Phase 1.2 (reliability:
-устойчивое FSM storage, restart/recovery, единая точка генерации) и Phase 1.3
-(operations/security), затем clean-environment E2E acceptance. Подробный
-порядок — `DEVELOPMENT_ROADMAP.md`.
+Phase 1.1 (AI configuration UX) и Phase 1.1.1 (AI infrastructure management &
+reliability) закрыты. Далее — Phase 1.2 (reliability: устойчивое FSM storage,
+restart/recovery, единая точка генерации — веб-кнопка должна идти через
+`ProgramGenerationOrchestrator`, чтобы получить fallback и readiness gate) и
+Phase 1.3 (operations/security), затем clean-environment E2E acceptance.
+Подробный порядок — `DEVELOPMENT_ROADMAP.md`.

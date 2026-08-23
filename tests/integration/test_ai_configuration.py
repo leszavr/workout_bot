@@ -12,14 +12,19 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import delete, select
 
-from src.application.ai.admin_service import AIConfigurationService
+from src.application.ai.admin_service import (
+    AIConfigurationService,
+    AIDependencyError,
+)
 from src.application.ai.gateway import AIGateway
+from src.application.ai.health import AIInfrastructureHealthService
 from src.application.ai.selection import ModelSelector
 from src.domain.ai.config import (
     AIEndpoint,
     AIModel,
     AIProvider,
     AITaskConfig,
+    AIUsageRecord,
     PromptTemplate,
 )
 from src.domain.ai.enums import AIProtocol, AITaskType
@@ -120,13 +125,27 @@ async def cleanup_ai_data():
                 await session.execute(
                     delete(AIProviderRow).where(AIProviderRow.slug.like("test-%"))
                 )
+                # FK ON DELETE SET NULL сохраняет записи usage после удаления
+                # модели, поэтому их нужно чистить по собственной метке.
+                await session.execute(
+                    delete(AIUsageRecordRow).where(
+                        AIUsageRecordRow.program_id.like("prog-test-%")
+                    )
+                )
                 await session.execute(
                     delete(AISecretRow).where(AISecretRow.reference.like("test-ref%"))
                 )
                 await session.execute(
                     delete(AIAuditEventRow).where(
                         AIAuditEventRow.entity_type.in_(
-                            ["ai_provider", "ai_endpoint", "ai_model", "ai_task_config", "prompt_template"]
+                            [
+                                "ai_provider",
+                                "ai_endpoint",
+                                "ai_model",
+                                "ai_task_config",
+                                "prompt_template",
+                                "program_generation",
+                            ]
                         )
                     )
                 )
@@ -373,3 +392,274 @@ async def test_model_bound_to_task_cannot_be_deleted(components):
     # Soft disable разрешён.
     disabled = await admin.update_model(model.id, actor="test", enabled=False)
     assert disabled is not None and disabled.enabled is False
+
+
+# --- Safe delete: зависимости проверяются заранее и объясняются ---------------------
+
+
+async def _configured_chain(admin: AIConfigurationService, slug: str):
+    """Провайдер → эндпоинт → модель. Привязки к задаче нет."""
+    provider = await admin.create_provider(
+        AIProvider(name=f"Chain {slug}", slug=slug), actor="test"
+    )
+    endpoint = await admin.create_endpoint(
+        AIEndpoint(
+            provider_id=provider.id, name="EP", base_url="https://chain.example/v1"
+        ),
+        api_key="sk-chain-secret-value",
+        actor="test",
+    )
+    model = await admin.create_model(
+        AIModel(endpoint_id=endpoint.id, model_id=f"{slug}/m", display_name="M"),
+        actor="test",
+    )
+    return provider, endpoint, model
+
+
+async def test_model_without_dependencies_is_deleted(components):
+    admin: AIConfigurationService = components["admin"]
+    _, _, model = await _configured_chain(admin, "test-del-model")
+
+    assert (await admin.model_dependencies(model.id)).safe is True
+    assert await admin.delete_model(model.id, actor="test") is True
+    assert await components["models"].get(model.id) is None
+
+
+async def test_model_dependencies_name_the_blocking_task(components):
+    admin: AIConfigurationService = components["admin"]
+    _, _, model = await _configured_chain(admin, "test-dep-model")
+    await admin.configure_task(
+        AITaskConfig(task_type=AITaskType.WORKOUT_GENERATION, enabled=True),
+        model_pks=[model.id],
+        actor="test",
+    )
+
+    dependencies = await admin.model_dependencies(model.id)
+
+    assert dependencies.safe is False
+    blocker = dependencies.blockers[0]
+    assert blocker["type"] == "ai_task_config"
+    assert blocker["task_type"] == "workout_generation"
+    assert "workout_generation" in dependencies.describe()
+
+
+async def test_endpoint_with_bound_model_cannot_be_deleted(components):
+    admin: AIConfigurationService = components["admin"]
+    _, endpoint, model = await _configured_chain(admin, "test-dep-endpoint")
+    await admin.configure_task(
+        AITaskConfig(task_type=AITaskType.WORKOUT_GENERATION, enabled=True),
+        model_pks=[model.id],
+        actor="test",
+    )
+
+    with pytest.raises(AIDependencyError) as exc_info:
+        await admin.delete_endpoint(endpoint.id, actor="test")
+
+    assert exc_info.value.blockers
+    # Эндпоинт и его модель на месте: broken references не появились.
+    assert await components["endpoints"].get(endpoint.id) is not None
+    assert await components["models"].get(model.id) is not None
+
+
+async def test_provider_with_bound_model_cannot_be_deleted(components):
+    """Каскад провайдера не должен обходить привязку модели к задаче."""
+    admin: AIConfigurationService = components["admin"]
+    provider, endpoint, model = await _configured_chain(admin, "test-dep-provider")
+    await admin.configure_task(
+        AITaskConfig(task_type=AITaskType.WORKOUT_GENERATION, enabled=True),
+        model_pks=[model.id],
+        actor="test",
+    )
+
+    with pytest.raises(AIDependencyError) as exc_info:
+        await admin.delete_provider(provider.id, actor="test")
+
+    assert "workout_generation" in str(exc_info.value)
+    assert await components["providers"].get(provider.id) is not None
+    assert await components["endpoints"].get(endpoint.id) is not None
+    assert await components["models"].get(model.id) is not None
+
+
+async def test_provider_without_dependencies_is_deleted_with_secrets(components):
+    """Hard delete допустим; секреты каскадных эндпоинтов не остаются в базе."""
+    admin: AIConfigurationService = components["admin"]
+    provider, endpoint, model = await _configured_chain(admin, "test-del-provider")
+    stored = await components["endpoints"].get(endpoint.id)
+    reference = stored.secret_reference
+    assert reference is not None
+    assert await components["secret_store"].get(reference) is not None
+
+    assert await admin.delete_provider(provider.id, actor="test") is True
+
+    assert await components["providers"].get(provider.id) is None
+    assert await components["endpoints"].get(endpoint.id) is None
+    assert await components["models"].get(model.id) is None
+    # Осиротевший шифрованный секрет — это утечка, его быть не должно.
+    assert await components["secret_store"].get(reference) is None
+
+
+async def test_disabling_provider_keeps_configuration_intact(components):
+    """Стратегия «сначала отключить»: объект остаётся, ссылки не рвутся."""
+    admin: AIConfigurationService = components["admin"]
+    provider, endpoint, model = await _configured_chain(admin, "test-disable-provider")
+
+    updated = await admin.update_provider(provider.id, actor="test", enabled=False)
+
+    assert updated is not None and updated.enabled is False
+    assert await components["endpoints"].get(endpoint.id) is not None
+    assert await components["models"].get(model.id) is not None
+
+
+async def test_deleting_model_keeps_usage_history(components):
+    """Историю вызовов нельзя удалять ради удаления конфигурации.
+
+    Ссылка на удалённую модель обнуляется (FK ON DELETE SET NULL), поэтому
+    запись остаётся, а битой ссылки не возникает.
+    """
+    admin: AIConfigurationService = components["admin"]
+    provider, endpoint, model = await _configured_chain(admin, "test-hist-model")
+    marker = "prog-test-hist-model"
+    await components["usage"].save(
+        AIUsageRecord(
+            task_type=AITaskType.WORKOUT_GENERATION,
+            provider_id=provider.id,
+            endpoint_id=endpoint.id,
+            model_id=model.id,
+            program_id=marker,
+            status="success",
+        )
+    )
+
+    await admin.delete_model(model.id, actor="test")
+
+    async with components["session_factory"]() as session:
+        row = (
+            await session.execute(
+                select(AIUsageRecordRow).where(AIUsageRecordRow.program_id == marker)
+            )
+        ).scalar_one()
+    assert row.status == "success"
+    assert row.model_id is None
+
+
+# --- Fallback observability --------------------------------------------------------
+
+
+async def test_fallback_event_is_recorded_and_readable(components):
+    admin: AIConfigurationService = components["admin"]
+
+    await admin.record_generation_fallback(
+        requested_generator="ai",
+        actual_generator="deterministic",
+        reason_code="provider_unavailable",
+        detail="Провайдер: все подходящие провайдеры отключены",
+        ai_attempted=False,
+    )
+
+    events = await admin.recent_fallback_events(limit=10)
+    assert events
+    event = events[0]
+    assert event["event_type"] == "ai_generation_fallback"
+    assert event["metadata"]["reason_code"] == "provider_unavailable"
+    assert event["metadata"]["requested_generator"] == "ai"
+    assert event["metadata"]["actual_generator"] == "deterministic"
+    assert event["metadata"]["ai_attempted"] is False
+
+
+async def test_fallback_events_exclude_other_audit_events(components):
+    admin: AIConfigurationService = components["admin"]
+    await admin.create_provider(
+        AIProvider(name="Noise", slug="test-fallback-noise"), actor="test"
+    )
+    await admin.record_generation_fallback(
+        requested_generator="ai",
+        actual_generator="deterministic",
+        reason_code="ai_timeout",
+        detail="timeout",
+        ai_attempted=True,
+    )
+
+    events = await admin.recent_fallback_events(limit=50)
+
+    assert {e["event_type"] for e in events} == {"ai_generation_fallback"}
+
+
+async def test_fallback_event_metadata_has_no_personal_data(components):
+    admin: AIConfigurationService = components["admin"]
+
+    await admin.record_generation_fallback(
+        requested_generator="ai",
+        actual_generator="deterministic",
+        reason_code="ai_runtime_failure",
+        detail="boom",
+        ai_attempted=True,
+    )
+
+    event = (await admin.recent_fallback_events(limit=1))[0]
+    assert set(event["metadata"]) == {
+        "requested_generator",
+        "actual_generator",
+        "reason_code",
+        "detail",
+        "ai_attempted",
+    }
+
+
+# --- Infrastructure health на реальной конфигурации ---------------------------------
+
+
+async def test_infrastructure_health_reflects_real_configuration(components):
+    admin: AIConfigurationService = components["admin"]
+    provider, endpoint, model = await _configured_chain(admin, "test-health-live")
+    await admin.configure_task(
+        AITaskConfig(task_type=AITaskType.WORKOUT_GENERATION, enabled=True),
+        model_pks=[model.id],
+        actor="test",
+    )
+    registry = ProviderAdapterRegistry()
+    registry.register(AIProtocol.OPENAI_COMPATIBLE, MockAdapter())
+    health = AIInfrastructureHealthService(
+        providers=components["providers"],
+        endpoints=components["endpoints"],
+        models=components["models"],
+        tasks=components["tasks"],
+        usage=components["usage"],
+        adapter_registry=registry,
+    )
+
+    report = await health.report()
+
+    entry = next(p for p in report.providers if p.id == provider.id)
+    assert entry.protocol_supported is True
+    # Подключение ни разу не проверялось → это не «доступно».
+    assert entry.health == "not_tested"
+    endpoint_entry = next(e for e in entry.endpoints if e.id == endpoint.id)
+    assert endpoint_entry.has_api_key is True
+    model_entry = next(m for m in endpoint_entry.models if m.id == model.id)
+    assert model_entry.availability == "not_tested"
+    assert model_entry.in_active_use is True
+
+
+async def test_infrastructure_health_marks_endpoint_available_after_test(components):
+    admin: AIConfigurationService = components["admin"]
+    provider, endpoint, model = await _configured_chain(admin, "test-health-tested")
+    await components["endpoints"].record_test_result(endpoint.id, success=True)
+    registry = ProviderAdapterRegistry()
+    registry.register(AIProtocol.OPENAI_COMPATIBLE, MockAdapter())
+    health = AIInfrastructureHealthService(
+        providers=components["providers"],
+        endpoints=components["endpoints"],
+        models=components["models"],
+        tasks=components["tasks"],
+        usage=components["usage"],
+        adapter_registry=registry,
+    )
+
+    report = await health.report()
+
+    entry = next(p for p in report.providers if p.id == provider.id)
+    assert entry.health == "healthy"
+    endpoint_entry = next(e for e in entry.endpoints if e.id == endpoint.id)
+    assert endpoint_entry.last_checked_at is not None
+    model_entry = next(m for m in endpoint_entry.models if m.id == model.id)
+    assert model_entry.availability == "available"

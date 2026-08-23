@@ -13,6 +13,7 @@ import httpx
 
 from src.application.ai.admin_service import AIConfigurationService
 from src.application.ai.gateway import AIGateway
+from src.application.ai.health import AIInfrastructureHealthService
 from src.application.ai.readiness import AIReadinessService
 from src.application.ai.selection import ModelSelector
 from src.infrastructure.ai.adapters import build_default_registry
@@ -37,11 +38,12 @@ from src.infrastructure.persistence.postgres.models import AISecretRow
 
 @dataclass
 class AIComponents:
-    """Собранный AI-слой: gateway + админ-сервис + readiness + репозитории."""
+    """Собранный AI-слой: gateway + админ-сервис + readiness + health."""
 
     gateway: AIGateway
     admin: AIConfigurationService
     readiness: AIReadinessService
+    health: AIInfrastructureHealthService
     providers: AIProviderRepository
     endpoints: AIEndpointRepository
     models: AIModelRepository
@@ -102,10 +104,19 @@ def build_ai_components(http_client: httpx.AsyncClient | None = None) -> AICompo
         fallback_generator=PROGRAM_FALLBACK_GENERATOR,
         auto_generate_after_finalize=AUTO_GENERATE_PROGRAM_AFTER_FINALIZE,
     )
+    health = AIInfrastructureHealthService(
+        providers=providers,
+        endpoints=endpoints,
+        models=models,
+        tasks=tasks,
+        usage=usage,
+        adapter_registry=adapter_registry,
+    )
     return AIComponents(
         gateway=gateway,
         admin=admin,
         readiness=readiness,
+        health=health,
         providers=providers,
         endpoints=endpoints,
         models=models,

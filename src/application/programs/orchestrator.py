@@ -3,7 +3,7 @@
 Оркестратор соединяет существующие компоненты (фильтр, safety, генераторы,
 валидатор, репозиторий) в конвейер с primary/fallback конфигурацией:
 
-    Profile → Pools → primary generator → validation
+    Profile → Pools → readiness gate → primary generator → validation
         → (failure) fallback generator → validation
         → (failure) ProgramGenerationError
     → ProgramRepository → результат.
@@ -15,12 +15,24 @@
 - повторная генерация после успешной (idempotent pipeline) возвращает
   существующую валидную программу — новая версия создаётся только явным
   запросом (админ-UI) или после failure.
+
+Readiness gate (Phase 1.1.1). Перед AI-попыткой оркестратор спрашивает
+`ai_readiness_gate`, имеет ли смысл вызывать AI. Это разделяет два разных
+класса fallback:
+
+- *configuration fallback* — конфигурация заведомо нерабочая, AI-запрос не
+  выполняется вообще (не платим за гарантированно бесполезный вызов);
+- *runtime fallback* — AI был готов, попытка сделана, но не удалась.
+
+Причина в обоих случаях сохраняется машиночитаемо (`AIFallbackReason`), чтобы
+администратор мог ответить на вопрос «почему программа детерминированная,
+хотя AI включён?».
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Awaitable, Callable
 
 from src.application.programs.filtering import ExerciseFilter
 from src.application.programs.generator import (
@@ -29,6 +41,12 @@ from src.application.programs.generator import (
 )
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.validator import ProgramValidator
+from src.domain.ai.enums import AIFallbackReason
+from src.domain.ai.errors import (
+    AIConfigurationError,
+    AIInvalidResponseError,
+    AITimeoutError,
+)
 from src.domain.enums import GenerationSource, ProgramStatus
 from src.domain.pools import ExerciseCandidatePool, SafeExercisePool
 from src.domain.profile import FitnessProfile
@@ -49,6 +67,34 @@ GENERATOR_DETERMINISTIC = GenerationSource.DETERMINISTIC.value
 VALID_GENERATORS = {GENERATOR_AI, GENERATOR_DETERMINISTIC}
 
 
+@dataclass(frozen=True)
+class GateDecision:
+    """Ответ readiness gate. Структурно совпадает с RuntimeGateDecision.
+
+    Оркестратор принимает простой протокол, а не конкретный AI-сервис:
+    так его можно тестировать без AI-инфраструктуры.
+    """
+
+    allowed: bool
+    reason: AIFallbackReason | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class FallbackEvent:
+    """Факт fallback для журнала администратора.
+
+    Персональных данных не содержит: profile_id и содержимое программы сюда
+    не попадают.
+    """
+
+    requested_generator: str
+    actual_generator: str
+    reason_code: str
+    detail: str
+    ai_attempted: bool
+
+
 @dataclass
 class OrchestratorResult:
     program: WorkoutProgram
@@ -62,8 +108,22 @@ class OrchestratorResult:
 class _GeneratorAttempt:
     name: str
     reason: str | None = None
+    reason_code: str | None = None
     error_type: str | None = None
     error_message: str | None = None
+    # skipped=True — генератор не вызывался (gate запретил или он не настроен).
+    skipped: bool = False
+
+
+def _classify_ai_error(exc: BaseException) -> AIFallbackReason:
+    """Относит ошибку AI-вызова к машиночитаемой причине fallback."""
+    if isinstance(exc, AITimeoutError):
+        return AIFallbackReason.AI_TIMEOUT
+    if isinstance(exc, AIInvalidResponseError):
+        return AIFallbackReason.AI_INVALID_RESPONSE
+    if isinstance(exc, AIConfigurationError):
+        return AIFallbackReason.AI_NOT_CONFIGURED
+    return AIFallbackReason.AI_RUNTIME_FAILURE
 
 
 class ProgramGenerationOrchestrator:
@@ -80,6 +140,8 @@ class ProgramGenerationOrchestrator:
         exercise_filter: ExerciseFilter | None = None,
         safety_engine: SafetyEngine | None = None,
         validator: ProgramValidator | None = None,
+        ai_readiness_gate: Callable[[], Awaitable[GateDecision]] | None = None,
+        fallback_recorder: Callable[[FallbackEvent], Awaitable[None]] | None = None,
     ) -> None:
         if primary_generator not in VALID_GENERATORS:
             raise ValueError(f"Недопустимый primary_generator: {primary_generator}")
@@ -96,6 +158,8 @@ class ProgramGenerationOrchestrator:
         self._filter = exercise_filter or ExerciseFilter()
         self._safety = safety_engine or SafetyEngine()
         self._validator = validator or ProgramValidator()
+        self._ai_gate = ai_readiness_gate
+        self._fallback_recorder = fallback_recorder
 
     # --- public API -------------------------------------------------------------
 
@@ -212,9 +276,26 @@ class ProgramGenerationOrchestrator:
             else:
                 reason = None
 
+            # Configuration gate: заведомо нерабочую AI-конфигурацию не
+            # вызываем вообще — только фиксируем структурированную причину.
+            if name == GENERATOR_AI:
+                skip = await self._ai_gate_decision(profile.profile_id)
+                if skip is not None:
+                    attempts.append(skip)
+                    continue
+
             generator = self._resolve_generator(name)
             if generator is None:
-                attempts.append(_GeneratorAttempt(name=name, reason="генератор не настроен"))
+                attempts.append(
+                    _GeneratorAttempt(
+                        name=name,
+                        reason="генератор не настроен",
+                        reason_code=AIFallbackReason.GENERATOR_NOT_CONFIGURED.value
+                        if name == GENERATOR_AI
+                        else None,
+                        skipped=True,
+                    )
+                )
                 continue
 
             try:
@@ -225,6 +306,9 @@ class ProgramGenerationOrchestrator:
                     _GeneratorAttempt(
                         name=name,
                         reason=f"ошибка генерации: {message}",
+                        reason_code=_classify_ai_error(exc).value
+                        if name == GENERATOR_AI
+                        else None,
                         error_type=exc.__class__.__name__,
                         error_message=message,
                     )
@@ -246,6 +330,9 @@ class ProgramGenerationOrchestrator:
                     _GeneratorAttempt(
                         name=name,
                         reason=f"validation failed: {message}",
+                        reason_code=AIFallbackReason.AI_VALIDATION_FAILED.value
+                        if name == GENERATOR_AI
+                        else None,
                         error_type="ValidationError",
                         error_message=message,
                     )
@@ -268,6 +355,8 @@ class ProgramGenerationOrchestrator:
                     "fallback_used": is_fallback,
                 },
             )
+            if is_fallback:
+                await self._record_fallback(program, attempts)
             return program, is_fallback
 
         last = attempts[-1]
@@ -285,6 +374,67 @@ class ProgramGenerationOrchestrator:
             f"Не удалось сгенерировать программу "
             f"(primary={self._primary}, fallback={self._fallback}): {last.reason or 'нет доступного генератора'}"
         )
+
+    async def _ai_gate_decision(self, profile_id: str) -> _GeneratorAttempt | None:
+        """None — AI можно вызывать; иначе готовая запись о пропуске попытки.
+
+        Сбой самого gate не должен ломать генерацию: если состояние
+        readiness неизвестно, попытку выполняем, а решение принимает AI.
+        """
+        if self._ai_gate is None:
+            return None
+        try:
+            decision = await self._ai_gate()
+        except Exception as exc:  # noqa: BLE001 — gate не критичен для генерации
+            logger.warning(
+                "event=generation_readiness_gate_failed",
+                extra={"profile_id": profile_id, "error_type": exc.__class__.__name__},
+            )
+            return None
+        if decision.allowed:
+            return None
+
+        reason_code = (decision.reason or AIFallbackReason.TASK_NOT_READY).value
+        logger.warning(
+            "event=generation_ai_skipped_not_ready",
+            extra={
+                "profile_id": profile_id,
+                "fallback_reason_code": reason_code,
+            },
+        )
+        return _GeneratorAttempt(
+            name=GENERATOR_AI,
+            reason=decision.detail or "AI-конфигурация не готова",
+            reason_code=reason_code,
+            skipped=True,
+        )
+
+    async def _record_fallback(
+        self, program: WorkoutProgram, attempts: list[_GeneratorAttempt]
+    ) -> None:
+        """Пишет fallback в журнал администратора. Сбой журнала не критичен."""
+        if self._fallback_recorder is None:
+            return
+        info = program.generation
+        if info.fallback_reason_code is None:
+            return
+        ai_attempted = any(
+            a.name == GENERATOR_AI and not a.skipped for a in attempts
+        )
+        try:
+            await self._fallback_recorder(
+                FallbackEvent(
+                    requested_generator=self._primary,
+                    actual_generator=(
+                        info.actual_generator.value if info.actual_generator else ""
+                    ),
+                    reason_code=info.fallback_reason_code,
+                    detail=(info.fallback_reason or "")[:500],
+                    ai_attempted=ai_attempted,
+                )
+            )
+        except Exception:  # noqa: BLE001 — журнал не должен ломать генерацию
+            logger.exception("Не удалось записать fallback-событие")
 
     def _fill_generation_metadata(
         self,
@@ -304,6 +454,13 @@ class ProgramGenerationOrchestrator:
                 f"{a.name}: {a.reason}" for a in attempts
             )[:500]
         info.fallback_reason = fallback_reason if is_fallback else None
+        # Машиночитаемый код берём из первой неудавшейся попытки: админа
+        # интересует именно причина отказа запрошенного генератора.
+        info.fallback_reason_code = (
+            next((a.reason_code for a in attempts if a.reason_code), None)
+            if is_fallback
+            else None
+        )
 
     async def _persist(self, program: WorkoutProgram, profile_id: str) -> None:
         import uuid

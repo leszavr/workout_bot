@@ -31,7 +31,7 @@ from src.domain.ai.config import (
     AITaskModelBinding,
     PromptTemplate,
 )
-from src.domain.ai.enums import AIProtocol, AITaskType
+from src.domain.ai.enums import AIFallbackReason, AIProtocol, AITaskType
 from src.domain.ai.errors import AIConfigurationError
 from src.infrastructure.ai.adapters import (
     AdapterRequest,
@@ -444,3 +444,102 @@ async def test_validate_enable_uses_existing_bindings_when_models_not_sent():
         await service.validate_enable(
             AITaskConfig(task_type=TASK, enabled=True), None
         )
+
+
+# --- runtime_gate: влияние readiness на генерацию ------------------------------------
+
+
+async def test_runtime_gate_allows_ready_configuration():
+    decision = await _service().runtime_gate(TASK)
+
+    assert decision.allowed is True
+    assert decision.reason is None
+
+
+async def test_runtime_gate_blocks_when_ai_not_configured():
+    decision = await _service(providers=[], endpoints=[], models=[]).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.AI_NOT_CONFIGURED
+
+
+async def test_runtime_gate_blocks_when_provider_disabled():
+    decision = await _service(providers=[_provider(enabled=False)]).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.PROVIDER_UNAVAILABLE
+
+
+async def test_runtime_gate_blocks_when_endpoint_disabled():
+    decision = await _service(endpoints=[_endpoint(enabled=False)]).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.ENDPOINT_UNAVAILABLE
+
+
+async def test_runtime_gate_blocks_when_connection_never_tested():
+    """«Не проверялось» — отдельная причина, не путается с провалом теста."""
+    decision = await _service(
+        endpoints=[_endpoint(last_test_at=None, last_test_status=None)]
+    ).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.CONNECTION_NOT_TESTED
+
+
+async def test_runtime_gate_blocks_when_connection_test_failed():
+    decision = await _service(
+        endpoints=[
+            _endpoint(last_test_status="error", last_test_error_type="AIConnectionError")
+        ]
+    ).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.ENDPOINT_UNAVAILABLE
+    assert "AIConnectionError" in (decision.detail or "")
+
+
+async def test_runtime_gate_blocks_when_model_disabled():
+    decision = await _service(models=[_model(enabled=False)]).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.MODEL_UNAVAILABLE
+
+
+async def test_runtime_gate_blocks_on_unsupported_protocol():
+    decision = await _service(
+        providers=[_provider(protocol=AIProtocol.ANTHROPIC)]
+    ).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.UNSUPPORTED_PROTOCOL
+
+
+async def test_runtime_gate_blocks_when_task_disabled():
+    """enabled=false — это запрет использовать AI, а не признак поломки."""
+    decision = await _service(
+        config=AITaskConfig(id=500, task_type=TASK, enabled=False)
+    ).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.TASK_DISABLED
+
+
+async def test_runtime_gate_blocks_when_prompt_version_missing():
+    decision = await _service(
+        config=AITaskConfig(id=500, task_type=TASK, enabled=True, prompt_version=42)
+    ).runtime_gate(TASK)
+
+    assert decision.allowed is False
+    assert decision.reason is AIFallbackReason.TASK_NOT_READY
+
+
+async def test_runtime_gate_reason_matches_report_reason_code():
+    """Админка и runtime обязаны показывать одну и ту же причину."""
+    service = _service(providers=[_provider(enabled=False)])
+    report = await service.report(TASK)
+    decision = await service.runtime_gate(TASK)
+
+    blocking = [c for c in report.checks if c.blocking and c.status != STATUS_OK]
+    assert decision.reason is not None
+    assert blocking[0].reason_code == decision.reason.value

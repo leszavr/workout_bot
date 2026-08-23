@@ -539,3 +539,360 @@ def test_disabled_provider_not_leaked_in_responses(client: TestClient, auth_head
     assert slugs.get("apitest-disabled") is False
 
     client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+# --- Lifecycle: edit / enable / disable / safe delete ------------------------------
+
+
+def _chain(client: TestClient, auth_headers: dict, slug: str) -> tuple[int, int, int]:
+    """Провайдер → эндпоинт с ключом → модель."""
+    provider_id = client.post(
+        "/api/v1/admin/ai/providers",
+        headers=auth_headers,
+        json={"name": f"Chain {slug}", "slug": slug},
+    ).json()["id"]
+    endpoint_id = client.post(
+        f"/api/v1/admin/ai/providers/{provider_id}/endpoints",
+        headers=auth_headers,
+        json={
+            "name": "EP",
+            "base_url": "https://chain.apitest.example/v1",
+            "api_key": REAL_SECRET,
+        },
+    ).json()["id"]
+    model_id = client.post(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models",
+        headers=auth_headers,
+        json={"model_id": f"{slug}/m", "display_name": "M"},
+    ).json()["id"]
+    return provider_id, endpoint_id, model_id
+
+
+def test_provider_endpoint_model_can_be_edited(client: TestClient, auth_headers: dict):
+    """Редактирование должно быть доступно, а не только create/toggle."""
+    provider_id, endpoint_id, model_id = _chain(client, auth_headers, "apitest-edit")
+
+    provider = client.patch(
+        f"/api/v1/admin/ai/providers/{provider_id}",
+        headers=auth_headers,
+        json={"name": "Renamed provider", "priority": 5},
+    )
+    assert provider.status_code == 200
+    assert provider.json()["name"] == "Renamed provider"
+    assert provider.json()["priority"] == 5
+
+    endpoint = client.patch(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}",
+        headers=auth_headers,
+        json={
+            "name": "Renamed endpoint",
+            "base_url": "https://edited.apitest.example/v1",
+            "timeout_seconds": 30,
+        },
+    )
+    assert endpoint.status_code == 200
+    assert endpoint.json()["base_url"] == "https://edited.apitest.example/v1"
+    assert endpoint.json()["timeout_seconds"] == 30
+    # Правка эндпоинта не должна терять сохранённый ключ.
+    assert endpoint.json()["has_api_key"] is True
+    _assert_no_secret_leak(endpoint)
+
+    model = client.patch(
+        f"/api/v1/admin/ai/models/{model_id}",
+        headers=auth_headers,
+        json={"display_name": "Renamed model", "context_window": 128000},
+    )
+    assert model.status_code == 200
+    assert model.json()["display_name"] == "Renamed model"
+    assert model.json()["context_window"] == 128000
+
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_entities_can_be_disabled_and_enabled(client: TestClient, auth_headers: dict):
+    provider_id, endpoint_id, model_id = _chain(client, auth_headers, "apitest-toggle")
+
+    for path in (
+        f"/api/v1/admin/ai/providers/{provider_id}",
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}",
+        f"/api/v1/admin/ai/models/{model_id}",
+    ):
+        disabled = client.patch(path, headers=auth_headers, json={"enabled": False})
+        assert disabled.status_code == 200
+        assert disabled.json()["enabled"] is False
+        enabled = client.patch(path, headers=auth_headers, json={"enabled": True})
+        assert enabled.status_code == 200
+        assert enabled.json()["enabled"] is True
+
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_safe_delete_without_dependencies(client: TestClient, auth_headers: dict):
+    provider_id, endpoint_id, model_id = _chain(client, auth_headers, "apitest-safedel")
+
+    assert (
+        client.delete(
+            f"/api/v1/admin/ai/models/{model_id}", headers=auth_headers
+        ).status_code
+        == 204
+    )
+    assert (
+        client.delete(
+            f"/api/v1/admin/ai/endpoints/{endpoint_id}", headers=auth_headers
+        ).status_code
+        == 204
+    )
+    assert (
+        client.delete(
+            f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers
+        ).status_code
+        == 204
+    )
+    assert (
+        client.get(
+            f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers
+        ).status_code
+        == 404
+    )
+
+
+def test_delete_with_dependencies_explains_blockers(
+    client: TestClient, auth_headers: dict
+):
+    """409 должен перечислять зависимости, а не выдавать ошибку целостности."""
+    provider_id, endpoint_id, model_id = _chain(client, auth_headers, "apitest-blocked")
+    assert (
+        client.put(
+            "/api/v1/admin/ai/tasks/workout_generation",
+            headers=auth_headers,
+            json={"enabled": True, "model_ids": [model_id]},
+        ).status_code
+        == 200
+    )
+
+    for path in (
+        f"/api/v1/admin/ai/models/{model_id}",
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}",
+        f"/api/v1/admin/ai/providers/{provider_id}",
+    ):
+        response = client.delete(path, headers=auth_headers)
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "workout_generation" in detail["message"]
+        assert detail["blockers"]
+        assert detail["blockers"][0]["task_type"] == "workout_generation"
+
+    # Broken references не появились: всё поддерево на месте.
+    assert (
+        client.get(
+            f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers
+        ).status_code
+        == 200
+    )
+    assert client.get(
+        f"/api/v1/admin/ai/endpoints/{endpoint_id}/models", headers=auth_headers
+    ).json()["total"] == 1
+
+    client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": False, "model_ids": []},
+    )
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_delete_missing_entities_returns_404(client: TestClient, auth_headers: dict):
+    assert (
+        client.delete(
+            "/api/v1/admin/ai/providers/99999999", headers=auth_headers
+        ).status_code
+        == 404
+    )
+    assert (
+        client.delete(
+            "/api/v1/admin/ai/endpoints/99999999", headers=auth_headers
+        ).status_code
+        == 404
+    )
+    assert (
+        client.delete(
+            "/api/v1/admin/ai/models/99999999", headers=auth_headers
+        ).status_code
+        == 404
+    )
+
+
+# --- Infrastructure health API -----------------------------------------------------
+
+
+def test_infrastructure_health_requires_auth(client: TestClient):
+    assert client.get("/api/v1/admin/ai/infrastructure-health").status_code == 401
+    assert (
+        client.post("/api/v1/admin/ai/infrastructure-health/refresh").status_code == 401
+    )
+
+
+def test_infrastructure_health_is_built_from_configuration(
+    client: TestClient, auth_headers: dict
+):
+    """Новый провайдер и модель появляются в дашборде без правок frontend."""
+    provider_id, endpoint_id, model_id = _chain(client, auth_headers, "apitest-health")
+
+    response = client.get("/api/v1/admin/ai/infrastructure-health", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["generated_at"]
+
+    provider = next(p for p in body["providers"] if p["id"] == provider_id)
+    assert provider["slug"] == "apitest-health"
+    assert provider["protocol_supported"] is True
+    # Подключение не проверялось: это не healthy и не unavailable.
+    assert provider["health"] == "not_tested"
+
+    endpoint = next(e for e in provider["endpoints"] if e["id"] == endpoint_id)
+    assert endpoint["has_api_key"] is True
+    assert endpoint["last_checked_at"] is None
+
+    model = next(m for m in endpoint["models"] if m["id"] == model_id)
+    assert model["availability"] == "not_tested"
+    assert model["in_active_use"] is False
+
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_infrastructure_health_shows_disabled_states(
+    client: TestClient, auth_headers: dict
+):
+    """Disabled-модель остаётся в конфигурации и не выглядит доступной."""
+    provider_id, endpoint_id, model_id = _chain(
+        client, auth_headers, "apitest-health-off"
+    )
+    client.patch(
+        f"/api/v1/admin/ai/models/{model_id}",
+        headers=auth_headers,
+        json={"enabled": False},
+    )
+
+    body = client.get(
+        "/api/v1/admin/ai/infrastructure-health", headers=auth_headers
+    ).json()
+    provider = next(p for p in body["providers"] if p["id"] == provider_id)
+    model = provider["endpoints"][0]["models"][0]
+
+    assert model["enabled"] is False
+    assert model["availability"] == "disabled"
+
+    client.patch(
+        f"/api/v1/admin/ai/providers/{provider_id}",
+        headers=auth_headers,
+        json={"enabled": False},
+    )
+    body = client.get(
+        "/api/v1/admin/ai/infrastructure-health", headers=auth_headers
+    ).json()
+    provider = next(p for p in body["providers"] if p["id"] == provider_id)
+    assert provider["health"] == "disabled"
+
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_infrastructure_health_disappears_after_delete(
+    client: TestClient, auth_headers: dict
+):
+    """Сценарий 5: безопасно удалённый провайдер исчезает из дашборда."""
+    provider_id, _, _ = _chain(client, auth_headers, "apitest-health-del")
+    body = client.get(
+        "/api/v1/admin/ai/infrastructure-health", headers=auth_headers
+    ).json()
+    assert any(p["id"] == provider_id for p in body["providers"])
+
+    assert (
+        client.delete(
+            f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers
+        ).status_code
+        == 204
+    )
+
+    body = client.get(
+        "/api/v1/admin/ai/infrastructure-health", headers=auth_headers
+    ).json()
+    assert not any(p["id"] == provider_id for p in body["providers"])
+
+
+def test_infrastructure_health_reports_task_usage(
+    client: TestClient, auth_headers: dict
+):
+    provider_id, _, model_id = _chain(client, auth_headers, "apitest-health-task")
+    client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": True, "model_ids": [model_id]},
+    )
+
+    body = client.get(
+        "/api/v1/admin/ai/infrastructure-health", headers=auth_headers
+    ).json()
+    provider = next(p for p in body["providers"] if p["id"] == provider_id)
+    model = provider["endpoints"][0]["models"][0]
+
+    assert model["in_active_use"] is True
+    assert model["tasks"][0]["task_type"] == "workout_generation"
+    assert model["tasks"][0]["is_primary"] is True
+
+    client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": False, "model_ids": []},
+    )
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_infrastructure_health_never_returns_secrets(
+    client: TestClient, auth_headers: dict
+):
+    provider_id, _, _ = _chain(client, auth_headers, "apitest-health-secret")
+
+    response = client.get(
+        "/api/v1/admin/ai/infrastructure-health", headers=auth_headers
+    )
+    _assert_no_secret_leak(response)
+    assert "secret_reference" not in response.text
+
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+def test_infrastructure_health_refresh_updates_last_checked(
+    client: TestClient, auth_headers: dict
+):
+    """Manual refresh пингует эндпоинт и сохраняет время проверки."""
+    provider_id, endpoint_id, _ = _chain(client, auth_headers, "apitest-health-refresh")
+
+    response = client.post(
+        "/api/v1/admin/ai/infrastructure-health/refresh", headers=auth_headers
+    )
+    assert response.status_code == 200
+    provider = next(p for p in response.json()["providers"] if p["id"] == provider_id)
+    endpoint = next(e for e in provider["endpoints"] if e["id"] == endpoint_id)
+
+    # Хост недоступен, поэтому ожидаем зафиксированный провал, а не «не проверялось».
+    assert endpoint["last_checked_at"] is not None
+    assert endpoint["health"] == "unavailable"
+    assert endpoint["last_check_error_type"]
+
+    client.delete(f"/api/v1/admin/ai/providers/{provider_id}", headers=auth_headers)
+
+
+# --- Fallback events API -----------------------------------------------------------
+
+
+def test_fallback_events_require_auth(client: TestClient):
+    assert client.get("/api/v1/admin/ai/fallback-events").status_code == 401
+
+
+def test_fallback_events_endpoint_returns_list(client: TestClient, auth_headers: dict):
+    response = client.get("/api/v1/admin/ai/fallback-events", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "items" in body and "total" in body
+    assert all(i["event_type"] == "ai_generation_fallback" for i in body["items"])
