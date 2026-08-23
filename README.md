@@ -36,7 +36,7 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 
 ## Локальная разработка
 
-Окружением управляет `./workout-manager.sh`: поднимает PostgreSQL и MinIO, backend и веб-интерфейс, показывает логи и состояние.
+Окружением управляет `./workout-manager.sh`: поднимает PostgreSQL, Redis и MinIO, backend и веб-интерфейс, показывает логи и состояние.
 
 ```bash
 ./workout-manager.sh start     # логи в терминале, Ctrl+C останавливает службы
@@ -52,6 +52,7 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 | FastAPI + Swagger | http://localhost:8000 (`/docs`) |
 | Web interface | http://localhost:3000 |
 | PostgreSQL | localhost:5432 |
+| Redis (состояние анкеты) | localhost:6379 |
 | MinIO API | http://localhost:9000 |
 | MinIO Console | http://localhost:9001 |
 
@@ -62,4 +63,4 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 ./workout-manager.sh test unit   # только unit-тесты, без БД
 ```
 
-Интеграционные тесты работают с реальной PostgreSQL и удаляют свои данные, поэтому им нужна отдельная база: адрес задаётся в `TEST_DATABASE_URL`. Запуск по рабочей базе скрипт не выполнит.
+Интеграционные тесты работают с реальной PostgreSQL и удаляют свои данные, поэтому им нужна отдельная база: адрес задаётся в `TEST_DATABASE_URL`. Запуск по рабочей базе скрипт не выполнит. Тестам устойчивого FSM нужен доступный Redis (`REDIS_URL`, либо отдельный `TEST_REDIS_URL`).

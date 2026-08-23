@@ -20,7 +20,7 @@ from apps.telegram_gateway.states.questionnaire_states import QuestionnaireState
 from src.domain.enums import CompletionStatus
 
 logger = logging.getLogger(__name__)
-router = Router()
+router = Router(name="telegram_gateway.start")
 
 SERVICE_INFO_TEXT = (
     "ℹ️ Услуга включает сбор анкеты, подбор целей, ограничений и режима тренировок, "

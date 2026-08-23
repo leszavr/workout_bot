@@ -24,6 +24,11 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 # PostgreSQL. Если DATABASE_URL не задан — используется файловое хранилище (dev/test).
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+# Redis — устойчивое runtime-состояние анкеты (FSM). Бизнес-данные остаются в
+# PostgreSQL. Обязателен для Telegram-бота: на MemoryStorage анкета теряется
+# при перезапуске и не работает при нескольких экземплярах приложения.
+REDIS_URL = os.getenv("REDIS_URL", "")
+
 # Внутренний веб-интерфейс: учётные данные администратора (только из env).
 ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")

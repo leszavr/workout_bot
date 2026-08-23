@@ -9,6 +9,7 @@ services:
     environment:
       WORKOUT_DATA_DIR: /app/data
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-workout_bot}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:-workout_bot}
+      REDIS_URL: redis://redis:6379/0
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set in .env}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set in .env}
@@ -17,6 +18,8 @@ services:
       - bot-data:/app/data
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       minio:
         condition: service_started
@@ -78,6 +81,22 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Redis — устойчивое runtime-состояние анкеты (FSM). Бизнес-данные остаются
+  # в PostgreSQL, поэтому потеря Redis не приводит к потере профилей и программ.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   # MinIO — object storage для медиа упражнений (S3-compatible).
   minio:
     image: minio/minio:RELEASE.2024-01-16T16-07-38Z
@@ -100,4 +119,5 @@ services:
 volumes:
   bot-data:
   pg-data:
+  redis-data:
   minio-data:

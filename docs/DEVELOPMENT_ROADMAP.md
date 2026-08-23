@@ -38,10 +38,16 @@
 
 **Design baseline:** `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`.
 
-#### 1.2-A — Persistent FSM
-- [ ] заменить `MemoryStorage` на устойчивое production storage;
-- [ ] проверить restart/recovery questionnaire state;
-- [ ] acceptance: restart во время questionnaire не теряет критическое состояние.
+#### 1.2-A — Persistent FSM: DONE
+- [x] заменить `MemoryStorage` на устойчивое production storage (Redis-backed
+      FSM: `RedisStorage` + `RedisEventIsolation`, ключи с `bot_id`);
+- [x] проверить restart/recovery questionnaire state;
+- [x] acceptance: restart во время questionnaire не теряет критическое состояние;
+- [x] `REDIS_URL` обязателен для бота, проверяется до старта polling и в
+      `workout-manager.sh`; ресурсы Redis закрываются при остановке;
+- [x] недоступность Redis приводит к понятному сообщению пользователю
+      (`FSMStorageError` → error router), а не к молчаливой потере ответа;
+- [x] Redis добавлен в docker compose и CI, тесты FSM выполняются реально.
 
 #### 1.2-B — Generation domain state
 - [ ] формализовать persistent generation status model;

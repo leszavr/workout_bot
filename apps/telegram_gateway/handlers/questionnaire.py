@@ -24,7 +24,7 @@ from src.application.questionnaire.questions import QUESTIONS, QuestionKind
 from src.errors import QuestionnaireValidationError
 
 logger = logging.getLogger(__name__)
-router = Router()
+router = Router(name="telegram_gateway.questionnaire")
 
 # callback_data → question_id для всех вопросов с вариантами ответа.
 CALLBACK_TO_QUESTION: dict[str, str] = {

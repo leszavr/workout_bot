@@ -37,7 +37,7 @@ from src.infrastructure.config import ADMIN_CHAT_ID
 from src.infrastructure.telegram.admin_sender import TelegramAdminSender
 
 logger = logging.getLogger(__name__)
-router = Router()
+router = Router(name="telegram_gateway.review")
 
 # Сильные ссылки на фоновые задачи pipeline: event loop хранит только
 # слабые ссылки, без этого set задача может быть собрана GC mid-execution.
