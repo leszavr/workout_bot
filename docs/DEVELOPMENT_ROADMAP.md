@@ -130,6 +130,23 @@
 
 **Правило:** 1.2-A…G реализуются отдельными проверяемыми PR. Каждый PR проходит CI и acceptance, после merge обновляются `PROJECT_STATUS.md` и этот roadmap.
 
+### 1.2-0 — Connector & deployment baseline: DESIGN READY
+
+Перед дальнейшим reliability engineering необходимо проверить систему на реальной production-like инфраструктуре.
+
+- [x] архитектурно зафиксирован Connector Layer — `docs/architecture/CONNECTOR_LAYER.md`;
+- [x] зафиксировано правило: сейчас конфигурация остаётся в ENV/secret variables;
+- [x] определены будущие connector types: Telegram, PostgreSQL, Redis, MinIO/S3, SMTP;
+- [x] определено разделение Connector Layer и специализированного AI Provider lifecycle;
+- [x] зафиксирован deployment baseline и E2E acceptance matrix — `docs/architecture/DEPLOYMENT_AND_INTEGRATION_BASELINE.md`;
+- [ ] получить параметры серверов и сетевые ограничения;
+- [ ] выполнить Deployment Readiness Audit;
+- [ ] развернуть staging/integration environment;
+- [ ] выполнить реальный E2E acceptance;
+- [ ] классифицировать найденные проблемы по 1.2-D / 1.2-E / 1.3.
+
+**Важно:** 1.2-0 не реализует Connector Registry, Admin CRUD или runtime hot-swap. Это архитектурный baseline и deployment gate.
+
 ### 1.3 Operations and security
 - [ ] structured logging и correlation IDs;
 - [ ] error tracking/metrics;
