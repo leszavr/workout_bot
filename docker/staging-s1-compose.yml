@@ -59,6 +59,14 @@ services:
     restart: unless-stopped
     networks: [workout_net]
 
+  # Temporary network probe for S2 connectivity checks. It is not part of the
+  # application stack and must be removed after verification.
+  staging-probe:
+    image: postgres:16-alpine
+    command: ["sleep", "infinity"]
+    profiles: [probe]
+    networks: [workout_net]
+
 networks:
   workout_net:
     external: true
