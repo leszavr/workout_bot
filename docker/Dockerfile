@@ -13,12 +13,13 @@ COPY apps ./apps
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY scripts ./scripts
+COPY prompts ./prompts
 
 RUN pip install --no-cache-dir . \
     # Запуск от непривилегированного пользователя (data/ доступна для записи боту).
     && useradd --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /app/data \
-    && chown -R appuser:appuser /app
+    && chown appuser:appuser /app/data
 USER appuser
 
 # По умолчанию запускается backend; для бота переопределяется в compose.
