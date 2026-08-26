@@ -7,26 +7,17 @@ services:
       - ${STAGING_APP_ENV_FILE:-/opt/workout_bot/compose/staging-app.env}
     environment:
       WORKOUT_DATA_DIR: /app/data
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://frontend:3000}
-      MEDIA_PUBLIC_BASE_URL: ${MEDIA_PUBLIC_BASE_URL:-http://backend:8000}
     command: ["uvicorn", "apps.backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - staging-bot-data:/app/data
-    expose:
-      - "8000"
+    ports:
+      - "8000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 20s
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
     cpus: 0.75
     mem_limit: 1024m
     mem_reservation: 256m
@@ -39,9 +30,9 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.web
       args:
-        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
-    expose:
-      - "3000"
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:?set in staging-app.env}
+    ports:
+      - "3000:3000"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -72,12 +63,6 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
     cpus: 0.5
     mem_limit: 768m
     mem_reservation: 256m
@@ -85,36 +70,11 @@ services:
     restart: unless-stopped
     networks: [workout_net]
 
-  postgres:
-    extends:
-      file: staging-s1-compose.yml
-      service: postgres
-    volumes:
-      - staging-postgres-data:/var/lib/postgresql/data
-  redis:
-    extends:
-      file: staging-s1-compose.yml
-      service: redis
-    volumes:
-      - staging-redis-data:/data
-  minio:
-    extends:
-      file: staging-s1-compose.yml
-      service: minio
-    volumes:
-      - staging-minio-data:/data
-
 networks:
   workout_net:
     external: true
     name: workout_net
 
 volumes:
-  staging-postgres-data:
-    name: workout-staging-postgres-data
-  staging-redis-data:
-    name: workout-staging-redis-data
-  staging-minio-data:
-    name: workout-staging-minio-data
   staging-bot-data:
     name: workout-staging-bot-data
