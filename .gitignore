@@ -10,6 +10,8 @@ venv/
 
 # Secrets
 .env
+docker/staging.env
+docker/staging-app.env
 
 # Temporary / scratch files
 .tmp/
