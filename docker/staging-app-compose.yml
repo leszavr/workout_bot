@@ -68,7 +68,12 @@ services:
     mem_reservation: 256m
     pids_limit: 256
     restart: unless-stopped
-    networks: [workout_net]
+    networks:
+      # Фиксированный адрес нужен хосту: только трафик этого контейнера
+      # уходит в WireGuard-туннель до EU-узла (policy routing по source IP).
+      # Остальные сервисы продолжают ходить через локального провайдера.
+      workout_net:
+        ipv4_address: ${TELEGRAM_BOT_IP:-172.18.0.20}
 
 networks:
   workout_net:
