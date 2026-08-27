@@ -18,7 +18,7 @@ from apps.telegram_gateway.handlers.errors import (
     STORAGE_UNAVAILABLE_TEXT,
     handle_fsm_storage_error,
 )
-from apps.telegram_gateway.main import build_dispatcher, resolve_fsm_url
+from apps.telegram_gateway.main import resolve_fsm_url
 from src.errors import FSMStorageError
 from src.infrastructure.telegram.fsm_storage import create_fsm_storage
 
@@ -52,12 +52,6 @@ class TestFSMConfiguration:
 
     def test_configured_url_is_used(self):
         assert resolve_fsm_url("redis://localhost:6379/0") == "redis://localhost:6379/0"
-
-
-@pytest.fixture(scope="module")
-def dispatcher():
-    """Роутеры aiogram — модульные singletons, поэтому dispatcher собирается один раз."""
-    return build_dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
 
 
 class TestDispatcherWiring:
