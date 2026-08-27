@@ -171,6 +171,34 @@ SYN-ACK на любой порт любого адреса (проверено �
    `ssh_pwauth: false` и `disable_root: true`, иначе cloud-init мог вернуть
    пароль при пересборке образа.
 
+### Доступ файловыми клиентами (WinSCP / PuTTY / FileZilla)
+
+Только по ключу; пароля нет. Тот же ключ экспортирован в PuTTY-формат:
+
+```text
+C:\Users\svv\vpn\ssh\eu-vpn-hub.ppk   для WinSCP / PuTTY / FileZilla
+C:\Users\svv\vpn\ssh\eu-vpn-hub       формат OpenSSH
+C:\Users\svv\vpn\ssh\eu-vpn-hub.pub   публичная часть
+```
+
+Отпечаток ключа: `SHA256:JkkFm0GzOOX61mCWczm1Swp3XIG85SBp5dtzNtVlq/4`.
+
+Параметры: SFTP, порт 22, пользователь `odmen`, пароль пустой, ключ —
+`eu-vpn-hub.ppk`.
+
+Две неочевидные детали, обе задокументированы в `ssh/README.txt` рядом с ключом:
+
+1. **При активном personal VPN публичный адрес узла изнутри туннеля
+   недоступен** — это следствие правила «peer может адресовать только узел своей
+   зоны» (§8). Подключаться надо на `10.10.30.1` (зона C) или `10.10.20.1`
+   (зона B). При выключенном VPN — на `31.58.181.202`.
+2. Для записи вне `/home/odmen` нужен sudo-режим SFTP:
+   `sudo /usr/lib/openssh/sftp-server` в настройках сервера SFTP. Иначе
+   `/etc/wireguard`, `/etc/nftables.conf` и прочее открываются только на чтение.
+
+Приватный ключ равнозначен root на узле, потому что у `odmen` sudo без пароля
+(warning 7). Он лежит вне Git и не должен покидать управляющую машину.
+
 Порт SSH не менялся: obscurity вместо аутентификации задание запрещает.
 fail2ban с jail `sshd` (backend systemd, bantime 1h, maxretry 5) активен и уже
 забанил один сканирующий адрес во время работ.
