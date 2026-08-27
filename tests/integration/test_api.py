@@ -449,6 +449,52 @@ def test_profile_programs(client: TestClient, auth_headers: dict):
     assert body["items"][0]["profile_id"] == profile_id
 
 
+def test_program_html_is_served(client: TestClient, auth_headers: dict):
+    """Админка получает тот же документ, что уходит пользователю в Telegram."""
+    profile_id = "test-api-prog-html"
+    _create_test_profile(client, profile_id)
+    generated = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+    program_id = generated["program"]["program_id"]
+
+    response = client.get(f"/api/v1/programs/{program_id}/html", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.headers["content-disposition"].startswith("inline")
+    assert "<!DOCTYPE html>" in response.text
+    assert 'id="timerWrap"' in response.text
+
+
+def test_program_html_download_disposition(client: TestClient, auth_headers: dict):
+    profile_id = "test-api-prog-html-dl"
+    _create_test_profile(client, profile_id)
+    generated = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+    program_id = generated["program"]["program_id"]
+
+    response = client.get(
+        f"/api/v1/programs/{program_id}/html?download=true", headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert disposition.startswith("attachment")
+    assert f"workout_program_{profile_id}_v1.html" in disposition
+
+
+def test_program_html_not_found(client: TestClient, auth_headers: dict):
+    response = client.get("/api/v1/programs/nonexistent-id/html", headers=auth_headers)
+    assert response.status_code == 404
+
+
+def test_program_html_requires_auth(client: TestClient):
+    response = client.get("/api/v1/programs/any-id/html")
+    assert response.status_code in (401, 403)
+
+
 def test_get_exercise_by_external_id(client: TestClient, auth_headers: dict):
     listing = client.get("/api/v1/exercises?limit=1", headers=auth_headers).json()
     external_id = listing["items"][0]["external_id"]
