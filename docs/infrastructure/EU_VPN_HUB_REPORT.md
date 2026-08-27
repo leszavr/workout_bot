@@ -9,7 +9,7 @@ Workout staging `192.168.1.3`.
 EU VPS:            PASS
 Workout VPN:       PASS
 Telegram access:   PASS
-Personal VPN:      PASS
+Personal VPN:      PASS (две зоны: AmneziaWG и WireGuard)
 VPN management UI:  NOT INSTALLED (вместо него CLI vpn-peer, см. §7)
 Security:          PASS WITH WARNINGS
 ```
@@ -64,11 +64,13 @@ IPv6 работает, но у него нет DNS-резолвинга для �
 | unattended-upgrades | 2.9.1+nmu4ubuntu1 | автообновления безопасности |
 | qrencode | 4.1.1-1build2 | QR-экспорт personal-конфигов |
 | wstunnel | 10.6.2 | TLS-обёртка для Workout-туннеля |
+| amneziawg-dkms | 1.0.0 (ppa:amnezia/ppa) | kernel-модуль обфусцированного WireGuard |
+| amneziawg-tools | 1.0.20210914 | `awg`, `awg-quick` |
 | tcpdump, dnsutils, netcat-openbsd | из репозитория | диагностика |
 
 Systemd-units, включённые в автозапуск: `nftables`, `wg-quick@wg-workout`,
-`wg-quick@wg-personal`, `wstunnel-server`, `fail2ban`,
-`unattended-upgrades`, `ssh.socket`.
+`wg-quick@wg-personal`, `awg-quick@awg-personal`, `wstunnel-server`,
+`fail2ban`, `unattended-upgrades`, `ssh.socket`.
 
 Обновления: применены все доступные (`procps`, `libproc2-0`), выполнен
 контролируемый reboot, ядро поднялось до 6.8.0-138. Major OS upgrade не
@@ -89,9 +91,10 @@ Systemd-units, включённые в автозапуск: `nftables`, `wg-qui
 Публично разрешено (только на `eth0`):
 
 ```text
-TCP/22   sshd                — управление
-TCP/443  wstunnel-server     — транспорт Workout-туннеля (WSS)
-UDP/51821 wg-personal        — personal VPN
+TCP/22    sshd               — управление
+TCP/443   wstunnel-server    — транспорт Workout-туннеля (WSS)
+UDP/51821 wg-personal        — personal VPN, обычный WireGuard
+UDP/51822 awg-personal       — personal VPN, AmneziaWG
 UDP/67→68                    — DHCPv4 renewal
 ICMP echo/unreach/ttl, ICMPv6 — PMTU и ND/RA
 ```
@@ -267,6 +270,20 @@ wg-personal на EU VPS  10.10.20.1
 Internet
 ```
 
+Personal VPN реализован двумя независимыми зонами, потому что фильтрация у
+провайдеров разная:
+
+| Зона | Транспорт | Подсеть | Порт | Для каких сетей |
+|---|---|---|---|---|
+| B: `wg-personal` | обычный WireGuard | `10.10.20.0/24` | UDP/51821 | без WireGuard-фильтрации |
+| C: `awg-personal` | AmneziaWG (обфускация handshake) | `10.10.30.0/24` | UDP/51822 | с фильтрацией, как у рабочей машины |
+
+Зона C — основной вариант для устройств в фильтрующих сетях (см. §7a). Зона B
+оставлена как есть: она работает без клиентского транспорта там, где фильтра нет
+(мобильный интернет, другие провайдеры).
+
+### Зона B — обычный WireGuard
+
 Зона: `10.10.20.0/24` + `fd00:10:20::/64`. Полностью независима от зоны A:
 отдельная пара ключей сервера, отдельные ключи и preshared-ключи peer'ов,
 отдельный порт, отдельная подсеть, отдельный конфиг
@@ -275,6 +292,77 @@ Internet
 Созданы два peer'а: `phone` (`10.10.20.2`) и `laptop` (`10.10.20.3`).
 Клиентские конфиги лежат только на управляющей машине в `~/vpn-configs/`
 (режим 0600, каталог 0700) и в Git не попадают.
+
+### Зона C — AmneziaWG
+
+AmneziaWG — форк WireGuard с обфускацией handshake. Криптография идентична
+(Noise, X25519, ChaCha20-Poly1305, те же ключи и preshared-ключи); отличается
+только то, как выглядит трафик на проводе. Именно это снимает проблему
+DPI-детекта без TCP-обёртки.
+
+Установка на узле:
+
+```text
+PPA:      ppa:amnezia/ppa
+Пакеты:   amneziawg-dkms 1.0.0, amneziawg-tools 1.0.20210914
+Модуль:   /lib/modules/6.8.0-138-generic/updates/dkms/amneziawg.ko (DKMS)
+Autoload: /etc/modules-load.d/amneziawg.conf
+Unit:     awg-quick@awg-personal (enabled)
+Конфиг:   /etc/amnezia/amneziawg/awg-personal.conf, 0600
+Ключи:    /etc/amnezia/amneziawg/keys/, 0600 / каталог 0700
+```
+
+DKMS важен: при обновлении ядра модуль пересобирается автоматически, отдельного
+действия не требуется.
+
+Параметры обфускации (одинаковы на сервере и всех клиентах, иначе handshake не
+проходит):
+
+```text
+Jc = 6            число мусорных пакетов перед handshake
+Jmin = 40         минимальный размер мусорного пакета
+Jmax = 70         максимальный размер
+S1 = 130          размер обфусцированного init-пакета
+S2 = 64           размер обфусцированного response-пакета
+H1..H4            магические заголовки вместо фиксированных типов сообщений
+```
+
+Значения сгенерированы случайно с соблюдением ограничений upstream: `H1..H4`
+различны и больше 4, `S1 + 56 != S2` (иначе обфусцированный handshake совпал бы
+по размеру с транспортным пакетом и обфускация потеряла бы смысл).
+
+### Результаты на фильтрующем провайдере
+
+AmneziaWG проверен на том же сетевом пути, где обычный WireGuard умирает:
+
+| Тест | Результат |
+|---|---|
+| handshake + egress | PASS, egress `31.58.181.202` |
+| soak 20 запросов (~100 с) | `ok=20 fail=0` |
+| soak 60 запросов (~300 с), прогон 1 | `ok=59 fail=1`, потеря на 135 с |
+| soak 60 запросов (~300 с), прогон 2 | `ok=60 fail=0` |
+| из сети рабочей машины, 24 запроса (~120 с) | `ok=24 fail=0` |
+
+Единственная потеря в первом длинном прогоне — не обрыв: handshake остался
+живым, следующий запрос прошёл, второй прогон чистый. Похоже на обычную сетевую
+потерю, а не на срабатывание фильтра (при фильтре, как показано в §9, поток
+умирает окончательно и `rx` перестаёт расти).
+
+### Что это меняет для эксплуатации
+
+Для personal-устройств AmneziaWG предпочтительнее WireGuard+wstunnel:
+
+- один шаг вместо двух: не нужен запущенный транспорт на клиенте;
+- нет TCP-over-TCP оверхеда;
+- нет зависимости от IPv6 (работает по IPv4 UDP);
+- Windows-клиент есть готовый (MSI 3.1.0).
+
+Для Workout-туннеля схема **не менялась**: там уже работающий wstunnel, а
+staging-хост на Ubuntu 26.04, для которого PPA пока не собран (проверено:
+`resolute Release` отсутствует). Для тестов на staging использовался userspace
+`amneziawg-go`, собранный из исходников; в проде это лишняя движущаяся часть,
+когда TLS-транспорт уже проверен reboot-тестами. Переход Workout на AmneziaWG
+остаётся возможным follow-up, если TCP-оверхед начнёт мешать.
 
 ### Управление вместо web UI
 
@@ -291,14 +379,19 @@ Internet
 требования, что были в задании:
 
 ```bash
-vpn-peer list              # peer'ы, адреса, последний handshake, трафик
-vpn-peer add <name>        # новый peer, свободный адрес выбирается сам
-vpn-peer show <name>       # клиентский конфиг в stdout
-vpn-peer qr <name>         # тот же конфиг QR-кодом для телефона
-vpn-peer revoke <name>     # снять peer с интерфейса и стереть ключи (shred)
+vpn-peer [--awg] list          # peer'ы, адреса, последний handshake, трафик
+vpn-peer [--awg] add <name>    # новый peer, свободный адрес выбирается сам
+vpn-peer [--awg] show <name>   # клиентский конфиг в stdout
+vpn-peer [--awg] qr <name>     # тот же конфиг QR-кодом для телефона
+vpn-peer [--awg] revoke <name> # снять peer и стереть ключи (shred)
 ```
 
-Скрипт работает только с `wg-personal`; зону A он не трогает вообще. Изменения
+Без `--awg` инструмент работает с зоной B (обычный WireGuard), с `--awg` — с
+зоной C (AmneziaWG). Для зоны C в клиентский конфиг автоматически добавляется
+блок обфускации, считанный из серверного конфига, поэтому параметры не могут
+разойтись.
+
+Зону A (Workout) скрипт не трогает вообще. Изменения
 применяются через `wg set` (живые peer'ы не рвутся) и одновременно пишутся в
 конфиг, поэтому переживают reboot. Полный цикл add → list → show → qr → revoke →
 restart проверен: после revoke peer исчезает и из runtime, и из файла, число
@@ -326,8 +419,13 @@ personal-пользователям. Реализовано на четырёх 
    это правило закрывает `192.168.1.3` и `172.18.0.0/16` для personal-устройств,
    даже если маршрут туда когда-нибудь появится.
 4. **Ограничение адресации самого узла.** Peer зоны A может обращаться только к
-   `10.10.10.1` / `fd00:10:10::1`, peer зоны B — только к `10.10.20.1` /
-   `fd00:10:20::1`. Всё остальное — `drop`.
+   `10.10.10.1` / `fd00:10:10::1`, зоны B — к `10.10.20.1` / `fd00:10:20::1`,
+   зоны C — к `10.10.30.1` / `fd00:10:30::1`. Всё остальное — `drop`.
+
+Зона C (AmneziaWG) изолирована так же, как B, и дополнительно **от самой зоны B**:
+`awg-personal ↔ wg-personal` в обе стороны — `drop`. Проверено по счётчикам
+nftables: попытка достучаться из зоны C до `10.10.20.1` даёт срабатывание правила
+`isolate awg->personal`.
 
 Пункт 4 добавлен по результату первого прогона тестов: до него personal-peer
 пинговал `10.10.10.1` — адрес узла в Workout-зоне. Доступа к staging это не
@@ -411,7 +509,15 @@ IPv6 у локального провайдера пропадёт, туннел
 | Gateway restart counter | PASS (`RestartCount=0`, 36 опросов за ~18 мин) |
 | Telegram soak до reboot (20 запросов) | PASS (`ok=20 fail=0`) |
 | Telegram soak после reboot (20 запросов) | PASS (`ok=20 fail=0`) |
-| Personal VPN Internet | PASS (egress `31.58.181.202`, Telegram 302, GitHub 200) |
+| Personal VPN (зона B) Internet | PASS (egress `31.58.181.202`, Telegram 302, GitHub 200) |
+| Personal VPN (зона B) через wstunnel на фильтрующем ISP | PASS (`ok=20 fail=0`) |
+| Personal VPN (зона B) прямым UDP на фильтрующем ISP | FAIL by design (handshake есть, 100% потерь) — причина перехода на зону C |
+| AmneziaWG (зона C) на фильтрующем ISP, 100 с | PASS (`ok=20 fail=0`) |
+| AmneziaWG (зона C) на фильтрующем ISP, 300 с ×2 | PASS (`ok=59 fail=1`, затем `ok=60 fail=0`) |
+| AmneziaWG (зона C) из сети рабочей машины, 120 с | PASS (`ok=24 fail=0`) |
+| AmneziaWG: изоляция от staging и от зоны B | PASS (все blocked/unreachable) |
+| AmneziaWG: add/show/qr/revoke + restart | PASS (runtime и конфиг консистентны) |
+| AmneziaWG: модуль DKMS после смены ядра | PASS (собран для 6.8.0-138, autoload настроен) |
 | Personal → staging PostgreSQL/Redis/MinIO | PASS (blocked) |
 | Personal → staging backend/frontend/SSH | PASS (blocked) |
 | Personal → Docker-сеть `172.18.0.0/16` | PASS (blocked) |
@@ -437,20 +543,23 @@ No tokens committed
 
 | Секрет | Место | Режим |
 |---|---|---|
-| Приватные ключи и PSK обеих зон | EU VPS `/etc/wireguard/keys/` | 0600, каталог 0700 |
+| Приватные ключи и PSK зон A и B | EU VPS `/etc/wireguard/keys/` | 0600, каталог 0700 |
+| Приватные ключи и PSK зоны C | EU VPS `/etc/amnezia/amneziawg/keys/` | 0600, каталог 0700 |
 | Приватный ключ peer'а staging | staging `/etc/wireguard/wg-workout.conf` | 0600 |
 | shared-secret пути wstunnel | оба хоста `/etc/wstunnel/{secret,client.env}` | 0600 |
 | TLS-ключ wstunnel | EU VPS `/etc/wstunnel/tls/key.pem` | 0640 `root:wstunnel` |
 | SSH-ключ администратора | управляющая машина `~/.ssh/eu-vpn-hub` | 0600 |
-| Клиентские конфиги personal VPN | управляющая машина `~/vpn-configs/` | 0600, каталог 0700 |
+| Клиентские конфиги зоны B | управляющая машина `~/vpn-configs/` | 0600, каталог 0700 |
+| Клиентские конфиги для Windows | `C:\Users\svv\vpn\` (вне Git) | — |
 
 В Git попали только: изменение `docker/staging-app-compose.yml`, новая
 переменная-плейсхолдер в `docker/staging-app.env.example` и этот отчёт.
 Публичные ключи серверов приведены в отчёте намеренно — они не секрет:
 
 ```text
-wg-workout  server pubkey: koPsiFJVvIFJllGuKEci5/gzzf2Ti72q0LJ0jDEaUVE=
-wg-personal server pubkey: PAHHS6TFzh1RTsxRHDE0IOwHTrbV0Tw3LpdZ774Sx0s=
+wg-workout   server pubkey: koPsiFJVvIFJllGuKEci5/gzzf2Ti72q0LJ0jDEaUVE=
+wg-personal  server pubkey: PAHHS6TFzh1RTsxRHDE0IOwHTrbV0Tw3LpdZ774Sx0s=
+awg-personal server pubkey: 590v3EPMdt/x8ODli8xIJ2Scpcuc6Ge4riwPceEQhBY=
 ```
 
 Значения `BOT_TOKEN`, `ADMIN_PASSWORD`, `JWT_SECRET`, `DATABASE_URL`, MinIO- и
@@ -491,9 +600,9 @@ MinIO остаются приватными.
 4. **`docker0` на staging остался `DOWN` с подсетью `172.17.0.0/16`.** На
    маршрутизацию не влияет, но это лишняя запись в таблице.
 5. **VPN management web UI не установлен** (обоснование в §7). Управление
-   personal-зоной — через `vpn-peer`.
+   personal-зонами — через `vpn-peer` / `vpn-peer --awg`.
 6. **1 vCPU / 2 GB и отсутствие swap** на EU VPS. Для текущей нагрузки
-   (два WireGuard-интерфейса + wstunnel) достаточно, но запаса нет; при росте
+   (три VPN-интерфейса + wstunnel) достаточно, но запаса нет; при росте
    personal-трафика узел станет узким местом раньше, чем канал.
 7. **Passwordless sudo для `odmen`** на EU VPS (`/etc/sudoers.d/90-odmen`).
    Сделано осознанно для автоматизации, но это означает: компрометация
@@ -504,33 +613,49 @@ MinIO остаются приватными.
    У `odmen` на staging passwordless sudo **не** настраивался, пароль sudo
    нигде не сохранён. Если постоянный root-доступ по ключу не нужен, его стоит
    отозвать отдельной задачей.
+9. **AmneziaWG зависит от DKMS-модуля.** При обновлении ядра модуль
+   пересобирается автоматически, но если сборка когда-нибудь упадёт,
+   `awg-quick@awg-personal` не поднимется. Диагностика: `modinfo amneziawg`,
+   `dkms status`. Зона B (обычный WireGuard) при этом продолжит работать, потому
+   что использует штатный модуль ОС — это и есть смысл держать обе зоны.
+10. **Параметры обфускации — общий секрет схемы.** `Jc`, `S1`, `S2`, `H1..H4`
+    должны совпадать на сервере и всех клиентах байт в байт. Смена значений
+    требует одновременного обновления узла и каждого устройства, иначе handshake
+    перестанет проходить. `vpn-peer --awg show` подставляет их автоматически,
+    поэтому вручную их менять не нужно.
 
 ## 13a. Personal VPN на клиентских устройствах
 
 Тот же провайдерский фильтр, что глушит WireGuard на staging, действует и в сети
 рабочей машины. Проверено отдельно: чистый WireGuard на публичный UDP/51821 с
-этого пути даёт handshake и затем 100% потерь, а через `wstunnel` — 20/20
-успешных запросов и egress `31.58.181.202`.
+этого пути даёт handshake и затем 100% потерь.
 
-Поэтому `wstunnel-server` на узле разрешает две локальные цели:
+Проверялись оба обхода, оба работают:
+
+| Способ | Результат на этом пути |
+|---|---|
+| AmneziaWG, UDP/51822 напрямую | `ok=24 fail=0` (120 с), `ok=60 fail=0` (300 с) |
+| WireGuard + wstunnel, TLS/IPv6/443 | `ok=20 fail=0` |
+
+**Основной способ для клиентов — AmneziaWG:** один шаг вместо двух, без
+TCP-оверхеда, без зависимости от IPv6, готовый Windows-клиент (MSI 3.1.0).
+Зона B с wstunnel оставлена как резерв и как вариант для сетей без фильтра.
+
+Чтобы зона B работала и через TLS, `wstunnel-server` разрешает две локальные
+цели:
 
 ```text
 --restrict-to 127.0.0.1:51820   # зона A, Workout
 --restrict-to 127.0.0.1:51821   # зона B, personal
 ```
 
-Публичный UDP/51821 оставлен открытым: он работает из сетей без такого фильтра
-(мобильный интернет, другие провайдеры) и не требует запуска транспорта на
-клиенте. Клиенты в фильтрующих сетях используют тот же TLS-транспорт, что и
-staging.
-
 Инструкция для Windows: `docs/infrastructure/PERSONAL_VPN_WINDOWS_SETUP.md`.
+Файлы разложены в `C:\Users\svv\vpn\` вместе с `START-HERE.txt`.
 
 Замечание об одновременной работе с другим full-tunnel VPN: на рабочей машине
 активен `nekoray-tun`. Два full-tunnel туннеля конкурируют за default route,
 поэтому либо personal VPN включается вместо nekoray, либо ему задаётся
-частичный `AllowedIPs`. Сам `wstunnel` маршруты не меняет и с nekoray не
-конфликтует.
+частичный `AllowedIPs`. Это свойство маршрутизации, а не дефект конфигурации.
 
 ## 14. Next required action
 
@@ -538,8 +663,10 @@ staging.
    блокер, который держал это раньше, снят; остаётся согласовать retention
    тестовых данных (см. `ANSWERS.md`, §5).
 2. Решить по warning 1: нужен ли резервный транспорт, если IPv6 пропадёт.
-3. Раздать personal-конфиги на устройства (`vpn-peer show` / `vpn-peer qr`) и при
-   необходимости отозвать неиспользуемый peer `laptop`.
+3. Установить AmneziaWG на рабочей машине (MSI и конфиг уже в
+   `C:\Users\svv\vpn\`, порядок в `START-HERE.txt`) и подтвердить egress
+   `31.58.181.202`. Затем раздать конфиги на остальные устройства
+   (`vpn-peer --awg qr <имя>`) и отозвать неиспользуемые peer'ы зоны B.
 4. Отдельной задачей — Tabitoken: теперь есть возможность проверить его через
    EU-адрес и понять, был ли `403` географической блокировкой.
 5. Решить судьбу root-доступа по ключу на staging (warning 8).
@@ -558,15 +685,22 @@ UDP и обычный TCP на нестандартных портах прох�
 | **wstunnel (выбран)** | WireGuard внутри TLS/WSS на 443. Поток выглядит как HTTPS. Шифрование и аутентификация WireGuard сохранены полностью, wstunnel только транспорт. Уже работает, проверено soak-тестами. |
 | **MTProto proxy** | Решает только Telegram и только для Telegram-клиентов. Это не VPN: остальной трафик через него не пойдёт, personal VPN на нём не построить. Для Workout-задачи означало бы правку кода бота (свой proxy в aiogram) вместо сетевого решения — задание правку кода без обоснования запрещает. |
 | **SOCKS5 / HTTP proxy** | Технически проще, но: (а) без обёртки поток узнаваем и уязвим к тому же фильтру; (б) требует поддержки proxy в каждом клиенте — в `apps/telegram_gateway/main.py` `Bot` создаётся без сессии с proxy, поддержки в `config.py` и `.env.example` нет; (в) для personal VPN на уровне ОС непригоден без отдельного TUN-слоя. |
-| **AmneziaWG** | Правильный кандидат: форк WireGuard с обфускацией (junk-пакеты, изменённые заголовки handshake) именно против DPI-детекта WireGuard. Даёт UDP-транспорт без TCP-оверхеда. Минусы для этого узла: нужен свой kernel-модуль или userspace-демон вместо штатного `wireguard` из ОС, отдельный клиент на каждом устройстве, и в задании прямо сказано использовать «стандартные и поддерживаемые механизмы ОС» для WireGuard. Разумный follow-up, если TCP-оверхед начнёт мешать. |
+| **AmneziaWG (внедрён для personal VPN)** | Форк WireGuard с обфускацией handshake (junk-пакеты, изменённые заголовки) именно против DPI-детекта WireGuard. Даёт UDP без TCP-оверхеда и без зависимости от IPv6. Установлен на узле как зона C из PPA с DKMS-модулем, проверен на фильтрующем провайдере: `ok=60 fail=0` за 300 с. Для Workout-туннеля не применён: staging на Ubuntu 26.04, PPA под неё пока не собран, а userspace-демон — лишняя движущаяся часть там, где TLS-транспорт уже прошёл reboot-тесты. |
 | **Shadowsocks / VLESS+Reality / Xray** | Сильнее по маскировке, чем TLS-обёртка, и уже используется на этой машине (nekoray). Но это отдельный стек с собственной моделью управления, поверх которого VPN всё равно надо строить. Для задачи «дать контейнеру доступ к Telegram» это заметно больше сложности при том же результате. |
 | **OpenVPN over TCP/443** | Тоже маскируется под TLS, но медленнее WireGuard, тяжелее в настройке и с более сложной ключевой инфраструктурой. Выигрыша перед текущей схемой нет. |
 
-Итог: смена протокола ничего не добавила бы, потому что проблема не в
-протоколе. Текущая схема сохраняет WireGuard как VPN-слой (простой, быстрый,
-с ключами и PSK) и решает вопрос обхода отдельным транспортным слоем, который
-можно заменить, не трогая VPN-конфигурацию. Если TCP-оверхед станет проблемой —
-менять надо именно транспорт: AmneziaWG на UDP как первый кандидат.
+Итог. Проблема не в протоколе, а в распознаваемости потока, поэтому применены
+два разных решения одной задачи:
+
+- **Workout-туннель** — WireGuard внутри TLS (`wstunnel`). Выбран потому, что
+  работает на Ubuntu 26.04 без нештатных модулей и уже подтверждён
+  reboot-тестами.
+- **Personal VPN** — AmneziaWG (обфускация на уровне самого WireGuard). Выбран
+  потому, что клиентам не нужен второй процесс, нет TCP-оверхеда и есть готовый
+  Windows-клиент.
+
+Оба варианта сохраняют WireGuard как VPN-слой с теми же ключами и PSK. Обход
+вынесен в заменяемый слой: транспорт у первого, параметры обфускации у второго.
 
 Один практический плюс текущего выбора: TCP/443 работает и через IPv4, если
 блокировка префикса когда-нибудь снимется — достаточно поправить одну строку
@@ -578,9 +712,12 @@ UDP и обычный TCP на нестандартных портах прох�
 
 ```bash
 sudo wg show
-sudo systemctl status wstunnel-server nftables wg-quick@wg-workout wg-quick@wg-personal
+sudo awg show
+sudo systemctl status wstunnel-server nftables \
+  wg-quick@wg-workout wg-quick@wg-personal awg-quick@awg-personal
 sudo nft list ruleset
 sudo vpn-peer list
+sudo vpn-peer --awg list
 ```
 
 Состояние на staging:
