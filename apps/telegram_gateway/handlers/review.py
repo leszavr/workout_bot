@@ -30,6 +30,10 @@ from apps.telegram_gateway.keyboards.inline import (
     edit_sections_kb,
     review_kb,
 )
+from apps.telegram_gateway.pipeline import (
+    build_program_pipeline,
+    is_auto_generation_enabled,
+)
 from apps.telegram_gateway.states.questionnaire_states import QuestionnaireStates
 from src.application.questionnaire.review import render_review_html
 from src.errors import ProfilePersistenceError, QuestionnaireValidationError
@@ -101,11 +105,6 @@ async def final_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     # Автогенерация программы после успешного сохранения профиля.
     # Ошибки pipeline не ломают сохранённый профиль; задача выполняется
     # в фоне, чтобы не блокировать handler.
-    from apps.telegram_gateway.pipeline import (
-        build_program_pipeline,
-        is_auto_generation_enabled,
-    )
-
     if is_auto_generation_enabled() and result.profile.profile_id:
         task = asyncio.create_task(
             run_program_pipeline(
