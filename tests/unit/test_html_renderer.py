@@ -201,4 +201,46 @@ class TestHtmlTimer:
 
     def test_timer_hidden_in_print(self):
         html = render_program_html(_program(), exercise_info=_info())
-        assert ".days-nav,.timer-wrap{display:none}" in html
+        assert ".days-nav,.timer-wrap,.timer-spacer{display:none}" in html
+
+
+class TestHtmlPinnedTimer:
+    """Приклеивание таймера к верху экрана во время отдыха.
+
+    Без него отсчёт уезжает за пределы экрана, как только пользователь
+    прокручивает страницу к следующему упражнению.
+    """
+
+    def test_pinned_markup_present(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        assert 'id="timerAnchor"' in html
+        assert 'id="timerSpacer"' in html
+        assert 'id="timerWrap"' in html
+
+    def test_pinned_style_is_fixed_and_translucent(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        assert ".timer-wrap.pinned{position:fixed;top:0" in html
+        assert "opacity:.9" in html
+        assert "backdrop-filter:blur(10px)" in html
+
+    def test_pinned_state_hides_presets_and_label(self):
+        """В сжатом виде остаются только отсчёт и Старт/Сброс."""
+        html = render_program_html(_program(), exercise_info=_info())
+        assert ".timer-wrap.pinned .timer-lbl{display:none}" in html
+        assert ".timer-wrap.pinned .btn-t{display:none}" in html
+
+    def test_pin_follows_scroll_only_while_running(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        assert "function _syncPin()" in html
+        assert "_pinTimer(tRunning && anchor.getBoundingClientRect().top < 0)" in html
+        assert "window.addEventListener('scroll', _syncPin, { passive: true })" in html
+
+    def test_spacer_compensates_height(self):
+        """Переход в fixed вынимает элемент из потока: без распорки страница дёргается."""
+        html = render_program_html(_program(), exercise_info=_info())
+        assert "spacer.style.height = wrap.offsetHeight + 'px'" in html
+
+    def test_state_changes_resync_pin(self):
+        html = render_program_html(_program(), exercise_info=_info())
+        # старт/пауза, сброс, смена пресета и автовозврат
+        assert html.count("_syncPin();") >= 5

@@ -246,7 +246,9 @@ def render_program_html(
   <p>{duration_line}</p>
 </div>
 
-<div class="timer-wrap">
+<div class="timer-anchor" id="timerAnchor"></div>
+<div class="timer-spacer" id="timerSpacer"></div>
+<div class="timer-wrap" id="timerWrap">
   <div class="timer-lbl">&#x23F1; Таймер отдыха</div>
   <div class="timer-disp" id="timerDisp">1:30</div>
   <div class="timer-btns">
@@ -305,6 +307,24 @@ body{font-family:var(--ff);background:var(--bg);color:var(--text);font-size:16px
 .header p{font-size:12px;color:var(--text2)}
 .timer-wrap{background:var(--surface2);border:1px solid var(--border);
   border-radius:var(--r-lg);padding:12px 14px;margin:14px 14px 0;text-align:center}
+/* Приклеенный таймер: пока идёт отдых, отсчёт остаётся виден при прокрутке
+   к следующему упражнению. Полупрозрачный и сжатый, чтобы не закрывать текст. */
+.timer-anchor{height:0}
+.timer-spacer{display:none}
+.timer-spacer.on{display:block}
+.timer-wrap.pinned{position:fixed;top:0;left:0;right:0;z-index:900;
+  margin:0;padding:7px 12px;border-top:none;border-left:none;border-right:none;
+  border-radius:0 0 var(--r-lg) var(--r-lg);
+  display:flex;align-items:center;gap:10px;text-align:left;
+  background:rgba(28,35,51,.88);
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  box-shadow:0 2px 12px rgba(0,0,0,.5);opacity:.9;transition:opacity .2s}
+.timer-wrap.pinned:hover,.timer-wrap.pinned:active{opacity:1}
+.timer-wrap.pinned .timer-lbl{display:none}
+.timer-wrap.pinned .timer-disp{font-size:24px;margin:0;flex-shrink:0;letter-spacing:0}
+.timer-wrap.pinned .timer-btns{margin-left:auto;gap:5px;flex-wrap:nowrap}
+.timer-wrap.pinned .btn-t{display:none}
+.timer-wrap.pinned .btn-go,.timer-wrap.pinned .btn-rst{padding:6px 12px;font-size:12px}
 .timer-lbl{font-size:11px;text-transform:uppercase;letter-spacing:.9px;
   color:var(--text2);margin-bottom:6px;font-weight:600}
 .timer-disp{font-size:38px;font-weight:700;color:var(--accent);
@@ -397,7 +417,7 @@ body{font-family:var(--ff);background:var(--bg);color:var(--text);font-size:16px
   padding:8px 12px;font-size:12px;color:var(--gold);margin-top:6px}
 .ex-tip.warning{background:#1c0e0e;border-color:var(--red);color:var(--red)}
 @media print{
-  .days-nav,.timer-wrap{display:none}
+  .days-nav,.timer-wrap,.timer-spacer{display:none}
   body{background:#fff;color:#000;padding:0;font-size:11pt}
   .day-section{display:block!important;padding:0}
   .day-section::before{content:attr(data-title);
@@ -433,6 +453,33 @@ var tSec = 90, tSet = 90, tRunning = false, tInt = null, tAutoReset = null;
 function _cancelAutoReset() {
   if (tAutoReset) { clearTimeout(tAutoReset); tAutoReset = null; }
 }
+/* Приклеивание таймера к верху экрана.
+
+   Работает только при запущенном отсчёте: в покое таймер остаётся на своём
+   месте в потоке страницы. Spacer компенсирует высоту, которую элемент теряет
+   при переходе в position:fixed, иначе содержимое подпрыгивало бы. */
+function _pinTimer(on) {
+  var wrap = document.getElementById('timerWrap');
+  var spacer = document.getElementById('timerSpacer');
+  if (!wrap || !spacer) return;
+  if (on === wrap.classList.contains('pinned')) return;
+  if (on) {
+    spacer.style.height = wrap.offsetHeight + 'px';
+    spacer.classList.add('on');
+    wrap.classList.add('pinned');
+  } else {
+    wrap.classList.remove('pinned');
+    spacer.classList.remove('on');
+    spacer.style.height = '';
+  }
+}
+function _syncPin() {
+  var anchor = document.getElementById('timerAnchor');
+  if (!anchor) return;
+  _pinTimer(tRunning && anchor.getBoundingClientRect().top < 0);
+}
+window.addEventListener('scroll', _syncPin, { passive: true });
+window.addEventListener('resize', _syncPin);
 function setTimer(s, btn) {
   tSet = s; tSec = s;
   if (tRunning) { clearInterval(tInt); tRunning = false; }
@@ -441,6 +488,7 @@ function setTimer(s, btn) {
   updTimer();
   document.querySelectorAll('.btn-t').forEach(function(b){ b.classList.remove('act'); });
   if (btn) btn.classList.add('act');
+  _syncPin();
 }
 function updTimer() {
   var m = Math.floor(tSec / 60), s = tSec % 60;
@@ -453,20 +501,24 @@ function startTimer() {
   if (tRunning) {
     clearInterval(tInt); tRunning = false;
     btn.textContent = '\\u25BA Старт';
+    _syncPin();
     return;
   }
   _cancelAutoReset();
   if (tSec === 0) { tSec = tSet; }
   tRunning = true;
   btn.textContent = '\\u23F8 Пауза';
+  _syncPin();
   tInt = setInterval(function() {
     if (tSec > 0) { tSec--; updTimer(); }
     if (tSec === 0) {
       clearInterval(tInt); tRunning = false;
       btn.textContent = '\\u25BA Старт';
       if ('vibrate' in navigator) navigator.vibrate([300, 100, 300]);
+      // Ноль виден секунду, затем таймер сам встаёт на исходное время:
+      // «Сброс» нужен только чтобы прервать неоконченный отдых.
       tAutoReset = setTimeout(function() {
-        tAutoReset = null; tSec = tSet; updTimer();
+        tAutoReset = null; tSec = tSet; updTimer(); _syncPin();
       }, 1000);
     }
   }, 1000);
@@ -476,5 +528,6 @@ function resetTimer() {
   _cancelAutoReset(); tSec = tSet;
   document.querySelector('.btn-go').textContent = '\\u25BA Старт';
   updTimer();
+  _syncPin();
 }
 showDay(1);"""
