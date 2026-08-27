@@ -280,13 +280,19 @@ async def test_gateway_no_candidates_raises_configuration_error():
 # --- Connection test -----------------------------------------------------------------
 
 
-def _test_gateway(adapter, endpoint: AIEndpoint) -> tuple[AIGateway, FakeEndpointsRepo]:
+def _test_gateway(
+    adapter, endpoint: AIEndpoint, models: dict[int, AIModel] | None = None
+) -> tuple[AIGateway, FakeEndpointsRepo]:
     """Gateway для проверки подключения (endpoint/provider доступны репозиториям)."""
     endpoints = FakeEndpointsRepo({10: endpoint})
     providers = FakeRepo(
         {1: AIProvider(id=1, name="P", slug="p1", protocol=AIProtocol.OPENAI_COMPATIBLE)}
     )
-    models = FakeRepo({1: AIModel(id=1, endpoint_id=10, model_id="model-a", display_name="A")})
+    models = FakeRepo(
+        models
+        if models is not None
+        else {1: AIModel(id=1, endpoint_id=10, model_id="model-a", display_name="A")}
+    )
     registry = ProviderAdapterRegistry()
     registry.register(AIProtocol.OPENAI_COMPATIBLE, adapter)
     config = AITaskConfig(id=100, task_type=AITaskType.WORKOUT_GENERATION, enabled=True)
@@ -371,6 +377,73 @@ async def test_connection_test_unknown_endpoint_raises():
     gateway, _, _ = _gateway(adapter)
     with pytest.raises(AIConfigurationError):
         await gateway.test_endpoint(999)
+
+
+async def test_connection_test_pings_enabled_model_not_the_first_one():
+    """Проверять надо ту модель, которую система реально может вызвать.
+
+    Отключённая модель может быть снята провайдером с обслуживания: её отказ
+    пометил бы рабочее подключение как недоступное и закрыл readiness gate.
+    """
+    endpoint = AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    adapter = ScriptedAdapter([AdapterResult(content="pong", model="live")])
+    gateway, endpoints = _test_gateway(
+        adapter,
+        endpoint,
+        models={
+            1: AIModel(
+                id=1, endpoint_id=10, model_id="retired", display_name="R", enabled=False
+            ),
+            2: AIModel(id=2, endpoint_id=10, model_id="live", display_name="L"),
+        },
+    )
+
+    result = await gateway.test_endpoint(10)
+
+    assert result["model"] == "live"
+    assert adapter.calls == [("live", None)]
+    assert result["success"] is True
+    assert endpoints.test_results == [(10, True, None)]
+
+
+async def test_connection_test_without_enabled_models_reports_configuration():
+    """Все модели выключены — это настройка, а не потеря связи.
+
+    Результат теста не перезаписывается: иначе рабочее подключение осталось бы
+    помеченным как недоступное, а readiness gate — закрытым.
+    """
+    endpoint = AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    adapter = ScriptedAdapter([])
+    gateway, endpoints = _test_gateway(
+        adapter,
+        endpoint,
+        models={
+            1: AIModel(
+                id=1, endpoint_id=10, model_id="retired", display_name="R", enabled=False
+            )
+        },
+    )
+
+    result = await gateway.test_endpoint(10)
+
+    assert result["success"] is False
+    assert result["error_type"] == "NoEnabledModel"
+    assert result["model"] is None
+    assert adapter.calls == []
+    assert endpoints.test_results == []
+
+
+async def test_connection_test_without_any_model_still_pings():
+    """Эндпоинт без моделей: проверяем сам адрес нейтральным запросом."""
+    endpoint = AIEndpoint(id=10, provider_id=1, name="E", base_url="https://x.example/v1")
+    adapter = ScriptedAdapter([AdapterResult(content="pong", model="ping")])
+    gateway, endpoints = _test_gateway(adapter, endpoint, models={})
+
+    result = await gateway.test_endpoint(10)
+
+    assert result["model"] == "ping"
+    assert result["success"] is True
+    assert endpoints.test_results == [(10, True, None)]
 
 
 # --- Список доступных моделей ---------------------------------------------------------

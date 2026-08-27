@@ -476,7 +476,8 @@ export interface AIEndpointTestResult {
   latency_ms: number;
   provider: string;
   endpoint: string;
-  model: string;
+  // null, когда проверять нечего: все модели подключения выключены.
+  model: string | null;
   message?: string;
   error_type?: string;
 }
