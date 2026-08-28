@@ -173,6 +173,10 @@ export default function ProfileDetailPage() {
   const [generatorType, setGeneratorType] = useState<"deterministic" | "ai">(
     "deterministic",
   );
+  // Ключ версии, для которой сейчас готовится HTML: программа с фотографиями
+  // весит несколько мегабайт, и без индикатора нажатие выглядит безответным.
+  const [htmlPending, setHtmlPending] = useState("");
+  const [htmlError, setHtmlError] = useState("");
 
   const loadPrograms = useCallback(() => {
     api
@@ -205,6 +209,38 @@ export default function ProfileDetailPage() {
       );
     } finally {
       setGenerating(false);
+    }
+  }
+
+  /**
+   * Открыть или скачать тот же HTML, который уходит пользователю в Telegram.
+   *
+   * Через blob, а не ссылкой: токен хранится в localStorage, при обычном
+   * переходе браузер его не отправит и вместо программы откроется логин.
+   */
+  async function onHtml(program: ProgramListItem, download: boolean) {
+    const key = `${program.program_id}-v${program.version}`;
+    setHtmlPending(key);
+    setHtmlError("");
+    let url = "";
+    try {
+      const blob = await api.programHtml(program.program_id, program.version);
+      url = URL.createObjectURL(blob);
+      if (download) {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `program_${program.program_id}_v${program.version}.html`;
+        link.click();
+      } else {
+        window.open(url, "_blank", "noopener");
+      }
+    } catch (e) {
+      setHtmlError(e instanceof Error ? e.message : "Не удалось получить HTML");
+    } finally {
+      // Ссылка живёт до закрытия вкладки: слишком ранний revoke обрывает
+      // открытие документа, слишком поздний держит файл в памяти.
+      if (url) setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      setHtmlPending("");
     }
   }
 
@@ -305,6 +341,7 @@ export default function ProfileDetailPage() {
           description="Каждая сборка сохраняется отдельной версией — предыдущие остаются."
         >
           {generateError && <div className="error">{generateError}</div>}
+          {htmlError && <div className="error">{htmlError}</div>}
 
           {canWrite ? (
             <div className="subcard" style={{ marginBottom: "var(--s-4)" }}>
@@ -380,6 +417,7 @@ export default function ProfileDetailPage() {
                     <th>Состояние</th>
                     <th>Собрана</th>
                     <th>Когда</th>
+                    <th>Файл программы</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -400,6 +438,30 @@ export default function ProfileDetailPage() {
                         </Tag>
                       </td>
                       <td className="muted">{moment(p.created_at)}</td>
+                      <td>
+                        <div className="button-row">
+                          <button
+                            type="button"
+                            disabled={
+                              htmlPending === `${p.program_id}-v${p.version}`
+                            }
+                            onClick={() => onHtml(p, false)}
+                          >
+                            {htmlPending === `${p.program_id}-v${p.version}`
+                              ? "Готовим…"
+                              : "Открыть HTML"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              htmlPending === `${p.program_id}-v${p.version}`
+                            }
+                            onClick={() => onHtml(p, true)}
+                          >
+                            Скачать
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

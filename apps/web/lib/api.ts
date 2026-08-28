@@ -117,6 +117,49 @@ async function request<T>(
   return response.json() as Promise<T>;
 }
 
+// Загрузка бинарного/HTML-ответа. Обычная ссылка здесь не работает: токен
+// лежит в localStorage, а не в cookie, поэтому браузер не отправил бы его при
+// переходе, и вместо документа открылась бы страница логина.
+async function requestBlob(
+  path: string,
+  timeoutMs: number = LONG_TIMEOUT_MS
+): Promise<Blob> {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      headers,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (controller.signal.aborted) {
+      throw new ApiError(
+        408,
+        `Сервер не ответил за ${Math.round(timeoutMs / 1000)} с. Повторите попытку.`
+      );
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (response.status === 401) {
+    clearToken();
+    if (typeof window !== "undefined") window.location.href = "/login";
+    throw new ApiError(401, "Требуется авторизация");
+  }
+  if (!response.ok) {
+    throw parseErrorBody(response.status, await response.text().catch(() => ""));
+  }
+  return response.blob();
+}
+
 // --- Авторизация и текущий пользователь --------------------------------------------
 
 // Значение detail, которым backend сообщает «пароль нужно сменить».
@@ -810,6 +853,12 @@ export const api = {
       { method: "POST", body: JSON.stringify({ generator }) },
       LONG_TIMEOUT_MS
     ),
+  programHtml: (programId: string, version?: number) => {
+    const qs = new URLSearchParams();
+    if (version) qs.set("version", String(version));
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return requestBlob(`/api/v1/programs/${programId}/html${suffix}`);
+  },
   aiProviders: () =>
     request<ListResponse<AIProviderForUI>>("/api/v1/ai/providers"),
 };
