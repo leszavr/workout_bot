@@ -9,11 +9,13 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from apps.backend.api.v1.dependencies import (
     build_generation_orchestrator,
+    build_program_html_service,
     build_program_service,
 )
 from apps.backend.api.v1.user_dependencies import build_admin_user_service
@@ -33,6 +35,7 @@ from src.application.programs.orchestrator import (
     GenerationRequest,
     OrchestratorResult,
 )
+from src.application.programs.telegram_delivery import build_filename
 from src.domain.auth import AdminRole
 from src.domain.generation import (
     GenerationErrorCode,
@@ -43,6 +46,7 @@ from src.domain.program import WorkoutProgram
 from src.errors import (
     GenerationAlreadyRunningError,
     GenerationFailedError,
+    HtmlRenderError,
     IdempotencyKeyConflictError,
     ProgramGenerationError,
 )
@@ -549,6 +553,45 @@ async def list_profile_programs(
     service = build_program_service()
     programs = await service.list_for_profile(profile_id)
     return {"total": len(programs), "items": [_program_summary(p) for p in programs]}
+
+
+@router.get(
+    "/programs/{program_id}/html",
+    response_class=Response,
+    responses={
+        200: {"content": {"text/html": {}}, "description": "Готовый HTML программы"},
+        404: {"description": "Program not found"},
+        422: {"description": "Render failed"},
+    },
+)
+async def get_program_html(
+    program_id: str,
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+    version: Annotated[int | None, Query(ge=1)] = None,
+    download: Annotated[bool, Query()] = False,
+) -> Response:
+    """Тот же HTML, что получает пользователь в Telegram.
+
+    Рендер идёт через `ProgramHtmlService`, поэтому админка и доставка не могут
+    разойтись: вложенные фотографии, media mode и вёрстка берутся из одного
+    источника. `download=true` отдаёт файл, иначе документ открывается в
+    соседней вкладке.
+    """
+    program = await build_program_service().get(program_id, version)
+    if program is None:
+        raise HTTPException(status_code=404, detail="Program not found")
+    try:
+        html = await build_program_html_service().render(program)
+    except HtmlRenderError as exc:
+        raise HTTPException(status_code=422, detail=safe_error_message(exc)) from exc
+
+    disposition = "attachment" if download else "inline"
+    filename = build_filename(program.profile_id, program.version)
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+    )
 
 
 class GenerateProgramRequest(BaseModel):

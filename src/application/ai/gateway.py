@@ -256,6 +256,10 @@ class AIGateway:
 
         Результат сохраняется на эндпоинте: отчёт готовности AI должен
         отличать «подключение не проверялось» от «проверка провалилась».
+
+        Проверяется включённая модель: отключённую систему не вызывает никогда,
+        и её отказ (например, снятая с обслуживания модель) означал бы
+        «связи нет» при полностью рабочем подключении.
         """
         endpoint = await self._endpoints.get(endpoint_id)
         if endpoint is None:
@@ -265,7 +269,24 @@ class AIGateway:
             raise AIConfigurationError("Сервис для этого подключения не найден")
 
         models = await self._models.list_for_endpoint(endpoint_id)
-        model_id = models[0].model_id if models else "ping"
+        enabled = [m for m in models if m.enabled]
+        if models and not enabled:
+            # Конфигурация, а не отказ связи: результат теста не перезаписываем,
+            # иначе рабочее подключение осталось бы помеченным как недоступное.
+            return {
+                "provider": provider.slug,
+                "endpoint": endpoint.name,
+                "model": None,
+                "success": False,
+                "latency_ms": 0,
+                "error_type": "NoEnabledModel",
+                "message": (
+                    "Все модели этого подключения выключены — проверять нечего. "
+                    "Включите модель и повторите проверку."
+                ),
+            }
+
+        model_id = enabled[0].model_id if enabled else "ping"
         base = {"provider": provider.slug, "endpoint": endpoint.name, "model": model_id}
 
         started = time.monotonic()

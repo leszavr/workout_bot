@@ -162,12 +162,15 @@ async def confirm_days(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("Дни недели сохранены")
 
 
-@router.callback_query()
+@router.callback_query(F.data.in_(CALLBACK_TO_QUESTION))
 async def handle_choice(callback: CallbackQuery, state: FSMContext) -> None:
-    """Единая точка обработки всех вопросов с вариантами ответа."""
-    question_id = CALLBACK_TO_QUESTION.get(callback.data or "")
-    if question_id is None:
-        return
+    """Единая точка обработки всех вопросов с вариантами ответа.
+
+    Фильтр обязателен: aiogram отдаёт обновление первому подошедшему
+    хендлеру и дальше по роутерам не идёт. Без него анкета перехватывала бы
+    review/confirm/edit-коллбэки соседнего роутера и молча их теряла.
+    """
+    question_id = CALLBACK_TO_QUESTION[callback.data or ""]
     profile = await load_profile(state)
     if profile is None:
         return
