@@ -45,6 +45,12 @@ from src.infrastructure.persistence.postgres.ai_repository import (
 # журнал событий AI-контура должен быть один.
 FALLBACK_EVENT_TYPE = "ai_generation_fallback"
 
+# Попытки моделей внутри одной AI-генерации: какая модель отвечала, прошёл ли
+# первый ответ, сколько раз запрашивалось исправление и почему модель была
+# оставлена. Без этой записи журнал не отвечает на вопрос «почему цепочка
+# fallback не помогла»: usage-запись видит только сам факт вызова.
+MODEL_ATTEMPTS_EVENT_TYPE = "ai_model_attempts"
+
 
 class AIDependencyError(WorkoutBotError):
     """Удаление заблокировано зависимостями.
@@ -428,12 +434,19 @@ class AIConfigurationService:
     async def create_prompt_version(
         self, template: PromptTemplate, actor: str | None = None
     ) -> PromptTemplate:
-        """Создаёт новую версию; существующие версии неизменяемы."""
+        """Создаёт новую версию промпта.
+
+        Существующая версия не перезаписывается созданием: одна пара
+        «задача + версия» — один промпт, на который ссылается конфигурация
+        задачи. Правка текста выполняется отдельной операцией (`update_prompt`),
+        и это осознанно: администратору нужна итеративная доводка инструкции, а
+        нумерация версий вместо каждой правки быстро превращается в мусор.
+        """
         existing = await self._prompts.get(template.task_type, template.version)
         if existing is not None:
             raise WorkoutBotError(
-                f"Версия v{template.version} уже существует и неизменяема. "
-                "Создайте новую версию."
+                f"Версия v{template.version} уже существует. "
+                "Создайте новую версию или измените существующую."
             )
         created = await self._prompts.create(template)
         await self._audit.record(
@@ -447,6 +460,95 @@ class AIConfigurationService:
 
     async def next_prompt_version(self, task_type: AITaskType) -> int:
         return await self._prompts.next_version(task_type)
+
+    async def get_prompt(self, prompt_id: int) -> PromptTemplate | None:
+        return await self._prompts.get_by_id(prompt_id)
+
+    async def update_prompt(
+        self, prompt_id: int, actor: str | None = None, **fields
+    ) -> PromptTemplate | None:
+        """Правит текст и метаданные промпта, не меняя его идентичность.
+
+        В audit попадают только имена изменённых полей: текст инструкции — это
+        рабочий материал администратора, дублировать его в журнале не нужно, а
+        сам промпт всегда можно прочитать через API.
+        """
+        updated = await self._prompts.update(prompt_id, **fields)
+        if updated is not None:
+            await self._audit.record(
+                "ai_prompt_updated",
+                actor=actor,
+                entity_type="prompt_template",
+                entity_id=str(prompt_id),
+                metadata={
+                    "task_type": updated.task_type.value,
+                    "version": updated.version,
+                    "fields": sorted(fields.keys()),
+                },
+            )
+        return updated
+
+    async def prompt_dependencies(self, prompt_id: int) -> DeleteDependencies:
+        """Задачи, которые ссылаются на этот промпт.
+
+        Ссылка логическая: `ai_task_configs.prompt_version` хранит номер версии,
+        а не внешний ключ. База такое удаление не остановит, поэтому проверка
+        обязана быть здесь — иначе задача осталась бы с номером инструкции,
+        которой больше нет, и генерация молча уехала бы на файловый промпт.
+        """
+        dependencies = DeleteDependencies()
+        prompt = await self._prompts.get_by_id(prompt_id)
+        if prompt is None:
+            return dependencies
+        for config in await self._tasks.list():
+            if config.task_type != prompt.task_type:
+                continue
+            if config.prompt_version != prompt.version:
+                continue
+            state = "включённой" if config.enabled else "выключенной"
+            dependencies.blockers.append(
+                {
+                    "type": "ai_task_config",
+                    "task_type": config.task_type.value,
+                    "task_enabled": config.enabled,
+                    "prompt_version": prompt.version,
+                    "detail": (
+                        f"инструкция №{prompt.version} выбрана в настройках "
+                        f"{state} задачи «{config.task_type.value}»"
+                    ),
+                }
+            )
+        return dependencies
+
+    async def delete_prompt(self, prompt_id: int, actor: str | None = None) -> bool:
+        """Hard delete промпта, который не выбран ни одной задачей.
+
+        Hard delete, а не архивация: внешних ключей на `prompt_templates` нет —
+        ни usage-, ни audit-записи текст инструкции не хранят, поэтому удаление
+        не оставляет битых ссылок и не разрушает историю. Заводить флаг
+        «архивный» ради этого не нужно.
+        """
+        dependencies = await self.prompt_dependencies(prompt_id)
+        if not dependencies.safe:
+            raise AIDependencyError(
+                f"Невозможно удалить инструкцию: {dependencies.describe()}. "
+                "Сначала выберите для задачи другую версию инструкции.",
+                dependencies.blockers,
+            )
+        prompt = await self._prompts.get_by_id(prompt_id)
+        deleted = await self._prompts.delete(prompt_id)
+        if deleted:
+            await self._audit.record(
+                "ai_prompt_deleted",
+                actor=actor,
+                entity_type="prompt_template",
+                entity_id=str(prompt_id),
+                metadata={
+                    "task_type": prompt.task_type.value if prompt else None,
+                    "version": prompt.version if prompt else None,
+                },
+            )
+        return deleted
 
     # --- Observability -------------------------------------------------------------
 
@@ -491,4 +593,39 @@ class AIConfigurationService:
         """Журнал fallback: почему программа не была сгенерирована AI."""
         return await self._audit.list_recent_by_types(
             [FALLBACK_EVENT_TYPE], limit=limit
+        )
+
+    async def record_model_attempts(
+        self, attempts: list[dict], *, task_type: AITaskType
+    ) -> None:
+        """Пишет историю попыток моделей одной AI-генерации.
+
+        Usage-запись фиксирует отдельный вызов, но не отвечает на вопрос «почему
+        цепочка резервных моделей не спасла»: по ней не видно, был ли ответ
+        отвергнут валидацией, запрашивалось ли исправление и перешла ли система
+        к следующей модели. Событие пишется в тот же журнал AI-контура —
+        отдельной подсистемы под это не вводится.
+
+        В metadata только технические поля: приоритет, провайдер,
+        идентификатор модели, исход, число repair-попыток. Промпта, ответа
+        модели и персональных данных здесь нет.
+        """
+        if not attempts:
+            return
+        await self._audit.record(
+            MODEL_ATTEMPTS_EVENT_TYPE,
+            actor=None,  # системное событие, не действие администратора
+            entity_type="program_generation",
+            entity_id=None,
+            metadata={
+                "task_type": task_type.value,
+                "models_tried": len(attempts),
+                "attempts": attempts,
+            },
+        )
+
+    async def recent_model_attempts(self, limit: int = 50) -> list[dict]:
+        """Журнал попыток моделей: где цепочка fallback сработала, а где нет."""
+        return await self._audit.list_recent_by_types(
+            [MODEL_ATTEMPTS_EVENT_TYPE], limit=limit
         )

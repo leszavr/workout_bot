@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import httpx
 
-from src.application.ai.program_generator import AIProgramGenerator, PromptLoader
+from src.application.ai.program_generator import (
+    AIProgramGenerator,
+    ModelAttempt,
+    PromptLoader,
+)
 from src.application.media.service import ExerciseMediaService
 from src.application.programs.filtering import ExerciseFilter
 from src.application.programs.generation_jobs import GenerationJobService
@@ -162,4 +166,20 @@ def build_ai_program_generator(http_client: httpx.AsyncClient | None = None) -> 
         gateway=components.gateway,
         prompt_loader=PromptLoader(prompt_repo),
         validator=ProgramValidator(),
+        attempt_recorder=_record_model_attempts,
     )
+
+
+async def _record_model_attempts(attempts: list[ModelAttempt]) -> None:
+    """Кладёт историю попыток моделей в журнал AI-контура.
+
+    Без неё администратор видит только «программа собрана без ИИ» и не может
+    отличить «резервные модели тоже не справились» от «до них дело не дошло».
+    """
+    from apps.backend.api.v1.ai_dependencies import build_ai_components
+
+    await build_ai_components().admin.record_model_attempts(
+        AIProgramGenerator.attempts_metadata(attempts),
+        task_type=AITaskType.WORKOUT_GENERATION,
+    )
+
