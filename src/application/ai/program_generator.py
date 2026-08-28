@@ -131,6 +131,36 @@ class AIOutputParser:
         raise ProgramGenerationError("Не удалось извлечь JSON из ответа AI")
 
 
+def _apply_catalog_sources(payload: dict, catalog_sources: dict[str, str]) -> None:
+    """Подставляет `exercise_source` из каталога, не доверяя его модели.
+
+    Ссылка на упражнение канонична как пара `external_id` + `source`. Модель
+    источник не выбирает — она берёт упражнения из safe pool, где source уже
+    известен, — но воспроизводит поле по примеру из промпта и искажает его
+    (наблюдалось `workout` вместо `leszavr/workout`). Такая запись проходит
+    схему, сохраняется, а потом каталог по ней не находится: пользователь
+    получает программу без названий, техники и предупреждений.
+
+    Чужой source не исправляется молча: неизвестный `external_id` остаётся как
+    есть, и его поймает проверка каталога, а не эта подстановка.
+    """
+    days = payload.get("training_days")
+    if not isinstance(days, list):
+        return
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        exercises = day.get("exercises")
+        if not isinstance(exercises, list):
+            continue
+        for exercise in exercises:
+            if not isinstance(exercise, dict):
+                continue
+            source = catalog_sources.get(exercise.get("exercise_external_id"))
+            if source is not None:
+                exercise["exercise_source"] = source
+
+
 class AIProgramGenerator:
     """Генератор программ через AI. Реализует контракт ProgramGenerator."""
 
@@ -215,6 +245,7 @@ class AIProgramGenerator:
         """Парсинг JSON + валидация + repair при ошибках."""
         parser = AIOutputParser()
         allowed_ids = pool.allowed_ids()
+        allowed_sources = pool.allowed_sources()
 
         for attempt in range(self._max_repair_attempts + 1):
             try:
@@ -226,6 +257,7 @@ class AIProgramGenerator:
                 payload.setdefault("schema_version", "1.0")
                 payload.setdefault("version", 1)
                 payload.setdefault("status", ProgramStatus.GENERATED.value)
+                _apply_catalog_sources(payload, allowed_sources)
 
                 # Валидируем схему
                 program, schema_result = self._validator.validate_schema(payload)
@@ -236,7 +268,7 @@ class AIProgramGenerator:
                 # Валидируем против safe pool и каталога
                 catalog_ids = allowed_ids  # AI может использовать только safe pool
                 validation_result = self._validator.validate(
-                    program, pool, profile, catalog_ids
+                    program, pool, profile, catalog_ids, allowed_sources
                 )
 
                 if validation_result.valid:

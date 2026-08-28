@@ -6,11 +6,12 @@
 Проверки:
 1. строгая Pydantic-схема (при валидации из dict);
 2. все exercise_id существуют в каталоге;
-3. все упражнения принадлежат SafeExercisePool;
-4. нет дубликатов упражнений внутри дня;
-5. число дней соответствует заявленному training_days_per_week;
-6. число упражнений в дне в разумном диапазоне;
-7. подходы/повторения валидны (гарантируется схемой, проверяется явно).
+3. ссылка на упражнение канонична: `external_id` + `source` как в каталоге;
+4. все упражнения принадлежат SafeExercisePool;
+5. нет дубликатов упражнений внутри дня;
+6. число дней соответствует заявленному training_days_per_week;
+7. число упражнений в дне в разумном диапазоне;
+8. подходы/повторения валидны (гарантируется схемой, проверяется явно).
 """
 from __future__ import annotations
 
@@ -62,7 +63,16 @@ class ProgramValidator:
         pool: SafeExercisePool,
         profile: FitnessProfile,
         catalog_ids: set[str],
+        catalog_sources: dict[str, str] | None = None,
     ) -> ValidationResult:
+        """Проверка программы против профиля, каталога и safe-пула.
+
+        `catalog_sources` — ожидаемый `source` каждого упражнения. Ссылка на
+        упражнение канонична только как пара `external_id` + `source`: с чужим
+        source запись сохранится, но каталог по ней не найдётся, и программа
+        придёт пользователю без названий, техники и предупреждений. Параметр
+        необязательный, чтобы существующие вызовы не ломались.
+        """
         issues: list[ValidationIssue] = []
         allowed_ids = pool.allowed_ids()
 
@@ -80,13 +90,18 @@ class ProgramValidator:
             )
 
         for day in program.training_days:
-            issues.extend(self._validate_day(day, allowed_ids, catalog_ids))
+            issues.extend(
+                self._validate_day(day, allowed_ids, catalog_ids, catalog_sources or {})
+            )
 
         return ValidationResult(valid=not issues, issues=issues)
 
     @staticmethod
     def _validate_day(
-        day: TrainingDay, allowed_ids: set[str], catalog_ids: set[str]
+        day: TrainingDay,
+        allowed_ids: set[str],
+        catalog_ids: set[str],
+        catalog_sources: dict[str, str],
     ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         if not (MIN_EXERCISES_PER_DAY <= len(day.exercises) <= MAX_EXERCISES_PER_DAY):
@@ -121,6 +136,17 @@ class ProgramValidator:
                     ValidationIssue(
                         "exercise_not_allowed",
                         f"Упражнение {item.exercise_external_id} не входит в SafeExercisePool",
+                    )
+                )
+
+            expected_source = catalog_sources.get(item.exercise_external_id)
+            if expected_source is not None and item.exercise_source != expected_source:
+                issues.append(
+                    ValidationIssue(
+                        "exercise_source_mismatch",
+                        f"Упражнение {item.exercise_external_id}: source "
+                        f"«{item.exercise_source}» вместо «{expected_source}» — "
+                        "по такой ссылке каталог не найдётся",
                     )
                 )
 

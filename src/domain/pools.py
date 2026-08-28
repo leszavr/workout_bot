@@ -80,6 +80,14 @@ class SafeExercisePool(BaseModel):
     def allowed_ids(self) -> set[str]:
         return {e.external_id for e in self.allowed}
 
+    def allowed_sources(self) -> dict[str, str]:
+        """external_id -> source каталога.
+
+        Ссылка на упражнение канонична только как пара `external_id` + `source`,
+        поэтому потребителям нужен не только набор идентификаторов.
+        """
+        return {e.external_id: e.source for e in self.allowed}
+
     def get_allowed(self, external_id: str) -> Exercise | None:
         for exercise in self.allowed:
             if exercise.external_id == external_id:

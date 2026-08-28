@@ -272,3 +272,61 @@ class TestValidator:
         assert restored is None
         assert not result.valid
         assert any(i.code == "schema" for i in result.issues)
+
+
+class TestValidatorExerciseSource:
+    """Ссылка на упражнение канонична как пара external_id + source.
+
+    Программа с чужим source сохраняется и внешне выглядит корректной, но
+    каталог по ней не находится: пользователь получает карточки без названий,
+    техники и предупреждений. Проверка обязательна именно здесь, потому что
+    источник приходит из AI-вывода.
+    """
+
+    async def test_matching_source_passes(self, generator, validator):
+        profile = _profile()
+        pool = _diverse_pool()
+        program = await generator.generate(profile, pool)
+
+        result = validator.validate(
+            program, pool, profile, pool.allowed_ids(), pool.allowed_sources()
+        )
+
+        assert result.valid
+
+    async def test_foreign_source_fails(self, generator, validator):
+        profile = _profile()
+        pool = _diverse_pool()
+        program = await generator.generate(profile, pool)
+        exercise = program.training_days[0].exercises[0]
+        program.training_days[0].exercises[0] = exercise.model_copy(
+            update={"exercise_source": "workout"}
+        )
+
+        result = validator.validate(
+            program, pool, profile, pool.allowed_ids(), pool.allowed_sources()
+        )
+
+        assert not result.valid
+        issue = next(i for i in result.issues if i.code == "exercise_source_mismatch")
+        assert "workout" in issue.message
+
+    async def test_source_check_is_optional(self, generator, validator):
+        """Без карты источников проверка не выполняется: старые вызовы не ломаются."""
+        profile = _profile()
+        pool = _diverse_pool()
+        program = await generator.generate(profile, pool)
+        exercise = program.training_days[0].exercises[0]
+        program.training_days[0].exercises[0] = exercise.model_copy(
+            update={"exercise_source": "workout"}
+        )
+
+        result = validator.validate(program, pool, profile, pool.allowed_ids())
+
+        assert result.valid
+
+    def test_pool_exposes_sources(self):
+        pool = _diverse_pool()
+        sources = pool.allowed_sources()
+        assert set(sources) == pool.allowed_ids()
+        assert set(sources.values()) == {"leszavr/workout"}
