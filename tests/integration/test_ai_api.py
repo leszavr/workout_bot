@@ -902,6 +902,342 @@ def test_fallback_events_endpoint_returns_list(client: TestClient, auth_headers:
     assert all(i["event_type"] == "ai_generation_fallback" for i in body["items"])
 
 
+def test_model_attempts_require_auth(client: TestClient):
+    assert client.get("/api/v1/admin/ai/model-attempts").status_code == 401
+
+
+def test_model_attempts_endpoint_returns_list(client: TestClient, auth_headers: dict):
+    """Журнал попыток моделей — отдельный от журнала вызовов."""
+    response = client.get("/api/v1/admin/ai/model-attempts", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "items" in body and "total" in body
+    assert all(i["event_type"] == "ai_model_attempts" for i in body["items"])
+
+
+# --- Управление инструкциями (промптами) ------------------------------------------
+#
+# Инструкция для модели должна быть доступна администратору целиком: без этого
+# каждая итерация промпт-инжиниринга требовала доступа к базе или пересборки
+# образа.
+
+_PROMPT_TEST_PREFIX = "apitest prompt"
+
+
+@pytest.fixture
+async def cleanup_prompts():
+    """Удаляет только свои промпты: чужие версии трогать нельзя."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from src.infrastructure.persistence.postgres.models import PromptTemplateRow
+
+    engine = create_async_engine(DATABASE_URL)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _purge() -> None:
+        async with sessions() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(PromptTemplateRow).where(
+                        PromptTemplateRow.name.like(f"{_PROMPT_TEST_PREFIX}%")
+                    )
+                )
+                await session.execute(
+                    delete(AIAuditEventRow).where(
+                        AIAuditEventRow.entity_type == "prompt_template"
+                    )
+                )
+
+    await _purge()
+    yield
+    await _purge()
+    await engine.dispose()
+
+
+def _create_prompt(
+    client: TestClient, auth_headers: dict, *, name: str, system: str = "Rules v1"
+) -> dict:
+    response = client.post(
+        "/api/v1/admin/ai/prompts",
+        headers=auth_headers,
+        json={
+            "task_type": "workout_generation",
+            "name": f"{_PROMPT_TEST_PREFIX} {name}",
+            "system_prompt": system,
+            "user_template": "Профиль: {sessions_per_week}. Пул: {safe_pool_exercises}",
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_prompt_endpoints_require_auth(client: TestClient):
+    assert client.get("/api/v1/admin/ai/prompts/workout_generation").status_code == 401
+    assert client.get("/api/v1/admin/ai/prompts/detail/1").status_code == 401
+    assert client.post("/api/v1/admin/ai/prompts", json={}).status_code == 401
+    assert client.patch("/api/v1/admin/ai/prompts/detail/1", json={}).status_code == 401
+    assert client.delete("/api/v1/admin/ai/prompts/detail/1").status_code == 401
+
+
+def test_prompt_create_list_and_full_detail(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    """Список отдаёт превью, карточка — полный текст без усечения."""
+    # Текст заметно длиннее превью: усечение было бы видно.
+    long_system = "СТРОГИЕ ПРАВИЛА. " + ("используй только safe pool. " * 40)
+    created = _create_prompt(client, auth_headers, name="detail", system=long_system)
+
+    assert created["system_prompt"] == long_system
+    assert created["task_type"] == "workout_generation"
+    assert created["in_use"] is False
+
+    listed = client.get(
+        "/api/v1/admin/ai/prompts/workout_generation", headers=auth_headers
+    )
+    assert listed.status_code == 200
+    body = listed.json()
+    item = next(i for i in body["items"] if i["id"] == created["id"])
+    # Список не тянет полный текст, но сообщает его длину.
+    assert "system_prompt" not in item
+    assert item["system_prompt_length"] == len(long_system)
+    assert item["system_prompt_preview"]
+    assert len(item["system_prompt_preview"]) < len(long_system)
+    assert body["next_version"] > created["version"]
+
+    detail = client.get(
+        f"/api/v1/admin/ai/prompts/detail/{created['id']}", headers=auth_headers
+    )
+    assert detail.status_code == 200
+    # Полный текст возвращается посимвольно тем же, что был сохранён.
+    assert detail.json()["system_prompt"] == long_system
+    assert detail.json()["user_template"].startswith("Профиль:")
+
+
+def test_prompt_version_is_assigned_automatically(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    """Администратор правит текст, а не ведёт нумерацию версий вручную."""
+    first = _create_prompt(client, auth_headers, name="auto-1")
+    second = _create_prompt(client, auth_headers, name="auto-2")
+    assert second["version"] == first["version"] + 1
+
+
+def test_prompt_duplicate_version_is_conflict(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    existing = _create_prompt(client, auth_headers, name="dup")
+    response = client.post(
+        "/api/v1/admin/ai/prompts",
+        headers=auth_headers,
+        json={
+            "task_type": "workout_generation",
+            "version": existing["version"],
+            "name": f"{_PROMPT_TEST_PREFIX} dup-again",
+            "system_prompt": "x",
+            "user_template": "y",
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_prompt_can_be_edited(client: TestClient, auth_headers: dict, cleanup_prompts):
+    created = _create_prompt(client, auth_headers, name="edit")
+
+    response = client.patch(
+        f"/api/v1/admin/ai/prompts/detail/{created['id']}",
+        headers=auth_headers,
+        json={
+            "name": f"{_PROMPT_TEST_PREFIX} edited",
+            "system_prompt": "НОВЫЕ ПРАВИЛА: только safe pool.",
+        },
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()
+    assert updated["system_prompt"] == "НОВЫЕ ПРАВИЛА: только safe pool."
+    # Идентичность промпта не меняется: на неё ссылается конфигурация задачи.
+    assert updated["version"] == created["version"]
+    assert updated["task_type"] == created["task_type"]
+    # Шаблон запроса не передавали — он остался прежним.
+    assert updated["user_template"] == created["user_template"]
+
+    stored = client.get(
+        f"/api/v1/admin/ai/prompts/detail/{created['id']}", headers=auth_headers
+    ).json()
+    assert stored["system_prompt"] == "НОВЫЕ ПРАВИЛА: только safe pool."
+
+
+def test_prompt_version_cannot_be_moved_by_patch(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    """Смена версии через PATCH запрещена схемой, а не молча игнорируется."""
+    created = _create_prompt(client, auth_headers, name="immutable-version")
+    response = client.patch(
+        f"/api/v1/admin/ai/prompts/detail/{created['id']}",
+        headers=auth_headers,
+        json={"version": created["version"] + 5},
+    )
+    assert response.status_code == 422
+
+
+def test_unused_prompt_can_be_deleted(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    created = _create_prompt(client, auth_headers, name="removable")
+
+    assert (
+        client.delete(
+            f"/api/v1/admin/ai/prompts/detail/{created['id']}", headers=auth_headers
+        ).status_code
+        == 204
+    )
+    assert (
+        client.get(
+            f"/api/v1/admin/ai/prompts/detail/{created['id']}", headers=auth_headers
+        ).status_code
+        == 404
+    )
+    listed = client.get(
+        "/api/v1/admin/ai/prompts/workout_generation", headers=auth_headers
+    ).json()
+    assert created["id"] not in {i["id"] for i in listed["items"]}
+
+
+def test_prompt_used_by_task_cannot_be_deleted(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    """Удаление выбранной инструкции оставило бы задачу без инструкции."""
+    created = _create_prompt(client, auth_headers, name="active")
+    _, _, model_id = _chain(client, auth_headers, "apitest-promptuse")
+
+    assert (
+        client.put(
+            "/api/v1/admin/ai/tasks/workout_generation",
+            headers=auth_headers,
+            json={
+                "enabled": True,
+                "model_ids": [model_id],
+                "prompt_version": created["version"],
+            },
+        ).status_code
+        == 200
+    )
+
+    listed = client.get(
+        "/api/v1/admin/ai/prompts/workout_generation", headers=auth_headers
+    ).json()
+    assert listed["active_version"] == created["version"]
+    assert next(i for i in listed["items"] if i["id"] == created["id"])["in_use"] is True
+
+    blocked = client.delete(
+        f"/api/v1/admin/ai/prompts/detail/{created['id']}", headers=auth_headers
+    )
+    assert blocked.status_code == 409
+    detail = blocked.json()["detail"]
+    assert detail["blockers"]
+    assert detail["blockers"][0]["task_type"] == "workout_generation"
+
+    # Инструкция на месте: битых ссылок не появилось.
+    assert (
+        client.get(
+            f"/api/v1/admin/ai/prompts/detail/{created['id']}", headers=auth_headers
+        ).status_code
+        == 200
+    )
+
+    # После переключения задачи на другую инструкцию удаление разрешено.
+    other = _create_prompt(client, auth_headers, name="replacement")
+    assert (
+        client.put(
+            "/api/v1/admin/ai/tasks/workout_generation",
+            headers=auth_headers,
+            json={
+                "enabled": True,
+                "model_ids": [model_id],
+                "prompt_version": other["version"],
+            },
+        ).status_code
+        == 200
+    )
+    assert (
+        client.delete(
+            f"/api/v1/admin/ai/prompts/detail/{created['id']}", headers=auth_headers
+        ).status_code
+        == 204
+    )
+
+    # Задача продолжает ссылаться на существующую инструкцию.
+    task = client.get(
+        "/api/v1/admin/ai/tasks/workout_generation", headers=auth_headers
+    ).json()
+    assert task["prompt_version"] == other["version"]
+    assert (
+        client.get(
+            f"/api/v1/admin/ai/prompts/detail/{other['id']}", headers=auth_headers
+        ).status_code
+        == 200
+    )
+
+
+def test_deleting_missing_prompt_returns_404(client: TestClient, auth_headers: dict):
+    assert (
+        client.delete(
+            "/api/v1/admin/ai/prompts/detail/99999999", headers=auth_headers
+        ).status_code
+        == 404
+    )
+    assert (
+        client.get(
+            "/api/v1/admin/ai/prompts/detail/99999999", headers=auth_headers
+        ).status_code
+        == 404
+    )
+
+
+def test_prompt_edit_is_visible_to_generation_loader(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    """Отредактированный текст действительно уходит в генерацию.
+
+    Иначе управление промптами оставалось бы декоративным: администратор правит
+    текст в интерфейсе, а модель получает старый.
+    """
+    import asyncio
+
+    from src.application.ai.program_generator import PromptLoader
+    from src.domain.ai.enums import AITaskType
+    from src.infrastructure.persistence.postgres.ai_repository import (
+        PromptTemplateRepository,
+    )
+
+    created = _create_prompt(client, auth_headers, name="loader")
+    client.patch(
+        f"/api/v1/admin/ai/prompts/detail/{created['id']}",
+        headers=auth_headers,
+        json={"system_prompt": "ИНСТРУКЦИЯ ИЗ ИНТЕРФЕЙСА"},
+    )
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    async def _load() -> tuple[str, str, int]:
+        engine = create_async_engine(DATABASE_URL)
+        try:
+            loader = PromptLoader(
+                PromptTemplateRepository(
+                    async_sessionmaker(engine, expire_on_commit=False)
+                )
+            )
+            return await loader.load(
+                AITaskType.WORKOUT_GENERATION, created["version"]
+            )
+        finally:
+            await engine.dispose()
+
+    system_prompt, _, version = asyncio.run(_load())
+    assert system_prompt == "ИНСТРУКЦИЯ ИЗ ИНТЕРФЕЙСА"
+    assert version == created["version"]
+
+
 # --- Выбор моделей из списка сервиса ---------------------------------------------------
 #
 # Идентификаторы моделей больше не вводятся руками: список запрашивается у

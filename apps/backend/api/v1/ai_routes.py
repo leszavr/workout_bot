@@ -229,14 +229,36 @@ class TaskConfigOut(BaseModel):
 class PromptCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     task_type: AITaskType
-    version: int = Field(ge=1)
+    # Номер версии необязателен: администратор итеративно правит инструкцию, а
+    # не ведёт нумерацию вручную. Без него берётся следующий свободный.
+    version: int | None = Field(default=None, ge=1)
     name: str = Field(min_length=1, max_length=200)
-    system_prompt: str = Field(min_length=1)
-    user_template: str = Field(min_length=1)
+    system_prompt: str = Field(min_length=1, max_length=200_000)
+    user_template: str = Field(min_length=1, max_length=200_000)
     enabled: bool = True
 
 
+class PromptPatch(BaseModel):
+    """Правка существующей инструкции.
+
+    `task_type` и `version` не меняются: это идентичность промпта, на которую
+    ссылается конфигурация задачи.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    system_prompt: str | None = Field(default=None, min_length=1, max_length=200_000)
+    user_template: str | None = Field(default=None, min_length=1, max_length=200_000)
+    enabled: bool | None = None
+
+
 class PromptOut(BaseModel):
+    """Полное представление инструкции: текст не усечён.
+
+    Списочный ответ отдаёт превью отдельным полем, а сам текст остаётся целым:
+    администратор должен видеть ровно то, что уходит в модель.
+    """
+
     id: int
     task_type: str
     version: int
@@ -244,7 +266,26 @@ class PromptOut(BaseModel):
     system_prompt: str
     user_template: str
     enabled: bool
+    # Выбрана в настройках задачи: удалять такую нельзя.
+    in_use: bool = False
     created_at: str | None = None
+    updated_at: str | None = None
+
+
+class PromptListItem(BaseModel):
+    """Строка списка: без полных текстов, но с превью для узнавания."""
+
+    id: int
+    task_type: str
+    version: int
+    name: str
+    enabled: bool
+    in_use: bool = False
+    system_prompt_preview: str
+    system_prompt_length: int
+    user_template_length: int
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 # --- Helpers --------------------------------------------------------------------
@@ -824,39 +865,107 @@ async def put_task(
 
 
 # --- Prompts ---------------------------------------------------------------------
+#
+# Инструкция для модели — не деталь реализации, а рабочий материал
+# администратора: без возможности прочитать и поправить её приходилось лезть в
+# базу или пересобирать образ на каждую итерацию промпт-инжиниринга.
+
+_PROMPT_NOT_FOUND = "Prompt not found"
+# Превью в списке: узнать инструкцию по началу текста, не загружая её целиком.
+_PROMPT_PREVIEW_CHARS = 160
+
+
+def _prompt_out(template: PromptTemplate, *, in_use: bool) -> PromptOut:
+    return PromptOut(
+        id=template.id or 0,
+        task_type=template.task_type.value,
+        version=template.version,
+        name=template.name,
+        system_prompt=template.system_prompt,
+        user_template=template.user_template,
+        enabled=template.enabled,
+        in_use=in_use,
+        created_at=_iso(template.created_at),
+        updated_at=_iso(template.updated_at),
+    )
+
+
+def _prompt_list_item(template: PromptTemplate, *, in_use: bool) -> PromptListItem:
+    preview = " ".join(template.system_prompt.split())[:_PROMPT_PREVIEW_CHARS]
+    return PromptListItem(
+        id=template.id or 0,
+        task_type=template.task_type.value,
+        version=template.version,
+        name=template.name,
+        enabled=template.enabled,
+        in_use=in_use,
+        system_prompt_preview=preview,
+        system_prompt_length=len(template.system_prompt),
+        user_template_length=len(template.user_template),
+        created_at=_iso(template.created_at),
+        updated_at=_iso(template.updated_at),
+    )
+
+
+async def _prompt_in_use(components, template: PromptTemplate) -> bool:
+    """Выбрана ли инструкция в настройках задачи.
+
+    Ссылка логическая (`ai_task_configs.prompt_version`), поэтому проверяется
+    сервисным слоем, а не внешним ключом.
+    """
+    dependencies = await components.admin.prompt_dependencies(template.id or 0)
+    return not dependencies.safe
 
 
 @router.get("/prompts/{task_type}")
 async def list_prompts(
     task_type: AITaskType, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
 ) -> dict:
+    """Список инструкций задачи: превью, метаданные, признак использования."""
+    _ensure_task_implemented(task_type)
     components = build_ai_components()
     templates = await components.prompts.list_for_task(task_type)
+    config = await components.tasks.get(task_type)
+    active_version = config.prompt_version if config else None
     items = [
-        PromptOut(
-            id=t.id or 0,
-            task_type=t.task_type.value,
-            version=t.version,
-            name=t.name,
-            system_prompt=t.system_prompt,
-            user_template=t.user_template,
-            enabled=t.enabled,
-            created_at=_iso(t.created_at),
-        ).model_dump()
+        _prompt_list_item(t, in_use=t.version == active_version).model_dump()
         for t in templates
     ]
     next_version = await components.admin.next_prompt_version(task_type)
-    return {"total": len(items), "items": items, "next_version": next_version}
+    return {
+        "total": len(items),
+        "items": items,
+        "next_version": next_version,
+        "active_version": active_version,
+    }
+
+
+@router.get("/prompts/detail/{prompt_id}", responses=_NOT_FOUND)
+async def get_prompt(
+    prompt_id: int, _: Annotated[AuthenticatedUser, Depends(require_viewer)]
+) -> PromptOut:
+    """Полный текст инструкции. Ничего не усекается.
+
+    Путь с префиксом `detail`, потому что `/prompts/{task_type}` уже занят
+    списком: числовой id и тип задачи иначе разбирались бы одним маршрутом.
+    """
+    components = build_ai_components()
+    template = await components.admin.get_prompt(prompt_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail=_PROMPT_NOT_FOUND)
+    return _prompt_out(template, in_use=await _prompt_in_use(components, template))
 
 
 @router.post("/prompts", status_code=201, responses=_CONFLICT)
 async def create_prompt(
     body: PromptCreate, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
 ) -> PromptOut:
+    _ensure_task_implemented(body.task_type)
     components = build_ai_components()
+    version = body.version or await components.admin.next_prompt_version(body.task_type)
     template = PromptTemplate(
         task_type=body.task_type,
-        version=body.version,
+        version=version,
         name=body.name,
         system_prompt=body.system_prompt,
         user_template=body.user_template,
@@ -868,16 +977,42 @@ async def create_prompt(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return PromptOut(
-        id=created.id or 0,
-        task_type=created.task_type.value,
-        version=created.version,
-        name=created.name,
-        system_prompt=created.system_prompt,
-        user_template=created.user_template,
-        enabled=created.enabled,
-        created_at=_iso(created.created_at),
+    return _prompt_out(created, in_use=False)
+
+
+@router.patch("/prompts/detail/{prompt_id}", responses=_NOT_FOUND)
+async def patch_prompt(
+    prompt_id: int,
+    body: PromptPatch,
+    admin: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> PromptOut:
+    """Правка текста и метаданных существующей инструкции."""
+    components = build_ai_components()
+    fields = body.model_dump(exclude_none=True)
+    updated = await components.admin.update_prompt(
+        prompt_id, actor=admin.login, **fields
     )
+    if updated is None:
+        raise HTTPException(status_code=404, detail=_PROMPT_NOT_FOUND)
+    return _prompt_out(updated, in_use=await _prompt_in_use(components, updated))
+
+
+@router.delete("/prompts/detail/{prompt_id}", status_code=204, responses=_NOT_FOUND_CONFLICT)
+async def delete_prompt(
+    prompt_id: int, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
+) -> None:
+    """Удаление инструкции. Выбранную задачей удалить нельзя (409)."""
+    components = build_ai_components()
+    if await components.admin.get_prompt(prompt_id) is None:
+        raise HTTPException(status_code=404, detail=_PROMPT_NOT_FOUND)
+    try:
+        deleted = await components.admin.delete_prompt(prompt_id, actor=admin.login)
+    except AIDependencyError as exc:
+        raise _dependency_conflict(exc) from exc
+    except ProfilePersistenceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail=_PROMPT_NOT_FOUND)
 
 
 # --- Observability ----------------------------------------------------------------
@@ -921,6 +1056,20 @@ async def recent_fallback_events(_: Annotated[AuthenticatedUser, Depends(require
     """
     components = build_ai_components()
     items = await components.admin.recent_fallback_events(limit=50)
+    return {"total": len(items), "items": items}
+
+
+@router.get("/model-attempts")
+async def recent_model_attempts(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) -> dict:
+    """Что происходило с моделями внутри одной AI-генерации.
+
+    Отвечает на вопрос, на который журнал вызовов ответить не может: прошёл ли
+    первый ответ модели, запрашивалось ли исправление, почему модель была
+    оставлена и перешла ли система к следующей. Промпты, ответы моделей и
+    персональные данные здесь не хранятся.
+    """
+    components = build_ai_components()
+    items = await components.admin.recent_model_attempts(limit=50)
     return {"total": len(items), "items": items}
 
 

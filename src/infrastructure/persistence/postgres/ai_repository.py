@@ -584,7 +584,7 @@ class PromptTemplateRepository:
         return (max_version or 0) + 1
 
     async def create(self, template: PromptTemplate) -> PromptTemplate:
-        """Создаёт НОВУЮ версию. Изменение существующей версии запрещено."""
+        """Создаёт новую версию промпта."""
         try:
             async with self._sessions() as session:
                 async with session.begin():
@@ -603,7 +603,7 @@ class PromptTemplateRepository:
         except IntegrityError as exc:
             raise ProfilePersistenceError(
                 f"Версия v{template.version} для задачи '{template.task_type}' уже существует. "
-                "Создайте новую версию вместо изменения существующей."
+                "Создайте новую версию."
             ) from exc
         except SQLAlchemyError as exc:
             raise _persistence_error(exc, "Не удалось создать шаблон промпта") from exc
@@ -620,6 +620,20 @@ class PromptTemplateRepository:
             ).scalar_one_or_none()
         return self._to_domain(row) if row else None
 
+    async def get_by_id(self, prompt_id: int) -> PromptTemplate | None:
+        """Промпт по первичному ключу.
+
+        Нужен административному интерфейсу: у него на руках id из списка, а не
+        пара «задача + версия».
+        """
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    select(PromptTemplateRow).where(PromptTemplateRow.id == prompt_id)
+                )
+            ).scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
     async def list_for_task(self, task_type: AITaskType) -> list[PromptTemplate]:
         async with self._sessions() as session:
             rows = (
@@ -630,6 +644,57 @@ class PromptTemplateRepository:
                 )
             ).scalars().all()
         return [self._to_domain(r) for r in rows]
+
+    async def update(self, prompt_id: int, **fields) -> PromptTemplate | None:
+        """Обновляет только переданные поля (PATCH-семантика).
+
+        `task_type` и `version` через этот метод не меняются: они образуют
+        идентичность промпта, на которую ссылается конфигурация задачи, и их
+        подмена превратила бы правку текста в незаметный перенос ссылки.
+        """
+        fields.pop("task_type", None)
+        fields.pop("version", None)
+        if not fields:
+            return await self.get_by_id(prompt_id)
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    row = (
+                        await session.execute(
+                            select(PromptTemplateRow)
+                            .where(PromptTemplateRow.id == prompt_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if row is None:
+                        return None
+                    for key, value in fields.items():
+                        setattr(row, key, value)
+                    await session.flush()
+                    await session.refresh(row)
+                    return self._to_domain(row)
+        except SQLAlchemyError as exc:
+            raise _persistence_error(exc, "Не удалось обновить шаблон промпта") from exc
+
+    async def delete(self, prompt_id: int) -> bool:
+        """Удаляет промпт.
+
+        Внешних ключей на `prompt_templates` нет: usage- и audit-записи промпт
+        не хранят, поэтому hard delete не оставляет битых ссылок в базе.
+        Логическую ссылку (`ai_task_configs.prompt_version`) проверяет сервисный
+        слой — база о ней не знает.
+        """
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        delete(PromptTemplateRow).where(
+                            PromptTemplateRow.id == prompt_id
+                        )
+                    )
+                    return bool(result.rowcount)
+        except SQLAlchemyError as exc:
+            raise _persistence_error(exc, "Не удалось удалить шаблон промпта") from exc
 
 
 # --- Usage records --------------------------------------------------------------
