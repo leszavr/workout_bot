@@ -2,10 +2,12 @@
 
 // /ai/logs — почему что-то не работает.
 //
-// Три журнала в одном месте: вызовы AI (токены, задержки, ошибки), причины
-// fallback и изменения конфигурации. Разбор инцидента начинается здесь.
+// Четыре журнала в одном месте: вызовы AI (токены, задержки, ошибки), попытки
+// моделей внутри одной генерации, причины fallback и изменения конфигурации.
+// Разбор инцидента начинается здесь.
 
 import AIFallbackEvents from "@/components/AIFallbackEvents";
+import AIModelAttempts from "@/components/AIModelAttempts";
 import AIObservability from "@/components/AIObservability";
 import { useAIConfiguration } from "@/lib/aiData";
 
@@ -27,6 +29,8 @@ export default function AILogsPage() {
       {state.error && <div className="error">{state.error}</div>}
 
       <AIFallbackEvents reloadKey={state.reloadKey} onError={state.onError} />
+
+      <AIModelAttempts reloadKey={state.reloadKey} onError={state.onError} />
 
       <AIObservability
         usage={state.usage}

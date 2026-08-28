@@ -316,6 +316,28 @@ export function aiFallbackReasonLabel(reason: string): string {
   return AI_FALLBACK_REASON_LABELS[reason] ?? reason;
 }
 
+// --- Исход попытки одной модели -------------------------------------------------
+
+export const AI_ATTEMPT_OUTCOME_LABELS: Record<string, string> = {
+  success: "программа принята",
+  invalid_output: "ответ не прошёл проверку",
+  provider_error: "сервис не ответил",
+  budget_exhausted: "время вышло",
+};
+
+export function aiAttemptOutcomeLabel(outcome: string): string {
+  return AI_ATTEMPT_OUTCOME_LABELS[outcome] ?? outcome;
+}
+
+export function aiAttemptOutcomeTone(
+  outcome: string
+): "ok" | "warn" | "bad" | "neutral" {
+  if (outcome === "success") return "ok";
+  if (outcome === "invalid_output") return "warn";
+  if (outcome === "provider_error") return "bad";
+  return "neutral";
+}
+
 // --- Журналы -----------------------------------------------------------------
 
 export const AI_AUDIT_EVENT_LABELS: Record<string, string> = {
@@ -331,7 +353,10 @@ export const AI_AUDIT_EVENT_LABELS: Record<string, string> = {
   ai_model_deleted: "модель удалена",
   ai_task_updated: "настройки задачи сохранены",
   ai_prompt_created: "создана версия инструкции",
+  ai_prompt_updated: "инструкция изменена",
+  ai_prompt_deleted: "инструкция удалена",
   ai_generation_fallback: "программа собрана без ИИ",
+  ai_model_attempts: "попытки моделей при сборке программы",
   admin_user_created: "пользователь создан",
   admin_user_updated: "пользователь изменён",
   admin_user_deleted: "пользователь удалён",

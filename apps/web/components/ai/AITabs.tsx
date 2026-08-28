@@ -13,6 +13,7 @@ const TABS = [
   { href: "/ai", label: "Состояние" },
   { href: "/ai/providers", label: "Подключения" },
   { href: "/ai/tasks", label: "Задачи" },
+  { href: "/ai/prompts", label: "Инструкции" },
   { href: "/ai/logs", label: "Журналы" },
 ];
 

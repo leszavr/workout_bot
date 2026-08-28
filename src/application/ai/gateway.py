@@ -10,14 +10,25 @@ Gateway:
 
 Gateway работает только с внутренними DTO (AIRequest/AIResponse);
 специфика протоколов изолирована в адаптерах.
+
+Кто перебирает цепочку моделей. `generate()` остаётся простым вызовом «дай
+ответ»: он сам идёт по кандидатам и падает, только когда не ответил ни один.
+Этого достаточно там, где ответ используется как есть. Но генератору программ
+недостаточно: транспортный успех у него не равен пригодному ответу — вывод
+модели ещё проходит схему, safe pool и каталог. Поэтому цепочка разбита на два
+шага (`prepare()` + `generate_once()`), и вызывающая сторона, которая умеет
+оценить пригодность ответа, ведёт перебор сама: модель, несколько раз
+вернувшая невалидный результат, должна уступить следующей, а не исчерпать
+всю генерацию.
 """
 from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 
 from src.application.ai.selection import ModelCandidate, ModelSelector
-from src.domain.ai.config import AIUsageRecord
+from src.domain.ai.config import AITaskConfig, AIUsageRecord
 from src.domain.ai.enums import AIProtocol, AIUsageStatus
 from src.domain.ai.errors import (
     AIConfigurationError,
@@ -42,6 +53,20 @@ from src.infrastructure.persistence.postgres.ai_repository import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class PreparedChain:
+    """Цепочка кандидатов задачи и параметры вызова.
+
+    Отдаётся вызывающей стороне, которая ведёт перебор моделей сама (генератор
+    программ). Кандидаты уже отфильтрованы и упорядочены (primary → fallback),
+    поэтому повторно решать, какая модель следующая, не нужно.
+    """
+
+    config: AITaskConfig
+    candidates: list[ModelCandidate]
+    adapter_request: AdapterRequest
+
+
 class AIGateway:
     def __init__(
         self,
@@ -64,8 +89,13 @@ class AIGateway:
         self._providers = provider_repository
         self._models = model_repository
 
-    async def generate(self, request: AIRequest) -> AIResponse:
-        """Выполняет AI-запрос с fallback по кандидатам конфигурации задачи."""
+    async def prepare(self, request: AIRequest) -> PreparedChain:
+        """Конфигурация задачи и упорядоченная цепочка кандидатов.
+
+        Отдельный шаг нужен тем вызывающим сторонам, которые проверяют
+        пригодность ответа сами и обязаны переходить к следующей модели не
+        только при транспортном сбое.
+        """
         config = await self._tasks.get(request.task_type)
         if config is None or not config.enabled:
             raise AIConfigurationError(
@@ -81,22 +111,42 @@ class AIGateway:
                 "(включены и соответствуют требованиям)"
             )
 
-        adapter_request = AdapterRequest(
-            messages=request.messages,
-            temperature=request.temperature
-            if request.temperature is not None
-            else config.temperature,
-            max_tokens=request.max_tokens
-            if request.max_tokens is not None
-            else config.max_tokens,
-            response_format=request.response_format,
+        return PreparedChain(
+            config=config,
+            candidates=candidates,
+            adapter_request=self._adapter_request(request, config),
         )
 
+    async def generate_once(
+        self,
+        candidate: ModelCandidate,
+        request: AIRequest,
+        chain: PreparedChain,
+    ) -> AIResponse:
+        """Один вызов конкретного кандидата. Перебор — на вызывающей стороне.
+
+        Сообщения берутся из `request`, поэтому repair-запрос можно отправить
+        той же модели, не пересобирая цепочку и не выбирая её заново.
+        """
+        return await self._execute(
+            candidate,
+            self._adapter_request(request, chain.config),
+            request,
+            chain.config.timeout_seconds,
+        )
+
+    async def generate(self, request: AIRequest) -> AIResponse:
+        """Выполняет AI-запрос с fallback по кандидатам конфигурации задачи."""
+        chain = await self.prepare(request)
+
         last_error: AIError | None = None
-        for candidate in candidates:
+        for candidate in chain.candidates:
             try:
                 return await self._execute(
-                    candidate, adapter_request, request, config.timeout_seconds
+                    candidate,
+                    chain.adapter_request,
+                    request,
+                    chain.config.timeout_seconds,
                 )
             except AIError as exc:
                 last_error = exc
@@ -108,6 +158,21 @@ class AIGateway:
                 )
         assert last_error is not None
         raise last_error
+
+    @staticmethod
+    def _adapter_request(
+        request: AIRequest, config: AITaskConfig
+    ) -> AdapterRequest:
+        return AdapterRequest(
+            messages=request.messages,
+            temperature=request.temperature
+            if request.temperature is not None
+            else config.temperature,
+            max_tokens=request.max_tokens
+            if request.max_tokens is not None
+            else config.max_tokens,
+            response_format=request.response_format,
+        )
 
     async def _execute(
         self,

@@ -18,7 +18,11 @@ from src.application.ai.program_generator import (
     AIProgramGenerator,
     PromptLoader,
 )
+from src.application.ai.selection import ModelCandidate
 from src.application.programs.validator import ProgramValidator
+from src.domain.ai.config import AIEndpoint, AIModel, AIProvider, AITaskConfig
+from src.domain.ai.enums import AITaskType
+from src.domain.ai.errors import AIProviderError
 from src.domain.ai.gateway import AIResponse
 from src.domain.enums import (
     ExperienceLevel,
@@ -99,26 +103,79 @@ def make_valid_program_json(pool: SafeExercisePool) -> str:
     return json.dumps(program)
 
 
+def make_candidate(priority: int, model_id: str) -> ModelCandidate:
+    """Кандидат цепочки задачи (модель + подключение + сервис)."""
+    return ModelCandidate(
+        model=AIModel(
+            id=priority, endpoint_id=10, model_id=model_id, display_name=model_id
+        ),
+        endpoint=AIEndpoint(
+            id=10, provider_id=1, name="E", base_url="https://x.example/v1"
+        ),
+        provider=AIProvider(id=1, name="P", slug="p1"),
+        priority=priority,
+        is_primary=priority == 1,
+    )
+
+
+class _PreparedChain:
+    """Минимальный аналог PreparedChain: генератору нужны только кандидаты."""
+
+    def __init__(self, candidates: list[ModelCandidate]) -> None:
+        self.config = AITaskConfig(
+            id=100, task_type=AITaskType.WORKOUT_GENERATION, enabled=True
+        )
+        self.candidates = candidates
+        self.adapter_request = None
+
+
 class FakeAIGateway:
-    """Фейковый AI Gateway для тестов."""
+    """Фейковый AI Gateway для тестов.
 
-    def __init__(self, responses: list[str] | None = None):
+    Повторяет двухшаговый контракт реального gateway: цепочку кандидатов
+    отдаёт `prepare`, а каждый вызов выполняет `generate_once`. Перебор моделей
+    ведёт сам генератор, поэтому сценарии «модель A испорчена, модель B
+    отвечает» проверяются без AI-инфраструктуры.
+    """
+
+    def __init__(
+        self,
+        responses: list[str] | None = None,
+        *,
+        candidates: list[ModelCandidate] | None = None,
+        per_model: dict[str, list[str | Exception]] | None = None,
+    ):
         self.responses = responses or []
+        self.per_model = per_model
         self.calls: list = []
+        # (model_id, request) — по ним видно, какой модели что отправляли.
+        self.model_calls: list[tuple[str, object]] = []
         self._call_index = 0
+        self._candidates = candidates or [make_candidate(1, "test-model")]
 
-    async def generate(self, request):
+    async def prepare(self, request):
+        return _PreparedChain(self._candidates)
+
+    async def generate_once(self, candidate, request, chain):
         self.calls.append(request)
-        if self._call_index < len(self.responses):
-            content = self.responses[self._call_index]
+        self.model_calls.append((candidate.model.model_id, request))
+
+        if self.per_model is not None:
+            queue = self.per_model.get(candidate.model.model_id, [])
+            outcome = queue.pop(0) if queue else "{}"
+        elif self._call_index < len(self.responses):
+            outcome = self.responses[self._call_index]
             self._call_index += 1
         else:
-            content = "{}"
+            outcome = "{}"
+
+        if isinstance(outcome, Exception):
+            raise outcome
         return AIResponse(
-            content=content,
-            model="test-model",
-            provider="test-provider",
-            endpoint="test-endpoint",
+            content=outcome,
+            model=candidate.model.model_id,
+            provider=candidate.provider.slug,
+            endpoint=candidate.endpoint.name,
             input_tokens=100,
             output_tokens=200,
             total_tokens=300,
@@ -129,9 +186,11 @@ class FakeAIGateway:
 class FakePromptLoader(PromptLoader):
     """Фейковый загрузчик промптов."""
 
+    SYSTEM_PROMPT = "You are a fitness expert. Follow the required JSON schema."
+
     async def load(self, task_type, version=None):
         return (
-            "You are a fitness expert.",
+            self.SYSTEM_PROMPT,
             "Create program for {sessions_per_week} days. Pool: {safe_pool_exercises}",
             version or 1,
         )
@@ -229,7 +288,7 @@ class TestAIProgramGenerator:
         program = await generator.generate(profile, pool)
 
         assert program.generation.source == GenerationSource.AI
-        assert program.generation.provider == "test-provider"
+        assert program.generation.provider == "p1"
         assert program.generation.model == "test-model"
         assert program.generation.prompt_version == 1
         assert program.title == "AI Test Program"
@@ -515,3 +574,339 @@ class TestExerciseSourceIsTakenFromCatalog:
 
         with pytest.raises(ProgramGenerationError, match="exercise_not_found"):
             await generator.generate(profile, pool)
+
+
+# --- Контекст repair-запроса -----------------------------------------------------
+
+
+class TestRepairContext:
+    """Repair должен иметь чем и по каким правилам исправлять.
+
+    Full STAGING E2E показал обратное: repair уходил одним `user`-сообщением
+    «исправь эти ошибки» — без схемы, без предыдущего ответа и без перечня
+    допустимых упражнений. Вход сжимался с ~6700 до ~120 токенов, и модель
+    возвращала фрагмент без обязательных полей, то есть деградировала вместо
+    исправления.
+    """
+
+    @staticmethod
+    def _program_with_invented_exercise(pool: SafeExercisePool) -> str:
+        payload = json.loads(make_valid_program_json(pool))
+        payload["training_days"][0]["exercises"][0][
+            "exercise_external_id"
+        ] = "Cable_Lat_Pulldown_(Generic)"
+        return json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_repair_receives_schema_previous_answer_and_allowed_ids(self):
+        pool = make_safe_pool()
+        profile = make_profile()
+        invalid = self._program_with_invented_exercise(pool)
+
+        gateway = FakeAIGateway([invalid, make_valid_program_json(pool)])
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=1,
+        )
+
+        await generator.generate(profile, pool)
+
+        repair = gateway.calls[1]
+        roles = [m.role for m in repair.messages]
+        assert roles == ["system", "assistant", "user"]
+
+        # Правила и схема — те же, что в исходном запросе.
+        assert repair.messages[0].content == FakePromptLoader.SYSTEM_PROMPT
+        # Предыдущий ответ модели передан целиком: править нужно именно его.
+        assert repair.messages[1].content == invalid
+
+        instructions = repair.messages[2].content
+        # Ошибка валидации названа.
+        assert "exercise_not_found" in instructions
+        # Выдуманный идентификатор назван прямо.
+        assert "Cable_Lat_Pulldown_(Generic)" in instructions
+        # Разрешённый набор перечислен полностью.
+        for exercise in pool.allowed:
+            assert exercise.external_id in instructions
+        # Запрет на изобретение идентификаторов сформулирован явно.
+        assert "придумывать" in instructions
+        assert "ТОЛЬКО" in instructions
+
+    @pytest.mark.asyncio
+    async def test_repair_targets_the_same_model(self):
+        """Исправляет свой ответ та же модель: чужой ответ править бессмысленно."""
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={
+                "model-a": [
+                    self._program_with_invented_exercise(pool),
+                    make_valid_program_json(pool),
+                ]
+            },
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=1,
+        )
+
+        await generator.generate(profile, pool)
+
+        assert [model for model, _ in gateway.model_calls] == ["model-a", "model-a"]
+
+    @pytest.mark.asyncio
+    async def test_invented_exercise_is_still_rejected_by_validator(self):
+        """Валидатор не ослаблен: выдуманный external_id остаётся ошибкой."""
+        pool = make_safe_pool()
+        profile = make_profile()
+        invalid = self._program_with_invented_exercise(pool)
+
+        generator = AIProgramGenerator(
+            gateway=FakeAIGateway([invalid, invalid, invalid]),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=2,
+        )
+
+        with pytest.raises(ProgramGenerationError, match="exercise_not_found"):
+            await generator.generate(profile, pool)
+
+
+# --- Переход по цепочке моделей ---------------------------------------------------
+
+
+class TestModelChainFallback:
+    """Невалидный ответ — тоже основание сменить модель.
+
+    Раньше цепочку перебирал только Gateway и только по `AIError`. Провайдер
+    отвечал `200 OK` с выдуманным упражнением, поэтому все три вызова уходили
+    в одну и ту же flash-модель, а настроенные резервные не использовались.
+    """
+
+    @pytest.mark.asyncio
+    async def test_next_model_is_tried_after_repair_attempts_fail(self):
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={
+                "model-a": ["invalid", "still invalid", "nope"],
+                "model-b": [make_valid_program_json(pool)],
+            },
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=2,
+        )
+
+        program = await generator.generate(profile, pool)
+
+        assert program.title == "AI Test Program"
+        assert program.generation.model == "model-b"
+        # Первая модель получила ответ + два исправления, затем пришла очередь второй.
+        assert [model for model, _ in gateway.model_calls] == [
+            "model-a",
+            "model-a",
+            "model-a",
+            "model-b",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_all_models_invalid_raises_for_deterministic_fallback(self):
+        """Исчерпанная цепочка — отказ генератора: fallback решает оркестратор."""
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={
+                "model-a": ["invalid", "invalid"],
+                "model-b": ["invalid", "invalid"],
+            },
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=1,
+        )
+
+        with pytest.raises(ProgramGenerationError):
+            await generator.generate(profile, pool)
+        assert [model for model, _ in gateway.model_calls] == [
+            "model-a",
+            "model-a",
+            "model-b",
+            "model-b",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_provider_error_still_moves_to_next_model(self):
+        """Транспортный сбой ведёт себя как раньше: сразу следующая модель."""
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={
+                "model-a": [AIProviderError("boom", status_code=500)],
+                "model-b": [make_valid_program_json(pool)],
+            },
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=2,
+        )
+
+        program = await generator.generate(profile, pool)
+
+        assert program.generation.model == "model-b"
+        # Исправлять нечего: ответа не было, repair не запрашивался.
+        assert [model for model, _ in gateway.model_calls] == ["model-a", "model-b"]
+
+    @pytest.mark.asyncio
+    async def test_transport_error_of_last_model_is_raised_as_is(self):
+        """Тип AI-ошибки сохраняется: по нему оркестратор различает причины."""
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a")],
+            per_model={"model-a": [AIProviderError("boom", status_code=503)]},
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+        )
+
+        with pytest.raises(AIProviderError):
+            await generator.generate(profile, pool)
+
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_stops_the_chain(self):
+        """Исчерпанный бюджет не переносится на следующую модель."""
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={
+                "model-a": ["invalid"],
+                "model-b": [make_valid_program_json(pool)],
+            },
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=2,
+            total_budget_seconds=0,
+        )
+
+        with pytest.raises(ProgramGenerationError, match="время"):
+            await generator.generate(profile, pool)
+        assert [model for model, _ in gateway.model_calls] == ["model-a"]
+
+
+# --- Телеметрия попыток ----------------------------------------------------------
+
+
+class TestAttemptTelemetry:
+    """По журналу должно быть видно, почему цепочка fallback не спасла."""
+
+    @pytest.mark.asyncio
+    async def test_attempts_describe_each_model(self):
+        pool = make_safe_pool()
+        profile = make_profile()
+        recorded: list[list] = []
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={
+                "model-a": ["invalid", "invalid"],
+                "model-b": ["invalid", make_valid_program_json(pool)],
+            },
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=1,
+            attempt_recorder=lambda attempts: _collect(recorded, attempts),
+        )
+
+        await generator.generate(profile, pool)
+
+        assert len(recorded) == 1
+        attempts = AIProgramGenerator.attempts_metadata(recorded[0])
+        assert [a["model_id"] for a in attempts] == ["model-a", "model-b"]
+
+        first, second = attempts
+        assert first["outcome"] == "invalid_output"
+        assert first["initial_valid"] is False
+        assert first["repair_attempts"] == 1
+        assert first["is_primary"] is True
+
+        assert second["outcome"] == "success"
+        # Успех пришёл с исправления, а не с первого ответа.
+        assert second["initial_valid"] is False
+        assert second["repair_attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_attempts_are_recorded_when_all_models_fail(self):
+        pool = make_safe_pool()
+        profile = make_profile()
+        recorded: list[list] = []
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a")],
+            per_model={"model-a": [AIProviderError("boom", status_code=500)]},
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            attempt_recorder=lambda attempts: _collect(recorded, attempts),
+        )
+
+        with pytest.raises(AIProviderError):
+            await generator.generate(profile, pool)
+
+        attempts = AIProgramGenerator.attempts_metadata(recorded[0])
+        assert attempts[0]["outcome"] == "provider_error"
+        assert attempts[0]["error_type"] == "AIProviderError"
+
+    @pytest.mark.asyncio
+    async def test_telemetry_failure_does_not_break_generation(self):
+        """Журнал не критичен: его сбой не отменяет готовую программу."""
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        async def _broken(_attempts):
+            raise RuntimeError("audit is down")
+
+        generator = AIProgramGenerator(
+            gateway=FakeAIGateway([make_valid_program_json(pool)]),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            attempt_recorder=_broken,
+        )
+
+        program = await generator.generate(profile, pool)
+        assert program.title == "AI Test Program"
+
+
+async def _collect(sink: list, attempts) -> None:
+    sink.append(attempts)

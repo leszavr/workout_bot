@@ -133,9 +133,11 @@ class ScriptedAdapter(AIProviderAdapter):
     def __init__(self, outcomes: list) -> None:
         self._outcomes = list(outcomes)
         self.calls: list[tuple[str, str | None]] = []
+        self.requests: list[AdapterRequest] = []
 
     async def generate(self, request: AdapterRequest, connection: EndpointConnection, model_id: str) -> AdapterResult:
         self.calls.append((model_id, connection.api_key))
+        self.requests.append(request)
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -275,6 +277,85 @@ async def test_gateway_no_candidates_raises_configuration_error():
     request = _request()
     with pytest.raises(AIConfigurationError):
         await gateway.generate(request)
+
+
+# --- Двухшаговый контракт: prepare + generate_once ------------------------------------
+#
+# Транспортный успех не равен пригодному ответу: генератор программ проверяет
+# вывод модели схемой, safe pool и каталогом, и обязан сменить модель после
+# неудачных исправлений. Для этого перебор цепочки должен быть доступен
+# вызывающей стороне, а не быть заперт внутри `generate`.
+
+
+async def test_prepare_returns_ordered_chain():
+    adapter = ScriptedAdapter([])
+    config = AITaskConfig(id=100, task_type=AITaskType.WORKOUT_GENERATION, enabled=True)
+    bindings = [
+        AITaskModelBinding(id=2, task_config_id=100, model_id=2, priority=2, is_primary=False),
+        AITaskModelBinding(id=1, task_config_id=100, model_id=1, priority=1, is_primary=True),
+    ]
+    models = {
+        1: AIModel(id=1, endpoint_id=10, model_id="model-a", display_name="A"),
+        2: AIModel(id=2, endpoint_id=10, model_id="model-b", display_name="B"),
+    }
+    gateway, _, _ = _gateway(adapter, config=config, bindings=bindings, models=models)
+
+    chain = await gateway.prepare(_request())
+
+    assert [c.model.model_id for c in chain.candidates] == ["model-a", "model-b"]
+    assert chain.candidates[0].is_primary is True
+    # Параметры вызова берутся из настроек задачи.
+    assert chain.config.id == 100
+
+
+async def test_prepare_rejects_disabled_task():
+    adapter = ScriptedAdapter([])
+    config = AITaskConfig(id=100, task_type=AITaskType.WORKOUT_GENERATION, enabled=False)
+    gateway, _, _ = _gateway(adapter, config=config)
+    with pytest.raises(AIConfigurationError):
+        await gateway.prepare(_request())
+
+
+async def test_generate_once_calls_only_the_given_candidate():
+    """Перебор ведёт вызывающая сторона: сам вызов ходит ровно в одну модель."""
+    adapter = ScriptedAdapter([AIProviderError("primary failed", status_code=500)])
+    config = AITaskConfig(id=100, task_type=AITaskType.WORKOUT_GENERATION, enabled=True)
+    bindings = [
+        AITaskModelBinding(id=1, task_config_id=100, model_id=1, priority=1, is_primary=True),
+        AITaskModelBinding(id=2, task_config_id=100, model_id=2, priority=2, is_primary=False),
+    ]
+    models = {
+        1: AIModel(id=1, endpoint_id=10, model_id="model-a", display_name="A"),
+        2: AIModel(id=2, endpoint_id=10, model_id="model-b", display_name="B"),
+    }
+    gateway, usage, _ = _gateway(adapter, config=config, bindings=bindings, models=models)
+
+    request = _request()
+    chain = await gateway.prepare(request)
+    with pytest.raises(AIProviderError):
+        await gateway.generate_once(chain.candidates[0], request, chain)
+
+    # К резервной модели gateway сам не переходит.
+    assert [c[0] for c in adapter.calls] == ["model-a"]
+    # Учёт вызова ведётся так же, как в `generate`.
+    assert [r.status for r in usage.records] == ["error"]
+
+
+async def test_generate_once_uses_messages_of_the_passed_request():
+    """Repair-запрос идёт той же модели с другими сообщениями."""
+    adapter = ScriptedAdapter([AdapterResult(content="corrected", model="model-a")])
+    gateway, _, _ = _gateway(adapter)
+
+    request = _request()
+    chain = await gateway.prepare(request)
+    repair = AIRequest(
+        task_type=AITaskType.WORKOUT_GENERATION,
+        messages=[AIMessage(role="user", content="fix your previous answer")],
+    )
+    response = await gateway.generate_once(chain.candidates[0], repair, chain)
+
+    assert response.content == "corrected"
+    assert adapter.requests[-1].messages[0].content == "fix your previous answer"
 
 
 # --- Connection test -----------------------------------------------------------------
