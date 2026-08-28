@@ -35,6 +35,7 @@ from apps.telegram_gateway.pipeline import (
     is_auto_generation_enabled,
 )
 from apps.telegram_gateway.states.questionnaire_states import QuestionnaireStates
+from src.application.programs.pipeline import PipelineOutcome
 from src.application.questionnaire.review import render_review_html
 from src.errors import ProfilePersistenceError, QuestionnaireValidationError
 from src.infrastructure.config import ADMIN_CHAT_ID
@@ -159,6 +160,19 @@ async def run_program_pipeline(
             await bot.send_message(chat_id, result.user_message)
         except Exception:  # noqa: BLE001
             logger.exception("user_message_send_failed", extra={"profile_id": profile_id})
+
+    # Исход фиксируется всегда: пользователь видит только обобщённое сообщение,
+    # и без записи стадии причина отказа доставки не восстанавливается по логу.
+    log = logger.info if result.outcome is PipelineOutcome.DELIVERED else logger.warning
+    log(
+        "event=program_pipeline_finished",
+        extra={
+            "profile_id": profile_id,
+            "outcome": result.outcome.value,
+            "program_id": result.program.program_id if result.program else None,
+            "program_version": result.program.version if result.program else None,
+        },
+    )
 
 
 @router.callback_query(F.data == "return_to_questionnaire")

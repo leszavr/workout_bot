@@ -45,6 +45,51 @@ def _result(message: str = "Ваша программа готова.") -> Pipel
     return PipelineResult(outcome=PipelineOutcome.DELIVERED, user_message=message)
 
 
+class TestOutcomeIsLogged:
+    """Пользователь видит обобщённое сообщение; стадия отказа нужна в логе.
+
+    Без записи исхода причину «Не удалось сформировать программу» невозможно
+    восстановить: она остаётся только в алерте администратору.
+    """
+
+    async def test_delivered_outcome_logged_as_info(self, monkeypatch, caplog):
+        bot = FakeBot()
+        monkeypatch.setattr(
+            review, "build_program_pipeline", lambda _bot: FakePipeline(_result())
+        )
+
+        with caplog.at_level("INFO", logger=review.logger.name):
+            await review.run_program_pipeline(
+                bot=bot, chat_id="42", profile_id="p1", already_finalized=False
+            )
+
+        record = next(
+            r for r in caplog.records if "program_pipeline_finished" in r.getMessage()
+        )
+        assert record.levelname == "INFO"
+        assert record.outcome == PipelineOutcome.DELIVERED.value
+
+    async def test_failed_outcome_logged_as_warning(self, monkeypatch, caplog):
+        bot = FakeBot()
+        failed = PipelineResult(
+            outcome=PipelineOutcome.DELIVERY_FAILED, user_message="не вышло"
+        )
+        monkeypatch.setattr(
+            review, "build_program_pipeline", lambda _bot: FakePipeline(failed)
+        )
+
+        with caplog.at_level("INFO", logger=review.logger.name):
+            await review.run_program_pipeline(
+                bot=bot, chat_id="42", profile_id="p1", already_finalized=False
+            )
+
+        record = next(
+            r for r in caplog.records if "program_pipeline_finished" in r.getMessage()
+        )
+        assert record.levelname == "WARNING"
+        assert record.outcome == PipelineOutcome.DELIVERY_FAILED.value
+
+
 class TestPipelineBuilderIsResolvable:
     """Имена, которые хендлер вызывает в рантайме, должны быть ему доступны."""
 
