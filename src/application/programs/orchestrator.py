@@ -490,7 +490,9 @@ class ProgramGenerationOrchestrator:
                 )
                 continue
 
-            result = self._validator.validate(program, safe_pool, profile, catalog_ids)
+            result = self._validator.validate(
+                program, safe_pool, profile, catalog_ids, safe_pool.allowed_sources()
+            )
             if not result.valid:
                 message = safe_error_message(
                     "; ".join(f"{i.code}: {i.message}" for i in result.issues)

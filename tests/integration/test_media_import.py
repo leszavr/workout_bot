@@ -158,3 +158,25 @@ async def test_import_creates_media_and_skips_unchanged(
         assert len(asset.checksum) == 64
         assert asset.size_bytes > 0
         assert asset.width > 0 and asset.height > 0
+
+async def test_bulk_list_filters_by_source(
+    repo_root: Path, local_storage, test_exercise_in_catalog
+):
+    """Медиа ищется по паре external_id + source, как и каталог.
+
+    Иначе программа с чужим source получала бы фотографии, но не находила
+    описания упражнений, и расхождение оставалось бы незаметным.
+    """
+    from src.infrastructure.persistence.postgres.db import get_session_factory
+    from src.infrastructure.persistence.postgres.exercise_media_repository import (
+        ExerciseMediaRepository,
+    )
+
+    await import_media(repo_root, source_version="test", max_per_exercise=5)
+    repo = ExerciseMediaRepository(get_session_factory())
+
+    matching = await repo.bulk_list([(TEST_EX_ID, SOURCE)])
+    assert len(matching.get(TEST_EX_ID, [])) == 2
+
+    foreign = await repo.bulk_list([(TEST_EX_ID, "workout")])
+    assert foreign == {}

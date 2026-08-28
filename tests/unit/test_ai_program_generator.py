@@ -442,3 +442,76 @@ class TestAIProgramGenerator:
 
         with pytest.raises(ProgramGenerationError, match="Schema validation failed"):
             await generator.generate(profile, pool)
+
+class TestExerciseSourceIsTakenFromCatalog:
+    """`exercise_source` не входит в зону ответственности модели.
+
+    Ссылка на упражнение канонична как пара `external_id` + `source`. Модель
+    источник не выбирает — упражнения приходят из safe pool, где source уже
+    известен, — но воспроизводит поле по примеру из промпта и искажает его.
+    Наблюдалось `workout` вместо `leszavr/workout`: схему такая запись
+    проходит, сохраняется, а затем каталог по ней не находится и пользователь
+    получает карточки без названий, техники и предупреждений.
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_source_is_replaced_by_catalog(self):
+        pool = make_safe_pool()
+        profile = make_profile()
+        payload = json.loads(make_valid_program_json(pool))
+        for exercise in payload["training_days"][0]["exercises"]:
+            exercise["exercise_source"] = "workout"
+
+        generator = AIProgramGenerator(
+            gateway=FakeAIGateway([json.dumps(payload)]),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=0,
+        )
+        program = await generator.generate(profile, pool)
+
+        sources = {
+            ex.exercise_source
+            for day in program.training_days
+            for ex in day.exercises
+        }
+        assert sources == {"leszavr/workout"}
+
+    @pytest.mark.asyncio
+    async def test_missing_source_is_filled_from_catalog(self):
+        """Промпт больше не требует поле: его подставляет сервер."""
+        pool = make_safe_pool()
+        profile = make_profile()
+        payload = json.loads(make_valid_program_json(pool))
+        for exercise in payload["training_days"][0]["exercises"]:
+            del exercise["exercise_source"]
+
+        generator = AIProgramGenerator(
+            gateway=FakeAIGateway([json.dumps(payload)]),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=0,
+        )
+        program = await generator.generate(profile, pool)
+
+        for day in program.training_days:
+            for exercise in day.exercises:
+                assert exercise.exercise_source == "leszavr/workout"
+
+    @pytest.mark.asyncio
+    async def test_unknown_exercise_keeps_its_source_and_fails_catalog_check(self):
+        """Подстановка не маскирует выдуманное упражнение."""
+        pool = make_safe_pool()
+        profile = make_profile()
+        payload = json.loads(make_valid_program_json(pool))
+        payload["training_days"][0]["exercises"][0]["exercise_external_id"] = "GHOST"
+
+        generator = AIProgramGenerator(
+            gateway=FakeAIGateway([json.dumps(payload)]),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=0,
+        )
+
+        with pytest.raises(ProgramGenerationError, match="exercise_not_found"):
+            await generator.generate(profile, pool)

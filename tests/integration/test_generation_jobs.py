@@ -941,7 +941,7 @@ class TestOrchestratorUnderJobControl:
 
 
 class _RejectingValidator:
-    def validate(self, program, pool, profile, catalog_ids):
+    def validate(self, program, pool, profile, catalog_ids, catalog_sources=None):
         class _Issue:
             code = "TEST"
             message = "отклонено тестом"
