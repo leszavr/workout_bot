@@ -73,9 +73,14 @@ class ExerciseMediaRepository:
         """Медиа для набора упражнений за минимальное число запросов.
 
         Возвращает dict: external_id -> [ассеты по sequence].
+
+        Фильтр идёт по паре `external_id` + `source`, как и поиск в каталоге:
+        иначе программа с чужим source получала бы фотографии, но не находила
+        описания, и расхождение оставалось бы незаметным.
         """
         if not pairs:
             return {}
+        wanted = set(pairs)
         external_ids = sorted({external_id for external_id, _ in pairs})
         stmt = (
             select(ExerciseMediaRow)
@@ -90,6 +95,8 @@ class ExerciseMediaRepository:
 
         result: dict[str, list[ExerciseMediaAsset]] = {}
         for row in rows:
+            if (row.exercise_external_id, row.exercise_source) not in wanted:
+                continue
             bucket = result.setdefault(row.exercise_external_id, [])
             if limit_per_exercise is not None and len(bucket) >= limit_per_exercise:
                 continue
