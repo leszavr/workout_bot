@@ -585,13 +585,67 @@ export interface AIAuditItem {
   created_at: string | null;
 }
 
+// --- Инструкции для ИИ (промпты) -------------------------------------------------
+// Список отдаёт превью и метаданные, полный текст — только карточка: инструкция
+// бывает в десятки килобайт, и тянуть её целиком в список незачем.
+
 export interface AIPromptItem {
   id: number;
   task_type: string;
   version: number;
   name: string;
   enabled: boolean;
+  // Выбрана в настройках задачи: удалять такую нельзя.
+  in_use: boolean;
+  system_prompt_preview: string;
+  system_prompt_length: number;
+  user_template_length: number;
   created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AIPromptDetail {
+  id: number;
+  task_type: string;
+  version: number;
+  name: string;
+  system_prompt: string;
+  user_template: string;
+  enabled: boolean;
+  in_use: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AIPromptListResponse extends ListResponse<AIPromptItem> {
+  next_version: number;
+  active_version: number | null;
+}
+
+// --- Попытки моделей внутри одной генерации ---------------------------------------
+
+export interface AIModelAttempt {
+  priority: number;
+  is_primary: boolean;
+  provider: string;
+  model_id: string;
+  model_pk: number | null;
+  initial_valid: boolean;
+  repair_attempts: number;
+  outcome: string;
+  error_type: string | null;
+  detail: string | null;
+}
+
+export interface AIModelAttemptsItem {
+  id: number;
+  event_type: string;
+  created_at: string | null;
+  metadata: {
+    task_type?: string;
+    models_tried?: number;
+    attempts?: AIModelAttempt[];
+  };
 }
 
 // --- Infrastructure health (Phase 1.1.1) -----------------------------------------
@@ -776,6 +830,10 @@ export const aiApi = {
     request<ListResponse<AIFallbackEventItem>>(
       "/api/v1/admin/ai/fallback-events"
     ),
+  modelAttempts: () =>
+    request<ListResponse<AIModelAttemptsItem>>(
+      "/api/v1/admin/ai/model-attempts"
+    ),
   infrastructureHealth: () =>
     request<AIInfrastructureHealth>("/api/v1/admin/ai/infrastructure-health"),
   refreshInfrastructureHealth: () =>
@@ -784,9 +842,21 @@ export const aiApi = {
       { method: "POST" }
     ),
   prompts: (taskType = "workout_generation") =>
-    request<ListResponse<AIPromptItem> & { next_version: number }>(
-      `/api/v1/admin/ai/prompts/${taskType}`
-    ),
+    request<AIPromptListResponse>(`/api/v1/admin/ai/prompts/${taskType}`),
+  prompt: (id: number) =>
+    request<AIPromptDetail>(`/api/v1/admin/ai/prompts/detail/${id}`),
+  createPrompt: (body: Record<string, unknown>) =>
+    request<AIPromptDetail>("/api/v1/admin/ai/prompts", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  patchPrompt: (id: number, body: Record<string, unknown>) =>
+    request<AIPromptDetail>(`/api/v1/admin/ai/prompts/detail/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deletePrompt: (id: number) =>
+    request<void>(`/api/v1/admin/ai/prompts/detail/${id}`, { method: "DELETE" }),
 };
 
 // --- AI Providers для UI (публичный API) ----------------------------------------
