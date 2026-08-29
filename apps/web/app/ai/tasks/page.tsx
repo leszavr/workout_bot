@@ -33,8 +33,7 @@ export default function AITasksPage() {
         allModels={state.allModels}
         endpoints={state.endpoints}
         providers={state.providers}
-        promptVersions={state.promptVersions}
-        canWrite={canWrite}
+        prompts={state.prompts}        canWrite={canWrite}
         onChanged={state.onChanged}
         onError={state.onError}
       />

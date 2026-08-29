@@ -15,6 +15,7 @@ import {
   AIAuditItem,
   AIEndpointItem,
   AIModelItem,
+  AIPromptItem,
   AIProviderItem,
   AIReadinessReport,
   AITaskItem,
@@ -30,7 +31,9 @@ export interface AIConfigurationState {
   endpoints: Record<number, AIEndpointItem[]>;
   models: Record<number, AIModelItem[]>;
   tasks: AITaskItem[];
-  promptVersions: number[];
+  // Инструкции задачи целиком, а не только номера версий: выбор в настройках
+  // задачи делается по названию, номер сам по себе ничего не говорит.
+  prompts: AIPromptItem[];
   readiness: AIReadinessReport | null;
   usage: AIUsageItem[];
   audit: AIAuditItem[];
@@ -51,7 +54,7 @@ export function useAIConfiguration(): AIConfigurationState {
   const [endpoints, setEndpoints] = useState<Record<number, AIEndpointItem[]>>({});
   const [models, setModels] = useState<Record<number, AIModelItem[]>>({});
   const [tasks, setTasks] = useState<AITaskItem[]>([]);
-  const [promptVersions, setPromptVersions] = useState<number[]>([]);
+  const [prompts, setPrompts] = useState<AIPromptItem[]>([]);
   const [readiness, setReadiness] = useState<AIReadinessReport | null>(null);
   const [usage, setUsage] = useState<AIUsageItem[]>([]);
   const [audit, setAudit] = useState<AIAuditItem[]>([]);
@@ -64,7 +67,7 @@ export function useAIConfiguration(): AIConfigurationState {
   const reload = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [providersData, tasksData, prompts, report, usageData, auditData] =
+      const [providersData, tasksData, promptsData, report, usageData, auditData] =
         await Promise.all([
           aiApi.providers(),
           aiApi.tasks(),
@@ -88,9 +91,7 @@ export function useAIConfiguration(): AIConfigurationState {
       setEndpoints(endpointMap);
       setModels(modelMap);
       setTasks(tasksData.items);
-      setPromptVersions(
-        prompts.items.filter((p) => p.enabled).map((p) => p.version)
-      );
+      setPrompts(promptsData.items);
       setReadiness(report);
       setUsage(usageData.items);
       setAudit(auditData.items);
@@ -124,7 +125,7 @@ export function useAIConfiguration(): AIConfigurationState {
     endpoints,
     models,
     tasks,
-    promptVersions,
+    prompts,
     readiness,
     usage,
     audit,
