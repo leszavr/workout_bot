@@ -8,11 +8,23 @@
    - дом → парсинг свободного текста описания оборудования в теги каталога;
    - "body only" доступно всегда.
 2. Уровень подготовки: отображение опыта профиля на допустимые difficulty.
-3. Явные исключения пользователя (exercise_preferences.excluded_exercises).
+3. Нежелательные упражнения пользователя: `disliked_exercises` (ответ на вопрос
+   «какие упражнения вы не любите или не хотите выполнять?») и
+   `excluded_exercises`.
 4. CardioPreference.EXCLUDE → кардио исключается.
 
 Цель пользователя НЕ исключает упражнения — она используется генератором
 для ранжирования (см. generator.py).
+
+Про пункт 3. Раньше фильтр читал только `excluded_exercises` — поле, которое
+анкета не заполняет и не заполнял никто в коде. Ответ пользователя уходил в
+`disliked_exercises` и на отбор не влиял вообще: человек писал «не хочу выпады» и
+получал программу с выпадами. Оба поля читаются вместе, потому что различие между
+«не люблю» и «исключить» пользователю не предъявляется: вопрос в анкете один.
+
+Сравнение идёт не по точному совпадению строк, а по значимым словам (см.
+`exercise_matching`): пользователь пишет «выпады», а в каталоге 11 упражнений с
+выпадами под разными названиями.
 """
 from __future__ import annotations
 
@@ -22,6 +34,10 @@ from src.domain.enums import (
     CardioPreference,
     ExperienceLevel,
     TrainingLocationType,
+)
+from src.application.programs.exercise_matching import (
+    matches_unwanted,
+    normalize_unwanted,
 )
 from src.domain.exercise import Exercise
 from src.domain.pools import ExclusionRecord, ExerciseCandidatePool
@@ -154,11 +170,13 @@ class ExerciseFilter:
         allowed_difficulty = EXPERIENCE_TO_DIFFICULTY.get(
             profile.training_background.experience_level
         )
-        excluded_names = {
-            name.strip().lower()
-            for name in profile.exercise_preferences.excluded_exercises
-            if name.strip()
-        }
+        # Оба поля вместе: пользователю в анкете задан один вопрос про
+        # нежелательные упражнения, и различать «не люблю» и «исключить» не на
+        # чем.
+        preferences = profile.exercise_preferences
+        unwanted = normalize_unwanted(
+            [*preferences.disliked_exercises, *preferences.excluded_exercises]
+        )
         cardio_excluded = (
             profile.lifestyle.cardio_preference is CardioPreference.EXCLUDE
         )
@@ -183,9 +201,11 @@ class ExerciseFilter:
             if reason:
                 excluded.append(self._record(exercise, reason))
                 continue
-            if self._is_user_excluded(exercise, excluded_names):
+            if self._is_user_excluded(exercise, unwanted):
                 excluded.append(
-                    self._record(exercise, "в списке исключений пользователя")
+                    self._record(
+                        exercise, "пользователь не хочет выполнять это упражнение"
+                    )
                 )
                 continue
             included.append(exercise)
@@ -228,11 +248,10 @@ class ExerciseFilter:
         return f"сложность '{exercise.difficulty}' выше допустимой для уровня подготовки"
 
     @staticmethod
-    def _is_user_excluded(exercise: Exercise, excluded_names: set[str]) -> bool:
-        if not excluded_names:
-            return False
-        names = {exercise.name.lower()}
-        if exercise.name_ru:
-            names.add(exercise.name_ru.lower())
-        names.update(alias.lower() for alias in exercise.aliases)
-        return bool(names & excluded_names)
+    def _is_user_excluded(exercise: Exercise, unwanted: list[set[str]]) -> bool:
+        return matches_unwanted(
+            name=exercise.name,
+            name_ru=exercise.name_ru,
+            aliases=exercise.aliases,
+            unwanted=unwanted,
+        )
