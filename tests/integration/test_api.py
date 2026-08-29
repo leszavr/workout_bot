@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 
 import pytest
+from sqlalchemy import select
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -50,6 +51,42 @@ def auth_headers(client: TestClient) -> dict:
     assert response.status_code == 200
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture(scope="module")
+def viewer_headers(client: TestClient, auth_headers: dict) -> dict:
+    """Токен наблюдателя: проверяет, что запрет на удаление серверный."""
+    login = "test-api-viewer"
+    password = "viewer-password-0123"
+    client.post(
+        "/api/v1/admin/users",
+        headers=auth_headers,
+        json={
+            "login": login,
+            "password": password,
+            "role": "viewer",
+            "must_change_password": False,
+        },
+    )
+    token = client.post(
+        "/api/v1/auth/login", json={"login": login, "password": password}
+    ).json()["access_token"]
+    yield {"Authorization": f"Bearer {token}"}
+
+    async def _purge() -> None:
+        from sqlalchemy import delete
+
+        from src.infrastructure.persistence.postgres.db import get_session_factory
+        from src.infrastructure.persistence.postgres.models import AdminUserRow
+
+        # Привязки внешних аккаунтов удалит каскад (ON DELETE CASCADE).
+        async with get_session_factory()() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(AdminUserRow).where(AdminUserRow.login == login)
+                )
+
+    client.portal.call(_purge)
 
 
 def test_health(client: TestClient):
@@ -150,6 +187,7 @@ def cleanup_program_test_data():
             ConsentRow,
             GenerationJobRow,
             ProfileRow,
+            ProgramDeliveryRow,
             UserRow,
             WorkoutProgramRow,
         )
@@ -174,6 +212,13 @@ def cleanup_program_test_data():
                     await session.execute(
                         delete(WorkoutProgramRow).where(
                             WorkoutProgramRow.profile_id.in_(profile_ids)
+                        )
+                    )
+                    # Доставки внешнего ключа не имеют: чистим сами, иначе
+                    # маркер «отправлено» протёк бы в следующие прогоны.
+                    await session.execute(
+                        delete(ProgramDeliveryRow).where(
+                            ProgramDeliveryRow.profile_id.in_(profile_ids)
                         )
                     )
                 user_ids = (
@@ -504,3 +549,261 @@ def test_get_exercise_by_external_id(client: TestClient, auth_headers: dict):
     assert response.status_code == 200
     body = response.json()
     assert body["external_id"] == external_id
+
+
+# --- Маркеры исполнения анкеты, сортировка и удаление ------------------------------
+#
+# Раздел анкет накапливался: удаления не было вовсе, а по списку нельзя было
+# понять, исполнена ли анкета. Маркеры вычисляются подзапросами по фактическому
+# составу программ и доставок, а не хранятся в анкете отдельными флагами.
+
+
+def _mark_delivered(client: TestClient, profile_id: str, program_id: str) -> None:
+    """Отмечает программу отправленной пользователю в Telegram.
+
+    Пишется через штатный репозиторий доставки, а не прямым INSERT: маркер
+    обязан читать ровно то, что создаёт доставка.
+    """
+    from src.domain.enums import ProgramDeliveryStatus
+    from src.infrastructure.persistence.postgres.db import get_session_factory
+    from src.infrastructure.persistence.postgres.delivery_repository import (
+        ProgramDeliveryRecord,
+        ProgramDeliveryRepository,
+    )
+
+    async def _write() -> None:
+        repo = ProgramDeliveryRepository(get_session_factory())
+        record = await repo.create(
+            ProgramDeliveryRecord(
+                program_id=program_id,
+                profile_id=profile_id,
+                chat_id="900088",
+                filename="program.html",
+            )
+        )
+        record.status = ProgramDeliveryStatus.SENT
+        record.sent_message_id = 4242
+        await repo.update(record)
+
+    client.portal.call(_write)
+
+
+def _profile_item(client: TestClient, auth_headers: dict, profile_id: str) -> dict:
+    body = client.get(
+        f"/api/v1/profiles?search={profile_id}", headers=auth_headers
+    ).json()
+    return next(i for i in body["items"] if i["profile_id"] == profile_id)
+
+
+def test_profile_markers_reflect_program_and_delivery(
+    client: TestClient, auth_headers: dict
+):
+    """Маркеры показывают, исполнена ли анкета."""
+    profile_id = "test-api-prog-markers"
+    _create_test_profile(client, profile_id)
+
+    fresh = _profile_item(client, auth_headers, profile_id)
+    assert fresh["has_program"] is False
+    assert fresh["delivered"] is False
+    assert fresh["delivered_at"] is None
+    assert fresh["delivery_status"] is None
+
+    generated = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+    program_id = generated["program"]["program_id"]
+
+    with_program = _profile_item(client, auth_headers, profile_id)
+    assert with_program["has_program"] is True
+    # Программа собрана, но пользователю ещё не уходила.
+    assert with_program["delivered"] is False
+
+    _mark_delivered(client, profile_id, program_id)
+
+    delivered = _profile_item(client, auth_headers, profile_id)
+    assert delivered["has_program"] is True
+    assert delivered["delivered"] is True
+    assert delivered["delivered_at"] is not None
+    assert delivered["delivery_status"] == "sent"
+
+
+def test_profile_filters_by_markers(client: TestClient, auth_headers: dict):
+    profile_id = "test-api-prog-filter"
+    _create_test_profile(client, profile_id)
+
+    def ids(query: str) -> set[str]:
+        body = client.get(f"/api/v1/profiles?{query}", headers=auth_headers).json()
+        return {i["profile_id"] for i in body["items"]}
+
+    # Анкета без программы: попадает в «без программы», не попадает в обратный.
+    assert profile_id in ids(f"search={profile_id}&generated=false")
+    assert profile_id not in ids(f"search={profile_id}&generated=true")
+
+    client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    )
+
+    assert profile_id in ids(f"search={profile_id}&generated=true")
+    assert profile_id not in ids(f"search={profile_id}&generated=false")
+    # Программа не отправлена, поэтому фильтр по доставке её не покажет.
+    assert profile_id in ids(f"search={profile_id}&delivered=false")
+    assert profile_id not in ids(f"search={profile_id}&delivered=true")
+
+
+def test_profile_sorting_groups_by_markers(client: TestClient, auth_headers: dict):
+    """Сортировка ставит нужную группу первой, внутри группы — новые сверху."""
+    plain = "test-api-prog-sort-plain"
+    with_program = "test-api-prog-sort-ready"
+    _create_test_profile(client, plain)
+    _create_test_profile(client, with_program)
+    client.post(
+        f"/api/v1/profiles/{with_program}/programs/generate", headers=auth_headers
+    )
+
+    def order(sort: str) -> list[str]:
+        body = client.get(
+            f"/api/v1/profiles?search=test-api-prog-sort&sort={sort}",
+            headers=auth_headers,
+        ).json()
+        assert body["sort"] == sort
+        return [i["profile_id"] for i in body["items"]]
+
+    assert order("generated_first")[0] == with_program
+    assert order("not_generated_first")[0] == plain
+
+    by_date = order("created_asc")
+    assert by_date.index(plain) < by_date.index(with_program)
+    newest_first = order("created_desc")
+    assert newest_first.index(with_program) < newest_first.index(plain)
+
+
+def test_unknown_sort_is_rejected(client: TestClient, auth_headers: dict):
+    """Порядок сортировки — белый список, а не имя колонки из запроса."""
+    response = client.get("/api/v1/profiles?sort=data", headers=auth_headers)
+    assert response.status_code == 422
+
+
+def test_program_list_reports_delivery(client: TestClient, auth_headers: dict):
+    profile_id = "test-api-prog-listdelivery"
+    _create_test_profile(client, profile_id)
+    generated = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+    program_id = generated["program"]["program_id"]
+
+    before = client.get(
+        f"/api/v1/profiles/{profile_id}/programs", headers=auth_headers
+    ).json()
+    assert before["items"][0]["delivered"] is False
+
+    _mark_delivered(client, profile_id, program_id)
+
+    after = client.get(
+        f"/api/v1/profiles/{profile_id}/programs", headers=auth_headers
+    ).json()
+    assert after["items"][0]["delivered"] is True
+
+
+def test_delete_endpoints_require_auth(client: TestClient):
+    assert client.delete("/api/v1/profiles/any").status_code in (401, 403)
+    assert client.delete("/api/v1/programs/any").status_code in (401, 403)
+
+
+def test_delete_endpoints_require_admin_role(
+    client: TestClient, viewer_headers: dict
+):
+    """Наблюдатель не удаляет данные: ограничение серверное, не только в UI."""
+    assert client.delete("/api/v1/profiles/any", headers=viewer_headers).status_code == 403
+    assert client.delete("/api/v1/programs/any", headers=viewer_headers).status_code == 403
+
+
+def test_profile_with_programs_cannot_be_deleted(
+    client: TestClient, auth_headers: dict
+):
+    """Анкету заполнял человек: её нельзя потерять из-за одного клика."""
+    profile_id = "test-api-prog-delblocked"
+    _create_test_profile(client, profile_id)
+    client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    )
+
+    response = client.delete(f"/api/v1/profiles/{profile_id}", headers=auth_headers)
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["blockers"][0]["type"] == "workout_program"
+    assert detail["blockers"][0]["count"] >= 1
+    # Анкета на месте: отказ произошёл до удаления.
+    assert client.get(f"/api/v1/profiles/{profile_id}", headers=auth_headers).status_code == 200
+
+
+def test_program_delete_removes_all_versions(client: TestClient, auth_headers: dict):
+    profile_id = "test-api-prog-delprog"
+    _create_test_profile(client, profile_id)
+    first = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+    program_id = first["program"]["program_id"]
+    # Вторая сборка добавляет версию той же программы.
+    client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    )
+
+    assert (
+        client.delete(f"/api/v1/programs/{program_id}", headers=auth_headers).status_code
+        == 204
+    )
+    assert (
+        client.get(f"/api/v1/programs/{program_id}", headers=auth_headers).status_code
+        == 404
+    )
+    remaining = client.get(
+        f"/api/v1/profiles/{profile_id}/programs", headers=auth_headers
+    ).json()
+    assert program_id not in {i["program_id"] for i in remaining["items"]}
+
+
+def test_profile_becomes_deletable_after_programs_removed(
+    client: TestClient, auth_headers: dict
+):
+    """Заявленный порядок: сначала программы, потом анкета."""
+    profile_id = "test-api-prog-delorder"
+    _create_test_profile(client, profile_id)
+    generated = client.post(
+        f"/api/v1/profiles/{profile_id}/programs/generate", headers=auth_headers
+    ).json()
+    program_id = generated["program"]["program_id"]
+    _mark_delivered(client, profile_id, program_id)
+
+    assert (
+        client.delete(f"/api/v1/profiles/{profile_id}", headers=auth_headers).status_code
+        == 409
+    )
+    assert (
+        client.delete(f"/api/v1/programs/{program_id}", headers=auth_headers).status_code
+        == 204
+    )
+    assert (
+        client.delete(f"/api/v1/profiles/{profile_id}", headers=auth_headers).status_code
+        == 204
+    )
+    assert (
+        client.get(f"/api/v1/profiles/{profile_id}", headers=auth_headers).status_code
+        == 404
+    )
+    # Анкета исчезла и из списка, а не только из детального ответа.
+    listed = client.get(
+        f"/api/v1/profiles?search={profile_id}", headers=auth_headers
+    ).json()
+    assert profile_id not in {i["profile_id"] for i in listed["items"]}
+
+
+def test_deleting_missing_entities_returns_404(client: TestClient, auth_headers: dict):
+    assert (
+        client.delete("/api/v1/profiles/absent-profile", headers=auth_headers).status_code
+        == 404
+    )
+    assert (
+        client.delete("/api/v1/programs/absent-program", headers=auth_headers).status_code
+        == 404
+    )

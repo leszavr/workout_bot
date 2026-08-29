@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,7 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from apps.backend.api.v1.dependencies import (
+    build_delivery_repository,
     build_generation_orchestrator,
+    build_profile_admin_service,
     build_program_html_service,
     build_program_service,
 )
@@ -31,12 +34,14 @@ from apps.backend.auth import (
     verify_env_admin,
 )
 from src.application.auth.service import AdminUserError
+from src.application.deletion import DeleteBlockedError
 from src.application.programs.orchestrator import (
     GenerationRequest,
     OrchestratorResult,
 )
 from src.application.programs.telegram_delivery import build_filename
 from src.domain.auth import AdminRole
+from src.domain.enums import ProgramDeliveryStatus
 from src.domain.generation import (
     GenerationErrorCode,
     GenerationTrigger,
@@ -48,18 +53,24 @@ from src.errors import (
     GenerationFailedError,
     HtmlRenderError,
     IdempotencyKeyConflictError,
+    ProfilePersistenceError,
+    ProgramDeliveryError,
     ProgramGenerationError,
+    ProgramPersistenceError,
 )
 from src.infrastructure.persistence.postgres.db import get_session_factory
 from src.infrastructure.persistence.postgres.models import (
     ConsentRow,
     ExerciseRow,
     ProfileRow,
+    ProgramDeliveryRow,
     UserRow,
     WorkoutProgramRow,
 )
 
 router = APIRouter(prefix="/api/v1")
+
+logger = logging.getLogger(__name__)
 
 # --- Auth ---------------------------------------------------------------------
 
@@ -208,16 +219,91 @@ async def dashboard(_: Annotated[AuthenticatedUser, Depends(require_viewer)]) ->
 
 
 # --- Profiles -----------------------------------------------------------------
+#
+# Раздел анкет накапливается: анкета остаётся в списке и после того, как
+# программа по ней собрана и отправлена. Поэтому список сообщает, исполнена ли
+# анкета (собрана программа, отправлена пользователю), умеет по этим признакам
+# сортировать, а неактуальные анкеты можно удалить.
+
+# Разрешённые способы сортировки. Белый список, а не имя колонки из запроса:
+# подстановка произвольного поля в ORDER BY — это и SQL-инъекция, и утечка
+# внутренней схемы в публичный контракт.
+_PROFILE_SORTS = {
+    "created_desc": "новые сверху",
+    "created_asc": "старые сверху",
+    "generated_first": "сначала с готовой программой",
+    "not_generated_first": "сначала без программы",
+    "delivered_first": "сначала отправленные пользователю",
+    "not_delivered_first": "сначала неотправленные",
+}
+
+
+def _profile_sort_clause(sort: str, has_program, delivered):
+    """ORDER BY для выбранного способа сортировки.
+
+    Внутри каждой группы порядок всегда «новые сверху»: без второго ключа
+    строки внутри группы шли бы в произвольном порядке базы, и список менялся
+    бы между открытиями.
+    """
+    newest = ProfileRow.created_at.desc()
+    if sort == "created_asc":
+        return (ProfileRow.created_at.asc(),)
+    if sort == "generated_first":
+        return (has_program.desc(), newest)
+    if sort == "not_generated_first":
+        return (has_program.asc(), newest)
+    if sort == "delivered_first":
+        return (delivered.desc(), newest)
+    if sort == "not_delivered_first":
+        return (delivered.asc(), newest)
+    return (newest,)
+
 
 @router.get("/profiles")
 async def list_profiles(
     _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     search: Annotated[str | None, Query(max_length=100)] = None,
     status: Annotated[str | None, Query(max_length=32)] = None,
+    generated: Annotated[bool | None, Query()] = None,
+    delivered: Annotated[bool | None, Query()] = None,
+    sort: Annotated[str, Query(pattern="^[a-z_]+$", max_length=32)] = "created_desc",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
-    stmt = select(ProfileRow)
+    """Список анкет с признаками исполнения, фильтрами и сортировкой.
+
+    Признаки вычисляются подзапросами, а не хранятся в анкете: дублирующие
+    флаги рассинхронизировались бы с фактическим составом программ и доставок.
+    """
+    if sort not in _PROFILE_SORTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Неизвестный порядок сортировки. Допустимые: {', '.join(_PROFILE_SORTS)}",
+        )
+
+    # Программа собрана хотя бы одна.
+    has_program = (
+        select(WorkoutProgramRow.id)
+        .where(WorkoutProgramRow.profile_id == ProfileRow.profile_id)
+        .exists()
+    )
+    # Программа доставлена пользователю в Telegram. Единственный достоверно
+    # известный факт получения: Bot API не сообщает, открыл ли человек документ,
+    # поэтому «скачано пользователем» не отслеживается вовсе, а не угадывается.
+    delivered_exists = (
+        select(ProgramDeliveryRow.id)
+        .where(
+            ProgramDeliveryRow.profile_id == ProfileRow.profile_id,
+            ProgramDeliveryRow.status == ProgramDeliveryStatus.SENT.value,
+        )
+        .exists()
+    )
+
+    stmt = select(
+        ProfileRow,
+        has_program.label("has_program"),
+        delivered_exists.label("delivered"),
+    )
     if search:
         like = f"%{search}%"
         stmt = stmt.where(
@@ -227,22 +313,32 @@ async def list_profiles(
         )
     if status:
         stmt = stmt.where(ProfileRow.status == status)
+    if generated is not None:
+        stmt = stmt.where(has_program if generated else ~has_program)
+    if delivered is not None:
+        stmt = stmt.where(delivered_exists if delivered else ~delivered_exists)
+
+    order_by = _profile_sort_clause(sort, has_program, delivered_exists)
 
     async with get_session_factory()() as session:
         total = (
             await session.execute(select(func.count()).select_from(stmt.subquery()))
         ).scalar_one()
         rows = (
-            (await session.execute(stmt.order_by(ProfileRow.created_at.desc()).limit(limit).offset(offset)))
-            .scalars()
-            .all()
-        )
+            await session.execute(stmt.order_by(*order_by).limit(limit).offset(offset))
+        ).all()
+
+    # Дата отправки нужна только для показанной страницы, поэтому берётся
+    # отдельным запросом по её profile_id, а не джойном ко всему списку.
+    page_ids = [row[0].profile_id for row in rows]
+    summaries = await build_delivery_repository().summaries_for_profiles(page_ids)
 
     items = []
-    for row in rows:
+    for row, row_has_program, row_delivered in rows:
         data = row.data or {}
         client = data.get("client", {})
         goals = data.get("goals", {})
+        summary = summaries.get(row.profile_id)
         items.append(
             {
                 "profile_id": row.profile_id,
@@ -252,9 +348,20 @@ async def list_profiles(
                 "primary_goal": goals.get("primary"),
                 "status": row.status,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
+                # Маркеры исполнения анкеты.
+                "has_program": bool(row_has_program),
+                "delivered": bool(row_delivered),
+                "delivered_at": (
+                    summary.delivered_at.isoformat()
+                    if summary and summary.delivered_at
+                    else None
+                ),
+                "delivery_status": (
+                    summary.last_status.value if summary and summary.last_status else None
+                ),
             }
         )
-    return {"total": total, "items": items}
+    return {"total": total, "items": items, "sort": sort}
 
 
 @router.get(
@@ -295,6 +402,49 @@ async def get_profile(profile_id: str, _: Annotated[AuthenticatedUser, Depends(r
         "data": row.data,
         "consents": consents,
     }
+
+
+@router.delete(
+    "/profiles/{profile_id}",
+    status_code=204,
+    responses={
+        404: {"description": "Profile not found"},
+        409: {"description": "Профиль нельзя удалить: есть собранные программы"},
+    },
+)
+async def delete_profile(
+    profile_id: str, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
+) -> None:
+    """Удаляет анкету, по которой нет программ.
+
+    Анкету с программами удалить нельзя (409 со списком блокеров): её заполнял
+    человек в боте и восстановить её невозможно, а программу всегда можно
+    собрать заново. Порядок действий — сначала программы, потом анкета.
+
+    Записи доставок удаляются вместе с анкетой, `generation_jobs` — каскадом
+    базы: там внешний ключ есть.
+    """
+    service = build_profile_admin_service()
+    async with get_session_factory()() as session:
+        exists = (
+            await session.execute(
+                select(ProfileRow.id).where(ProfileRow.profile_id == profile_id)
+            )
+        ).scalar_one_or_none()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    try:
+        result = await service.delete_profile(profile_id)
+    except DeleteBlockedError as exc:
+        raise HTTPException(
+            status_code=409, detail={"message": str(exc), "blockers": exc.blockers}
+        ) from exc
+    except (ProfilePersistenceError, ProgramDeliveryError) as exc:
+        raise HTTPException(status_code=422, detail=safe_error_message(exc)) from exc
+    logger.info(
+        "event=profile_deleted_by_admin",
+        extra={"profile_id": profile_id, "actor": admin.login, **result},
+    )
 
 
 # --- Users --------------------------------------------------------------------
@@ -497,8 +647,8 @@ async def get_exercise(exercise_id: int, _: Annotated[AuthenticatedUser, Depends
 # --- Programs -----------------------------------------------------------------
 
 
-def _program_summary(program: WorkoutProgram) -> dict:
-    return {
+def _program_summary(program: WorkoutProgram, *, delivered: bool | None = None) -> dict:
+    summary = {
         "program_id": program.program_id,
         "profile_id": program.profile_id,
         "version": program.version,
@@ -510,6 +660,18 @@ def _program_summary(program: WorkoutProgram) -> dict:
         "duration_weeks": program.duration_weeks,
         "created_at": program.created_at.isoformat() if program.created_at else None,
     }
+    if delivered is not None:
+        # Отправлена ли программа пользователю в Telegram. Заполняется только
+        # там, где сводка доставок уже прочитана: тянуть её в каждый ответ ради
+        # одного флага незачем.
+        summary["delivered"] = delivered
+    return summary
+
+
+async def _delivered_flags(profile_ids: list[str]) -> dict[str, bool]:
+    """Какие анкеты получили программу в Telegram. Один запрос на страницу."""
+    summaries = await build_delivery_repository().summaries_for_profiles(profile_ids)
+    return {pid: summary.delivered for pid, summary in summaries.items()}
 
 
 @router.get("/programs")
@@ -520,7 +682,14 @@ async def list_programs(
 ) -> dict:
     service = build_program_service()
     total, programs = await service.list_all(limit=limit, offset=offset)
-    return {"total": total, "items": [_program_summary(p) for p in programs]}
+    delivered = await _delivered_flags([p.profile_id for p in programs])
+    return {
+        "total": total,
+        "items": [
+            _program_summary(p, delivered=delivered.get(p.profile_id, False))
+            for p in programs
+        ],
+    }
 
 
 @router.get(
@@ -552,7 +721,42 @@ async def list_profile_programs(
 ) -> dict:
     service = build_program_service()
     programs = await service.list_for_profile(profile_id)
-    return {"total": len(programs), "items": [_program_summary(p) for p in programs]}
+    delivered = await _delivered_flags([profile_id])
+    was_delivered = delivered.get(profile_id, False)
+    return {
+        "total": len(programs),
+        "items": [_program_summary(p, delivered=was_delivered) for p in programs],
+    }
+
+
+@router.delete(
+    "/programs/{program_id}",
+    status_code=204,
+    responses={404: {"description": "Program not found"}},
+)
+async def delete_program(
+    program_id: str, admin: Annotated[AuthenticatedUser, Depends(require_admin)]
+) -> None:
+    """Удаляет программу со всеми версиями и записями её доставок.
+
+    Блокеров нет: программа производна от анкеты и всегда может быть собрана
+    заново. Версии не удаляются по одной — `program_id` и есть программа, а
+    версии её история; частичное удаление оставило бы дыры и сбило бы нумерацию
+    следующей версии.
+
+    Ссылка из `generation_jobs` обнуляется каскадом базы (`ON DELETE SET NULL`):
+    история операций генерации сохраняется намеренно.
+    """
+    if await build_program_service().get(program_id) is None:
+        raise HTTPException(status_code=404, detail="Program not found")
+    try:
+        result = await build_profile_admin_service().delete_program(program_id)
+    except (ProgramPersistenceError, ProgramDeliveryError) as exc:
+        raise HTTPException(status_code=422, detail=safe_error_message(exc)) from exc
+    logger.info(
+        "event=program_deleted_by_admin",
+        extra={"program_id": program_id, "actor": admin.login, **result},
+    )
 
 
 @router.get(
