@@ -17,8 +17,8 @@ Safe delete (Phase 1.1.1). Удаление конфигурации не дол
 from __future__ import annotations
 
 import secrets as pysecrets
-from dataclasses import dataclass, field
 
+from src.application.deletion import DeleteBlockedError, DeleteDependencies
 from src.domain.ai.config import (
     AIEndpoint,
     AIModel,
@@ -52,30 +52,11 @@ FALLBACK_EVENT_TYPE = "ai_generation_fallback"
 MODEL_ATTEMPTS_EVENT_TYPE = "ai_model_attempts"
 
 
-class AIDependencyError(WorkoutBotError):
-    """Удаление заблокировано зависимостями.
-
-    Несёт машиночитаемый список блокеров, чтобы UI мог объяснить причину,
-    а не показывать текст ошибки базы данных.
-    """
-
-    def __init__(self, message: str, blockers: list[dict]) -> None:
-        super().__init__(message)
-        self.blockers = blockers
-
-
-@dataclass
-class DeleteDependencies:
-    """Что мешает удалить объект конфигурации."""
-
-    blockers: list[dict] = field(default_factory=list)
-
-    @property
-    def safe(self) -> bool:
-        return not self.blockers
-
-    def describe(self) -> str:
-        return "; ".join(b["detail"] for b in self.blockers)
+# Тот же контракт удаления с зависимостями теперь используют анкеты и
+# программы, поэтому классы живут в `src.application.deletion`. Имя
+# `AIDependencyError` сохранено как псевдоним: по нему AI-роуты и тесты
+# отличают отказ удаления от прочих ошибок конфигурации.
+AIDependencyError = DeleteBlockedError
 
 
 class AIConfigurationService:
