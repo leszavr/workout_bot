@@ -12,6 +12,8 @@
    «какие упражнения вы не любите или не хотите выполнять?») и
    `excluded_exercises`.
 4. CardioPreference.EXCLUDE → кардио исключается.
+5. Растяжка и мобилизация (`exercise_type = stretching`) не попадают в пул
+   основной работы.
 
 Цель пользователя НЕ исключает упражнения — она используется генератором
 для ранжирования (см. generator.py).
@@ -25,6 +27,18 @@
 Сравнение идёт не по точному совпадению строк, а по значимым словам (см.
 `exercise_matching`): пользователь пишет «выпады», а в каталоге 11 упражнений с
 выпадами под разными названиями.
+
+Про пункт 5. В каталоге 123 упражнения типа `stretching` — от «Растяжки задней
+поверхности бедра» до «Круговых движений голеностопом». Формально это упражнения,
+и пул отдавал их наравне с силовыми, поэтому генераторы составляли из них
+тренировочные дни: наблюдались дни из 10 упражнений, где 6 — растяжки, и день
+«mobility» из 5 упражнений, где 4 растяжки. Растяжка и мобилизация относятся к
+разминке и заминке, а не к основной работе, и держать их в одном пуле с рабочими
+упражнениями значит предлагать генератору заведомо неверный выбор.
+
+Рекомендации по разминке и заминке даются в программе текстом, единые для
+тренировки: подбирать их персонально по каталогу не требуется, а вот выдавать
+растяжку вместо тренировки — прямой продуктовый дефект.
 """
 from __future__ import annotations
 
@@ -42,6 +56,10 @@ from src.application.programs.exercise_matching import (
 from src.domain.exercise import Exercise
 from src.domain.pools import ExclusionRecord, ExerciseCandidatePool
 from src.domain.profile import FitnessProfile
+
+# Тип упражнений каталога, относящийся к разминке и заминке, а не к основной
+# работе. Держать их в общем пуле — предлагать генератору неверный выбор.
+STRETCHING_TYPE = "stretching"
 
 # Теги оборудования каталога (leszavr/workout).
 EQ_BANDS = "bands"
@@ -187,6 +205,13 @@ class ExerciseFilter:
         for exercise in sorted(exercises, key=lambda e: e.name):
             if not exercise.is_active:
                 excluded.append(self._record(exercise, "упражнение деактивировано"))
+                continue
+            if exercise.exercise_type == STRETCHING_TYPE:
+                excluded.append(
+                    self._record(
+                        exercise, "растяжка и мобилизация — для разминки и заминки"
+                    )
+                )
                 continue
             if cardio_excluded and exercise.exercise_type == "cardio":
                 excluded.append(
