@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Версии actions закреплены на релизах с runtime node24: Node 20 снят с
+# поддержки на runner'ах, и старые мажорные версии сначала предупреждают, а
+# затем перестают запускаться. Обновление версий actions к Node.js проекта
+# отношения не имеет: они выполняются в рантайме runner'а, а не нашим Node.
 env:
   PYTHON_VERSION: "3.12"
   NODE_VERSION: "22"
@@ -56,18 +60,18 @@ jobs:
       AI_SECRETS_KEY: ci-only-ai-secrets-key-not-a-production-value
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Каталог упражнений живёт во внешнем публичном репозитории. Без него
       # часть интеграционных тестов (программы, e2e, dashboard) проверяет
       # пустую базу и падает, поэтому каталог засевается реальными данными.
       - name: Checkout exercise catalog
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: leszavr/workout
           path: .exercise-catalog
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -110,9 +114,9 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://workout_ci:workout_ci@localhost:5432/workout_migrations_ci
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -144,9 +148,9 @@ jobs:
         working-directory: apps/web
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -174,7 +178,7 @@ jobs:
 
     steps:
       - name: Open an issue with the failing jobs
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const results = {
