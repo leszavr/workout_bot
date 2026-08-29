@@ -6,7 +6,7 @@ Pydantic WorkoutProgram → строгая валидация → PostgreSQL JSO
 """
 from __future__ import annotations
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -143,6 +143,43 @@ class PostgresProgramRepository(ProgramRepository):
     async def count(self) -> int:
         total, _ = await self.list_all(limit=1, offset=0)
         return total
+
+    async def delete(self, program_id: str) -> int:
+        """Удаляет все версии программы.
+
+        Hard delete: программа целиком выводится из системы вместе с историей
+        версий. Частичное удаление версий не поддерживается — оно оставило бы
+        программу с дырами в истории и рассинхронизировало `next_version`.
+        """
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        delete(WorkoutProgramRow).where(
+                            WorkoutProgramRow.program_id == program_id
+                        )
+                    )
+                    return int(result.rowcount or 0)
+        except SQLAlchemyError as exc:
+            raise ProgramPersistenceError(
+                f"Не удалось удалить программу {program_id}: {exc}"
+            ) from exc
+
+    async def delete_for_profile(self, profile_id: str) -> int:
+        """Удаляет все программы профиля (все их версии)."""
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        delete(WorkoutProgramRow).where(
+                            WorkoutProgramRow.profile_id == profile_id
+                        )
+                    )
+                    return int(result.rowcount or 0)
+        except SQLAlchemyError as exc:
+            raise ProgramPersistenceError(
+                f"Не удалось удалить программы профиля {profile_id}: {exc}"
+            ) from exc
 
 
 def _to_domain(row: WorkoutProgramRow) -> WorkoutProgram:
