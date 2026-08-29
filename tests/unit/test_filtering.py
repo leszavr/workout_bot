@@ -41,6 +41,32 @@ def _exercise(
     )
 
 
+def _named(
+    external_id: str,
+    name: str,
+    *,
+    name_ru: str | None = None,
+    aliases: list[str] | None = None,
+    equipment: list[str] | None = None,
+) -> Exercise:
+    """Упражнение с реалистичным названием.
+
+    Нужно там, где проверяется сопоставление свободного текста пользователя:
+    у `_exercise` названия вида «Exercise A» отличаются одной буквой, и по
+    значимым словам они неразличимы.
+    """
+    return Exercise(
+        external_id=external_id,
+        name=name,
+        name_ru=name_ru,
+        aliases=aliases or ([name_ru] if name_ru else []),
+        equipment=equipment or ["body only"],
+        difficulty="beginner",
+        exercise_type="strength",
+        primary_muscles=["chest"],
+    )
+
+
 def _profile(
     location: TrainingLocationType = TrainingLocationType.GYM,
     equipment: list[str] | None = None,
@@ -175,15 +201,98 @@ class TestFiltering:
         assert "кардио" in pool.excluded[0].reason
 
     async def test_user_excluded_exercises(self, exercise_filter):
+        """Явные исключения пользователя убирают упражнение из пула.
+
+        Названия здесь реалистичные, а не «Exercise A» / «Exercise B»:
+        сопоставление идёт по значимым словам, и фикстуры, отличающиеся одной
+        буквой-различителем, проверяли бы не то поведение, которое существует.
+        """
         profile = _profile()
-        profile.exercise_preferences.excluded_exercises = ["Exercise A"]
+        profile.exercise_preferences.excluded_exercises = ["Выпады"]
         exercises = [
-            _exercise("A"),
-            _exercise("B"),
+            _named("lunge", "Barbell Lunge", name_ru="Выпад со штангой"),
+            _named("bench", "Bench Press", name_ru="Жим лёжа"),
         ]
         pool = await exercise_filter.select_candidates(profile, exercises)
-        assert {e.external_id for e in pool.included} == {"B"}
-        assert "исключений пользователя" in pool.excluded[0].reason
+        assert {e.external_id for e in pool.included} == {"bench"}
+        assert "не хочет выполнять" in pool.excluded[0].reason
+
+    async def test_disliked_exercises_are_excluded(self, exercise_filter):
+        """Ответ на вопрос «какие упражнения не хотите выполнять?» соблюдается.
+
+        Регрессия: фильтр читал только `excluded_exercises`, которое анкета не
+        заполняет. Ответ пользователя уходил в `disliked_exercises` и на отбор не
+        влиял — человек писал «не хочу выпады» и получал программу с выпадами.
+        """
+        profile = _profile()
+        profile.exercise_preferences.disliked_exercises = ["выпады", "бег"]
+        exercises = [
+            _named("lunge", "Barbell Lunge", name_ru="Выпад со штангой"),
+            _named("walk_lunge", "Barbell Walking Lunge", name_ru="Ходьба выпадами со штангой"),
+            _named("run", "Treadmill Running", name_ru="Бег на беговой дорожке"),
+            _named("bench", "Bench Press", name_ru="Жим лёжа"),
+        ]
+
+        pool = await exercise_filter.select_candidates(profile, exercises)
+
+        # Все варианты выпадов и бега исключены, хотя пользователь назвал их
+        # одним словом и не в той форме, что в каталоге.
+        assert {e.external_id for e in pool.included} == {"bench"}
+        assert len(pool.excluded) == 3
+
+    async def test_unwanted_matching_is_word_based_not_exact(self, exercise_filter):
+        """Одного слова достаточно, чтобы убрать все его варианты.
+
+        Точное совпадение строк не годится: «выпады» совпало бы ровно с одним
+        названием из одиннадцати, а остальные десять попали бы в программу.
+        """
+        profile = _profile()
+        profile.exercise_preferences.disliked_exercises = ["приседания"]
+        exercises = [
+            _named("front", "Front Barbell Squat", name_ru="Фронтальный присед со штангой"),
+            _named("jump", "Freehand Jump Squat", name_ru="Присед с прыжком без веса"),
+            _named("hack", "Hack Squat", name_ru="Гакк-присед"),
+            _named("row", "Barbell Row", name_ru="Тяга штанги"),
+        ]
+
+        pool = await exercise_filter.select_candidates(profile, exercises)
+
+        assert {e.external_id for e in pool.included} == {"row"}
+
+    async def test_noise_answer_excludes_nothing(self, exercise_filter):
+        """«Нет» — это отсутствие ответа, а не запрос на исключение.
+
+        Без этой проверки слово-пустышка совпало бы с чем угодно и пул опустел бы.
+        """
+        profile = _profile()
+        profile.exercise_preferences.disliked_exercises = ["нет", "-", "ничего"]
+        exercises = [
+            _named("lunge", "Barbell Lunge", name_ru="Выпад со штангой"),
+            _named("bench", "Bench Press", name_ru="Жим лёжа"),
+        ]
+
+        pool = await exercise_filter.select_candidates(profile, exercises)
+
+        assert len(pool.included) == 2
+        assert pool.excluded == []
+
+    async def test_unwanted_matches_english_name_and_aliases(self, exercise_filter):
+        """Каталог англоязычный: сопоставление учитывает все названия.
+
+        Русское название и синонимы обязательны — иначе запрос по-русски не нашёл
+        бы ничего, а запрос по-английски не нашёл бы переведённые упражнения.
+        """
+        profile = _profile()
+        profile.exercise_preferences.disliked_exercises = ["deadlift", "скакалка"]
+        exercises = [
+            _named("dl", "Barbell Deadlift", name_ru="Становая тяга со штангой"),
+            _named("rope", "Rope Jumping", name_ru="Прыжки со скакалкой", aliases=["Скакалка"]),
+            _named("bench", "Bench Press", name_ru="Жим лёжа"),
+        ]
+
+        pool = await exercise_filter.select_candidates(profile, exercises)
+
+        assert {e.external_id for e in pool.included} == {"bench"}
 
     async def test_deterministic_order(self, exercise_filter):
         profile = _profile()
