@@ -461,6 +461,17 @@ class AIConfigurationService:
     async def next_prompt_version(self, task_type: AITaskType) -> int:
         return await self._prompts.next_version(task_type)
 
+    async def default_prompt_version(self, task_type: AITaskType) -> int | None:
+        """Последняя включённая версия инструкции задачи.
+
+        Используется, когда задачу включают, не выбрав инструкцию явно: ссылка
+        всё равно сохраняется числом в конфигурации, поэтому генерация остаётся
+        однозначной, а администратор видит выбранную версию в интерфейсе.
+        Скрытого разрешения «какой-нибудь инструкции» во время генерации нет.
+        """
+        versions = [t.version for t in await self._prompts.list_for_task(task_type) if t.enabled]
+        return max(versions) if versions else None
+
     async def get_prompt(self, prompt_id: int) -> PromptTemplate | None:
         return await self._prompts.get_by_id(prompt_id)
 

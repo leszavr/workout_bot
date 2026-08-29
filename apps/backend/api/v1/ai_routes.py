@@ -823,13 +823,20 @@ async def put_task(
 ) -> TaskConfigOut:
     _ensure_task_implemented(task_type)
     components = build_ai_components()
+    prompt_version = body.prompt_version
+    if prompt_version is None:
+        # Инструкция обязательна: файлового источника больше нет, а хранить в
+        # конфигурации «не выбрано» значило бы решать этот вопрос во время
+        # генерации. Поэтому ссылка проставляется сразу — последней включённой
+        # версией, — и администратор видит её в интерфейсе.
+        prompt_version = await components.admin.default_prompt_version(task_type)
     config = AITaskConfig(
         task_type=task_type,
         enabled=body.enabled,
         temperature=body.temperature,
         max_tokens=body.max_tokens,
         timeout_seconds=body.timeout_seconds,
-        prompt_version=body.prompt_version,
+        prompt_version=prompt_version,
     )
     try:
         # Включение задачи в заведомо нерабочем состоянии запрещено на сервере,

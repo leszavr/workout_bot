@@ -2,11 +2,15 @@
 
 // Инструкции для ИИ (промпты).
 //
-// До этого раздела текст инструкции существовал только в файлах образа и в
-// базе: чтобы поправить формулировку, администратору приходилось лезть в SQL
-// или пересобирать контейнер. Промпт-инжиниринг — это итерации, поэтому здесь
-// он делается штатно: посмотреть целиком → изменить → выбрать для задачи →
-// запустить генерацию → посмотреть результат.
+// Единственный источник инструкций. Раньше текст жил в двух местах — в базе и в
+// файлах образа, — и файловая версия была недоступна: её нельзя было прочитать,
+// изменить или заменить, а задача с пустой версией молча брала её. Базовая
+// инструкция перенесена в базу миграцией и стала обычной версией: её видно,
+// можно править, копировать и удалять. Ничем не выделенной — если созданная
+// позже окажется лучше, базовую незачем сохранять.
+//
+// Рабочий цикл: посмотреть целиком → скопировать за основу → изменить →
+// выбрать для задачи → запустить генерацию → посмотреть результат.
 //
 // Полный текст не усечён нигде: администратор должен видеть ровно то, что
 // уходит в модель. Список показывает только превью, а сам текст загружается
@@ -33,7 +37,8 @@ export default function PromptsSection(props: Readonly<Shared & {
   const [nextVersion, setNextVersion] = useState(1);
   const [loading, setLoading] = useState(true);
   const [failure, setFailure] = useState("");
-  const [creating, setCreating] = useState(false);
+  // null — форма закрыта; иначе id инструкции-образца или 0 для пустой формы.
+  const [creatingFrom, setCreatingFrom] = useState<number | null>(null);
   const [openId, setOpenId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
@@ -62,13 +67,13 @@ export default function PromptsSection(props: Readonly<Shared & {
   return (
     <Card
       title="Инструкции для ИИ"
-      description="Текст, по которому модель собирает программу. Задача использует ту версию, которая указана в её настройках; остальные хранятся для сравнения."
+      description="Текст, по которому модель собирает программу. Задача использует ту версию, которая выбрана в её настройках; остальные хранятся для сравнения. Другого источника инструкций нет."
       actions={
-        props.canWrite && !creating ? (
+        props.canWrite && creatingFrom === null ? (
           <button
             type="button"
             className="primary small"
-            onClick={() => setCreating(true)}
+            onClick={() => setCreatingFrom(0)}
           >
             Создать инструкцию
           </button>
@@ -78,21 +83,22 @@ export default function PromptsSection(props: Readonly<Shared & {
       {loading && <Skeleton rows={3} />}
       {failure && <div className="error">Не удалось загрузить инструкции: {failure}</div>}
 
-      {creating && (
+      {creatingFrom !== null && (
         <NewPrompt
           canWrite={props.canWrite}
           onChanged={afterChange}
           onError={props.onError}
           taskType={taskType}
           nextVersion={nextVersion}
-          onClose={() => setCreating(false)}
+          sourceId={creatingFrom || null}
+          onClose={() => setCreatingFrom(null)}
         />
       )}
 
-      {!loading && !failure && items.length === 0 && !creating && (
+      {!loading && !failure && items.length === 0 && creatingFrom === null && (
         <Empty
-          title="Своих инструкций нет"
-          hint="Система использует инструкцию из файлов проекта. Создайте свою, чтобы менять формулировки без пересборки."
+          title="Инструкций нет"
+          hint="Без инструкции ИИ вызвать нельзя: задача останется не готовой, и программу соберёт алгоритмический генератор. Создайте инструкцию."
         />
       )}
 
@@ -108,6 +114,7 @@ export default function PromptsSection(props: Readonly<Shared & {
               isActive={item.version === activeVersion}
               open={openId === item.id}
               onToggle={() => setOpenId(openId === item.id ? null : item.id)}
+              onCopy={() => setCreatingFrom(item.id)}
             />
           ))}
         </div>
@@ -121,12 +128,42 @@ export default function PromptsSection(props: Readonly<Shared & {
 function NewPrompt(props: Readonly<Shared & {
   taskType: string;
   nextVersion: number;
+  // id инструкции-образца: новая создаётся её копией. Так существующая
+  // инструкция служит референсом, а не единственным рабочим текстом.
+  sourceId: number | null;
   onClose: () => void;
 }>) {
+  const { sourceId } = props;
   const [name, setName] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [userTemplate, setUserTemplate] = useState("");
+  const [loadingSource, setLoadingSource] = useState(sourceId !== null);
+  const [sourceLabel, setSourceLabel] = useState("");
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (sourceId === null) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const source = await aiApi.prompt(sourceId);
+        if (cancelled) return;
+        setName(`${source.name} (копия)`);
+        setSystemPrompt(source.system_prompt);
+        setUserTemplate(source.user_template);
+        setSourceLabel(`№${source.version} «${source.name}»`);
+      } catch (e) {
+        if (!cancelled) props.onError((e as Error).message);
+      } finally {
+        if (!cancelled) setLoadingSource(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // props.onError стабилен на уровне страницы; пересоздавать эффект незачем.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceId]);
 
   const create = async () => {
     setSaving(true);
@@ -146,11 +183,22 @@ function NewPrompt(props: Readonly<Shared & {
     }
   };
 
+  if (loadingSource) {
+    return (
+      <div className="subcard" style={{ marginBottom: 20 }}>
+        <Skeleton rows={3} />
+      </div>
+    );
+  }
+
   return (
     <div className="subcard" style={{ marginBottom: 20 }}>
       <Notice tone="info" title={`Будет создана версия №${props.nextVersion}`}>
-        Создание не переключает задачу на новую инструкцию: номер версии нужно
-        указать в настройках задачи.
+        {sourceLabel
+          ? `Текст скопирован из инструкции ${sourceLabel} — правьте свободно, оригинал не изменится. `
+          : ""}
+        Создание не переключает задачу на новую инструкцию: выберите её в
+        настройках задачи.
       </Notice>
 
       <Field label="Название" hint="Чтобы отличать версии в списке.">
@@ -218,6 +266,7 @@ function PromptRow(props: Readonly<Shared & {
   isActive: boolean;
   open: boolean;
   onToggle: () => void;
+  onCopy: () => void;
 }>) {
   const { item, canWrite } = props;
 
@@ -250,6 +299,11 @@ function PromptRow(props: Readonly<Shared & {
           <button type="button" className="small" onClick={props.onToggle}>
             {props.open ? "Свернуть" : "Открыть полностью"}
           </button>
+          {canWrite && (
+            <button type="button" className="small" onClick={props.onCopy}>
+              Создать копию
+            </button>
+          )}
         </div>
       </div>
 

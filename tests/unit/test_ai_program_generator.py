@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -20,9 +21,15 @@ from src.application.ai.program_generator import (
 )
 from src.application.ai.selection import ModelCandidate
 from src.application.programs.validator import ProgramValidator
-from src.domain.ai.config import AIEndpoint, AIModel, AIProvider, AITaskConfig
+from src.domain.ai.config import (
+    AIEndpoint,
+    AIModel,
+    AIProvider,
+    AITaskConfig,
+    PromptTemplate,
+)
 from src.domain.ai.enums import AITaskType
-from src.domain.ai.errors import AIProviderError
+from src.domain.ai.errors import AIConfigurationError, AIProviderError
 from src.domain.ai.gateway import AIResponse
 from src.domain.enums import (
     ExperienceLevel,
@@ -183,8 +190,12 @@ class FakeAIGateway:
         )
 
 
-class FakePromptLoader(PromptLoader):
-    """Фейковый загрузчик промптов."""
+class FakePromptLoader:
+    """Загрузчик-заглушка: тестам генератора нужен только текст инструкции.
+
+    Сам `PromptLoader` (разрешение версии и отказ, когда инструкции нет)
+    проверяется отдельно в `TestPromptLoader` на фейковых репозиториях.
+    """
 
     SYSTEM_PROMPT = "You are a fitness expert. Follow the required JSON schema."
 
@@ -910,3 +921,110 @@ class TestAttemptTelemetry:
 
 async def _collect(sink: list, attempts) -> None:
     sink.append(attempts)
+
+
+# --- PromptLoader: единственный источник инструкций --------------------------------
+
+
+class _PromptRepo:
+    def __init__(self, items: list[PromptTemplate]) -> None:
+        self.items = items
+
+    async def get(self, task_type, version):
+        return next(
+            (t for t in self.items if t.task_type == task_type and t.version == version),
+            None,
+        )
+
+
+class _TaskRepo:
+    def __init__(self, config: AITaskConfig | None) -> None:
+        self.config = config
+
+    async def get(self, task_type):
+        return self.config
+
+
+def _template(**overrides) -> PromptTemplate:
+    data = {
+        "id": 1,
+        "task_type": AITaskType.WORKOUT_GENERATION,
+        "version": 1,
+        "name": "Базовая инструкция",
+        "system_prompt": "ПРАВИЛА",
+        "user_template": "ЗАПРОС",
+        "enabled": True,
+    }
+    data.update(overrides)
+    return PromptTemplate(**data)
+
+
+class TestPromptLoader:
+    """Инструкция берётся только из базы.
+
+    Раньше загрузчик читал `prompt_templates`, а при неудаче молча брал файл из
+    образа. Источник истины был неопределён: файловый текст нельзя было ни
+    прочитать в админке, ни изменить, ни удалить, а `prompt_version = NULL`
+    означал «взять файл». Базовая инструкция перенесена в базу миграцией `0009`,
+    поэтому второго источника больше нет.
+    """
+
+    @pytest.mark.asyncio
+    async def test_loads_selected_version(self):
+        loader = PromptLoader(_PromptRepo([_template(version=3, system_prompt="V3")]))
+        system_prompt, user_template, version = await loader.load(
+            AITaskType.WORKOUT_GENERATION, 3
+        )
+        assert system_prompt == "V3"
+        assert user_template == "ЗАПРОС"
+        assert version == 3
+
+    @pytest.mark.asyncio
+    async def test_version_is_taken_from_task_configuration(self):
+        """Версию выбирает задача: генератор её не угадывает."""
+        loader = PromptLoader(
+            _PromptRepo([_template(version=1), _template(id=2, version=2, system_prompt="V2")]),
+            _TaskRepo(
+                AITaskConfig(
+                    id=1, task_type=AITaskType.WORKOUT_GENERATION, prompt_version=2
+                )
+            ),
+        )
+        system_prompt, _, version = await loader.load(AITaskType.WORKOUT_GENERATION)
+        assert system_prompt == "V2"
+        assert version == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_selection_is_a_configuration_error(self):
+        """Пустая версия не подменяется «какой-нибудь» инструкцией."""
+        loader = PromptLoader(
+            _PromptRepo([_template()]),
+            _TaskRepo(
+                AITaskConfig(
+                    id=1, task_type=AITaskType.WORKOUT_GENERATION, prompt_version=None
+                )
+            ),
+        )
+        with pytest.raises(AIConfigurationError, match="не выбрана"):
+            await loader.load(AITaskType.WORKOUT_GENERATION)
+
+    @pytest.mark.asyncio
+    async def test_unknown_version_is_a_configuration_error(self):
+        loader = PromptLoader(_PromptRepo([_template()]))
+        with pytest.raises(AIConfigurationError, match="№7"):
+            await loader.load(AITaskType.WORKOUT_GENERATION, 7)
+
+    @pytest.mark.asyncio
+    async def test_disabled_version_is_not_used(self):
+        loader = PromptLoader(_PromptRepo([_template(enabled=False)]))
+        with pytest.raises(AIConfigurationError, match="выключена"):
+            await loader.load(AITaskType.WORKOUT_GENERATION, 1)
+
+    def test_module_has_no_filesystem_prompt_source(self):
+        """Файлового источника нет ни как пути, ни как чтения с диска."""
+        import src.application.ai.program_generator as module
+
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert not hasattr(module, "PROMPTS_DIR")
+        assert "read_text" not in source
+        assert "prompts/program_generator" not in source

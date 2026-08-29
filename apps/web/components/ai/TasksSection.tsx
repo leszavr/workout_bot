@@ -9,7 +9,14 @@
 import { useEffect, useState } from "react";
 
 import { Card, Empty, Field, Notice, Status } from "@/components/ui/Primitives";
-import { AIEndpointItem, AIModelItem, AIProviderItem, AITaskItem, aiApi } from "@/lib/api";
+import {
+  AIEndpointItem,
+  AIModelItem,
+  AIPromptItem,
+  AIProviderItem,
+  AITaskItem,
+  aiApi,
+} from "@/lib/api";
 import { aiTaskHint, aiTaskLabel } from "@/lib/labels";
 
 export default function TasksSection(props: Readonly<{
@@ -17,7 +24,7 @@ export default function TasksSection(props: Readonly<{
   allModels: AIModelItem[];
   endpoints: Record<number, AIEndpointItem[]>;
   providers: AIProviderItem[];
-  promptVersions: number[];
+  prompts: AIPromptItem[];
   canWrite: boolean;
   onChanged: (message: string) => void;
   onError: (message: string) => void;
@@ -54,7 +61,7 @@ export default function TasksSection(props: Readonly<{
           task={task}
           allModels={props.allModels}
           modelLabel={modelLabel}
-          promptVersions={props.promptVersions}
+          prompts={props.prompts}
           canWrite={props.canWrite}
           onChanged={props.onChanged}
           onError={props.onError}
@@ -68,7 +75,7 @@ function TaskCard(props: Readonly<{
   task: AITaskItem;
   allModels: AIModelItem[];
   modelLabel: (pk: number) => string;
-  promptVersions: number[];
+  prompts: AIPromptItem[];
   canWrite: boolean;
   onChanged: (message: string) => void;
   onError: (message: string) => void;
@@ -120,6 +127,12 @@ function TaskCard(props: Readonly<{
     setSelected(next);
   };
 
+  // Выключенную инструкцию выбрать нельзя: сервер откажет при сохранении.
+  // Уже выбранная остаётся в списке, иначе настройка «схлопнулась» бы молча.
+  const usablePrompts = props.prompts.filter(
+    (p) => p.enabled || p.version === promptVersion
+  );
+
   const unusedModels = props.allModels.filter((m) => !selected.includes(m.id));
 
   return (
@@ -135,6 +148,13 @@ function TaskCard(props: Readonly<{
       {enabled && selected.length === 0 && (
         <Notice tone="warn" title="Не выбрана ни одна модель">
           Задачу нельзя включить без модели — сервер откажет при сохранении.
+        </Notice>
+      )}
+
+      {enabled && promptVersion === 0 && (
+        <Notice tone="warn" title="Не выбрана инструкция">
+          Без инструкции ИИ вызвать нельзя. Выберите версию ниже или создайте её
+          на вкладке «Инструкции».
         </Notice>
       )}
 
@@ -272,23 +292,28 @@ function TaskCard(props: Readonly<{
         </Field>
 
         <Field
-          label="Версия инструкции"
+          label="Инструкция для ИИ"
           hint={
-            props.promptVersions.length > 0
-              ? `0 — версия по умолчанию из файлов проекта. Сохранённые версии: ${props.promptVersions
-                  .map((v) => `№${v}`)
-                  .join(", ")}. Текст инструкций — на вкладке «Инструкции».`
-              : "0 — версия по умолчанию из файлов проекта. Свои версии создаются на вкладке «Инструкции»."
+            usablePrompts.length > 0
+              ? "Текст, по которому модель собирает программу. Читать и менять его — на вкладке «Инструкции»."
+              : "Инструкций нет. Создайте инструкцию на вкладке «Инструкции» — без неё ИИ вызвать нельзя."
           }
         >
-          <input
-            type="number"
-            min={0}
-            value={promptVersion}
-            disabled={!canWrite}
+          <select
+            value={promptVersion > 0 ? String(promptVersion) : ""}
+            disabled={!canWrite || usablePrompts.length === 0}
             onChange={(e) => setPromptVersion(Number(e.target.value) || 0)}
-            aria-label="Версия инструкции"
-          />
+            aria-label="Инструкция для ИИ"
+          >
+            {/* Пустой вариант нужен, только пока инструкция не выбрана: иначе
+                администратор не увидит, что настройка не заполнена. */}
+            {promptVersion === 0 && <option value="">Не выбрана</option>}
+            {usablePrompts.map((prompt) => (
+              <option key={prompt.id} value={prompt.version}>
+                №{prompt.version} · {prompt.name}
+              </option>
+            ))}
+          </select>
         </Field>
       </div>
 

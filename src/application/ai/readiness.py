@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from src.application.ai.program_generator import PROMPTS_DIR
 from src.application.ai.selection import ModelCandidate, ModelSelector
 from src.domain.ai.config import AIEndpoint, AIModel, AIProvider, AITaskConfig
 from src.domain.ai.enums import (
@@ -241,7 +240,7 @@ class AIReadinessService:
         Дублирует UI-ограничения серверной проверкой. Требование минимально
         достаточное: хотя бы одна из привязанных моделей должна быть
         реально вызываемой (именно так работает выбор кандидатов в
-        AIGateway) и версия промпта должна существовать.
+        AIGateway) и выбранная инструкция должна существовать и быть включённой.
         """
         pks = model_pks
         if pks is None:
@@ -537,7 +536,7 @@ class AIReadinessService:
             title="Инструкция для ИИ",
             status=STATUS_FAILED,
             detail=detail,
-            action="Укажите существующую версию инструкции",
+            action="Выберите инструкцию в настройках задачи",
             reason_code=AIFallbackReason.TASK_NOT_READY.value,
         )
 
@@ -627,25 +626,38 @@ class AIReadinessService:
     async def _resolve_prompt(
         self, task_type: AITaskType, version: int | None
     ) -> tuple[bool, str]:
-        """Повторяет порядок PromptLoader: сначала БД, затем файлы."""
-        if version is not None:
-            template = await self._prompts.get(task_type, version)
-            if template is not None and template.enabled:
-                return True, f"версия №{version} из базы данных"
-        file_version = version or 1
-        directory = PROMPTS_DIR / f"v{file_version}"
-        if (directory / "system.txt").exists() and (
-            directory / "user_template.txt"
-        ).exists():
-            return True, f"версия №{file_version} из файлов проекта"
-        db_versions = await self._prompts.list_for_task(task_type)
-        available = (
-            ", ".join(f"№{t.version}" for t in db_versions if t.enabled) or "нет"
-        )
-        return False, (
-            f"инструкции версии №{file_version} нет ни в базе данных, ни в файлах "
-            f"(версии в базе: {available})"
-        )
+        """Повторяет логику PromptLoader: инструкция только из базы.
+
+        Файлового источника нет: инструкции живут в `prompt_templates`, и
+        readiness обязан проверять ровно то, что будет использовано при
+        генерации.
+        """
+        enabled_versions = [
+            t.version for t in await self._prompts.list_for_task(task_type) if t.enabled
+        ]
+        available = ", ".join(f"№{v}" for v in enabled_versions) or "нет"
+
+        if version is None:
+            if not enabled_versions:
+                return False, (
+                    "инструкций для задачи нет: создайте инструкцию на вкладке "
+                    "«Инструкции»"
+                )
+            return False, (
+                f"инструкция не выбрана в настройках задачи (доступны: {available})"
+            )
+
+        template = await self._prompts.get(task_type, version)
+        if template is None:
+            return False, (
+                f"инструкции №{version} нет (доступны: {available})"
+            )
+        if not template.enabled:
+            return False, (
+                f"инструкция №{version} «{template.name}» выключена "
+                f"(доступны: {available})"
+            )
+        return True, f"версия №{version} «{template.name}»"
 
     @staticmethod
     def _chain_entry(candidate: ModelCandidate) -> ChainEntry:
