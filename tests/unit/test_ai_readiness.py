@@ -180,6 +180,20 @@ def _model(**overrides) -> AIModel:
     return AIModel(**data)
 
 
+def _prompt(**overrides) -> PromptTemplate:
+    data = {
+        "id": 1,
+        "task_type": TASK,
+        "version": 1,
+        "name": "Базовая инструкция",
+        "system_prompt": "s",
+        "user_template": "u",
+        "enabled": True,
+    }
+    data.update(overrides)
+    return PromptTemplate(**data)
+
+
 def _service(
     *,
     providers: list[AIProvider] | None = None,
@@ -187,7 +201,7 @@ def _service(
     models: list[AIModel] | None = None,
     config: AITaskConfig | None = _DEFAULT,
     bindings: list[AITaskModelBinding] | None = None,
-    prompts: list[PromptTemplate] | None = None,
+    prompts: list[PromptTemplate] | None = _DEFAULT,
     primary_generator: str = "ai",
     fallback_generator: str = "deterministic",
     secret_store: SecretStore | None = _DEFAULT,
@@ -196,7 +210,11 @@ def _service(
     endpoints_repo = FakeEndpoints(endpoints if endpoints is not None else [_endpoint()])
     models_repo = FakeModels(models if models is not None else [_model()])
     if config is _DEFAULT:
-        config = AITaskConfig(id=500, task_type=TASK, enabled=True)
+        # Инструкция обязательна: файлового источника нет, поэтому готовая
+        # конфигурация всегда ссылается на существующую версию.
+        config = AITaskConfig(id=500, task_type=TASK, enabled=True, prompt_version=1)
+    if prompts is _DEFAULT:
+        prompts = [_prompt()]
     if bindings is None:
         bindings = [
             AITaskModelBinding(
@@ -247,8 +265,9 @@ async def test_fully_configured_task_is_ready():
     assert len(report.chain) == 1
     assert report.chain[0].is_primary is True
     assert report.chain[0].model_id == "qwen/qwen3-max"
-    # Промпт берётся из файлов проекта (prompts/program_generator/v1).
-    assert "файлов" in _check(report, "prompt").detail
+    # Инструкция — из базы: другого источника промптов нет.
+    assert _check(report, "prompt").status == STATUS_OK
+    assert "№1" in _check(report, "prompt").detail
 
 
 async def test_report_exposes_generation_strategy():
@@ -345,7 +364,7 @@ async def test_protocol_without_adapter_is_not_usable():
 
 async def test_disabled_task_is_not_ready_but_chain_visible():
     report = await _service(
-        config=AITaskConfig(id=500, task_type=TASK, enabled=False)
+        config=AITaskConfig(id=500, task_type=TASK, enabled=False, prompt_version=1)
     ).report(TASK)
 
     assert report.ready is False
@@ -373,24 +392,51 @@ async def test_unknown_prompt_version_fails_prompt_check():
     assert report.ready is False
 
 
-async def test_prompt_version_from_database_is_accepted():
-    template = PromptTemplate(
-        id=1,
-        task_type=TASK,
-        version=7,
-        name="v7",
-        system_prompt="s",
-        user_template="u",
-        enabled=True,
-    )
+async def test_selected_prompt_version_is_accepted():
     report = await _service(
         config=AITaskConfig(id=500, task_type=TASK, enabled=True, prompt_version=7),
-        prompts=[template],
+        prompts=[_prompt(version=7, name="Строже про safe pool")],
     ).report(TASK)
 
     check = _check(report, "prompt")
     assert check.status == STATUS_OK
-    assert "базы данных" in check.detail
+    # В отчёте видно, какая именно инструкция будет использована.
+    assert "№7" in check.detail
+    assert "Строже про safe pool" in check.detail
+
+
+async def test_task_without_selected_prompt_is_not_ready():
+    """Пустая версия больше не означает «взять файл»: файлов нет."""
+    report = await _service(
+        config=AITaskConfig(id=500, task_type=TASK, enabled=True, prompt_version=None)
+    ).report(TASK)
+
+    check = _check(report, "prompt")
+    assert check.status == STATUS_FAILED
+    assert "не выбрана" in check.detail
+    assert report.ready is False
+
+
+async def test_disabled_prompt_is_not_accepted():
+    report = await _service(
+        config=AITaskConfig(id=500, task_type=TASK, enabled=True, prompt_version=1),
+        prompts=[_prompt(enabled=False)],
+    ).report(TASK)
+
+    check = _check(report, "prompt")
+    assert check.status == STATUS_FAILED
+    assert "выключена" in check.detail
+
+
+async def test_no_prompts_at_all_explains_what_to_create():
+    report = await _service(
+        config=AITaskConfig(id=500, task_type=TASK, enabled=True, prompt_version=None),
+        prompts=[],
+    ).report(TASK)
+
+    check = _check(report, "prompt")
+    assert check.status == STATUS_FAILED
+    assert "создайте" in check.detail.lower()
 
 
 async def test_deterministic_only_strategy_blocks_readiness():
@@ -417,7 +463,9 @@ async def test_ai_as_fallback_only_warns_without_blocking():
 
 async def test_strategy_check_absent_for_other_tasks():
     report = await _service(
-        config=AITaskConfig(id=500, task_type=AITaskType.USER_CHAT, enabled=True),
+        config=AITaskConfig(
+            id=500, task_type=AITaskType.USER_CHAT, enabled=True, prompt_version=1
+        ),
         bindings=[
             AITaskModelBinding(
                 id=1, task_config_id=500, model_id=100, priority=1, is_primary=True
@@ -433,7 +481,18 @@ async def test_strategy_check_absent_for_other_tasks():
 
 async def test_validate_enable_accepts_usable_model():
     service = _service()
-    await service.validate_enable(AITaskConfig(task_type=TASK, enabled=True), [100])
+    await service.validate_enable(
+        AITaskConfig(task_type=TASK, enabled=True, prompt_version=1), [100]
+    )
+
+
+async def test_validate_enable_rejects_task_without_prompt():
+    """Инструкция обязательна: файлового источника больше нет."""
+    service = _service()
+    with pytest.raises(AIConfigurationError, match="не выбрана"):
+        await service.validate_enable(
+            AITaskConfig(task_type=TASK, enabled=True, prompt_version=None), [100]
+        )
 
 
 async def test_validate_enable_rejects_empty_model_list():
@@ -466,7 +525,7 @@ async def test_validate_enable_accepts_when_only_fallback_is_usable():
         models=[_model(id=100, enabled=False), _model(id=101, model_id="m-b")]
     )
     await service.validate_enable(
-        AITaskConfig(task_type=TASK, enabled=True), [100, 101]
+        AITaskConfig(task_type=TASK, enabled=True, prompt_version=1), [100, 101]
     )
 
 
@@ -559,7 +618,7 @@ async def test_runtime_gate_blocks_on_unsupported_protocol():
 async def test_runtime_gate_blocks_when_task_disabled():
     """enabled=false — это запрет использовать AI, а не признак поломки."""
     decision = await _service(
-        config=AITaskConfig(id=500, task_type=TASK, enabled=False)
+        config=AITaskConfig(id=500, task_type=TASK, enabled=False, prompt_version=1)
     ).runtime_gate(TASK)
 
     assert decision.allowed is False

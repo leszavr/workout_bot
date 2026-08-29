@@ -37,7 +37,6 @@ import logging
 import re
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Awaitable, Callable
 
 from src.application.ai.program_context import (
@@ -74,9 +73,6 @@ DEFAULT_TOTAL_BUDGET_SECONDS = 240
 # нечего. Ограничение защищает от вырожденного случая, когда модель вместо
 # программы вернула поток текста.
 MAX_PREVIOUS_RESPONSE_CHARS = 20_000
-
-# Путь к файлам промптов (fallback, если в БД нет)
-PROMPTS_DIR = Path(__file__).parent.parent.parent.parent / "prompts" / "program_generator"
 
 # Исходы попытки одной модели. Значения попадают в журнал администратора,
 # поэтому переименование — breaking change, а не косметика.
@@ -125,36 +121,59 @@ class _CandidateFailed(Exception):
 
 
 class PromptLoader:
-    """Загрузка промптов из файлов или БД."""
+    """Загрузка инструкции из базы — единственного источника промптов.
 
-    def __init__(self, prompt_repository=None):
+    Файлового fallback нет намеренно. Пока текст жил и в базе, и в образе,
+    источник истины был неопределён: файловую инструкцию нельзя было прочитать
+    в админке, изменить или заменить, а `prompt_version = NULL` молча означал
+    «взять файл». Базовая инструкция перенесена в базу миграцией `0009` и стала
+    обычной версией, поэтому читать откуда-то ещё больше не нужно.
+
+    Версию выбирает конфигурация задачи (`ai_task_configs.prompt_version`), и
+    разрешение этой ссылки живёт здесь: «какую инструкцию использует задача» —
+    часть вопроса «откуда берётся промпт», а не отдельная ответственность
+    генератора. Отсутствие версии — ошибка конфигурации, а не повод молча взять
+    другой текст: подмена инструкции незаметно меняет поведение генерации.
+    """
+
+    def __init__(self, prompt_repository, task_repository=None):
         self._repo = prompt_repository
+        self._tasks = task_repository
 
     async def load(
         self, task_type: AITaskType, version: int | None = None
     ) -> tuple[str, str, int]:
-        """Возвращает (system_prompt, user_template, version)."""
-        # Сначала пробуем БД
-        if self._repo is not None:
-            template = await self._repo.get(task_type, version)
-            if template is not None and template.enabled:
-                return template.system_prompt, template.user_template, template.version
+        """Возвращает (system_prompt, user_template, version).
 
-        # Fallback на файлы
-        prompt_dir = PROMPTS_DIR / f"v{version or 1}"
-        system_file = prompt_dir / "system.txt"
-        user_file = prompt_dir / "user_template.txt"
-
-        if not system_file.exists() or not user_file.exists():
+        `version=None` означает «взять версию из настроек задачи», а не
+        «взять любую»: явный аргумент нужен только там, где версия уже известна.
+        """
+        if version is None:
+            version = await self._task_prompt_version(task_type)
+        if version is None:
             raise AIConfigurationError(
-                f"Промпты для задачи {task_type.value} v{version or 1} не найдены"
+                f"Для задачи «{task_type.value}» не выбрана инструкция. "
+                "Выберите версию инструкции в настройках задачи."
             )
 
-        return (
-            system_file.read_text(encoding="utf-8"),
-            user_file.read_text(encoding="utf-8"),
-            version or 1,
-        )
+        template = await self._repo.get(task_type, version)
+        if template is None:
+            raise AIConfigurationError(
+                f"Инструкция №{version} для задачи «{task_type.value}» не найдена. "
+                "Выберите существующую версию в настройках задачи."
+            )
+        if not template.enabled:
+            raise AIConfigurationError(
+                f"Инструкция №{version} выключена. Включите её или выберите "
+                "другую версию в настройках задачи."
+            )
+        return template.system_prompt, template.user_template, template.version
+
+    async def _task_prompt_version(self, task_type: AITaskType) -> int | None:
+        if self._tasks is None:
+            return None
+        config = await self._tasks.get(task_type)
+        return config.prompt_version if config else None
 
 
 class AIOutputParser:

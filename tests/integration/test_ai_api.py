@@ -1238,6 +1238,146 @@ def test_prompt_edit_is_visible_to_generation_loader(
     assert version == created["version"]
 
 
+# --- Инструкция как единственный источник -----------------------------------------
+#
+# Раньше базовая инструкция жила в файлах образа: её нельзя было прочитать в
+# админке, изменить или удалить, а задача с пустой версией молча брала её.
+# Миграция 0009 перенесла текст в базу обычной версией.
+
+
+def test_seeded_default_prompt_is_visible_in_admin_api(
+    client: TestClient, auth_headers: dict
+):
+    """Базовая инструкция доступна как обычная запись, а не как файл."""
+    listed = client.get(
+        "/api/v1/admin/ai/prompts/workout_generation", headers=auth_headers
+    ).json()
+
+    seeded = next(
+        (i for i in listed["items"] if i["name"] == "Базовая инструкция"), None
+    )
+    assert seeded is not None, "миграция 0009 должна засеять базовую инструкцию"
+
+    detail = client.get(
+        f"/api/v1/admin/ai/prompts/detail/{seeded['id']}", headers=auth_headers
+    ).json()
+    # Полный текст читается через API: это и есть референс для новых версий.
+    assert "КРИТИЧЕСКИЕ ПРАВИЛА" in detail["system_prompt"]
+    assert "{safe_pool_exercises}" in detail["user_template"]
+
+
+def test_seeded_prompt_is_editable_and_deletable_like_any_other(
+    client: TestClient, auth_headers: dict
+):
+    """У базовой инструкции нет особого статуса: правится и удаляется.
+
+    Хардкод исключён именно в этом смысле: если созданная позже инструкция
+    окажется лучше, базовую незачем сохранять.
+    """
+    # Работаем на копии базовой: удалять реальный seed в общей базе разработки
+    # нельзя, а проверить нужно отсутствие защиты, а не сам факт удаления.
+    seeded_id = next(
+        i["id"]
+        for i in client.get(
+            "/api/v1/admin/ai/prompts/workout_generation", headers=auth_headers
+        ).json()["items"]
+        if i["name"] == "Базовая инструкция"
+    )
+    source = client.get(
+        f"/api/v1/admin/ai/prompts/detail/{seeded_id}", headers=auth_headers
+    ).json()
+
+    copy = client.post(
+        "/api/v1/admin/ai/prompts",
+        headers=auth_headers,
+        json={
+            "task_type": "workout_generation",
+            "name": f"{_PROMPT_TEST_PREFIX} копия базовой",
+            "system_prompt": source["system_prompt"],
+            "user_template": source["user_template"],
+        },
+    )
+    assert copy.status_code == 201, copy.text
+    copy_id = copy.json()["id"]
+    # Копия равна оригиналу: базовая инструкция служит образцом.
+    assert copy.json()["system_prompt"] == source["system_prompt"]
+
+    edited = client.patch(
+        f"/api/v1/admin/ai/prompts/detail/{copy_id}",
+        headers=auth_headers,
+        json={"system_prompt": source["system_prompt"] + "\n6. Дополнительное правило."},
+    )
+    assert edited.status_code == 200
+    assert edited.json()["system_prompt"].endswith("6. Дополнительное правило.")
+
+    assert (
+        client.delete(
+            f"/api/v1/admin/ai/prompts/detail/{copy_id}", headers=auth_headers
+        ).status_code
+        == 204
+    )
+
+
+def test_task_without_explicit_prompt_gets_existing_version(
+    client: TestClient, auth_headers: dict, cleanup_prompts
+):
+    """Пустая версия больше не означает «взять файл»: ссылка проставляется.
+
+    Файлового источника нет, поэтому конфигурация не может остаться без
+    инструкции: сервер выбирает последнюю включённую и показывает её номер.
+    """
+    prompt = _create_prompt(client, auth_headers, name="autoselect")
+    _, _, model_id = _chain(client, auth_headers, "apitest-autoprompt")
+
+    saved = client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={"enabled": True, "model_ids": [model_id]},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["prompt_version"] == prompt["version"]
+
+    report = client.get(
+        "/api/v1/admin/ai/readiness", headers=auth_headers
+    ).json()
+    prompt_check = next(c for c in report["checks"] if c["key"] == "prompt")
+    assert prompt_check["status"] == "ok"
+    # В отчёте видно, какая инструкция будет использована, а не «из файлов».
+    assert f"№{prompt['version']}" in prompt_check["detail"]
+    assert "файл" not in prompt_check["detail"].lower()
+
+
+def test_readiness_prompt_check_fails_when_selected_version_is_missing(
+    client: TestClient, auth_headers: dict
+):
+    """Отчёт готовности проверяет ровно ту инструкцию, что выберет генерация.
+
+    Задача сохраняется выключенной: `validate_enable` намеренно не пускает такую
+    конфигурацию во включённом виде, а проверить нужно текст шага readiness.
+    Общее состояние базы тест не портит — чужие инструкции не трогаются.
+    """
+    _, _, model_id = _chain(client, auth_headers, "apitest-promptmissing")
+
+    saved = client.put(
+        "/api/v1/admin/ai/tasks/workout_generation",
+        headers=auth_headers,
+        json={
+            "enabled": False,
+            "model_ids": [model_id],
+            "prompt_version": 9999,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+    report = client.get("/api/v1/admin/ai/readiness", headers=auth_headers).json()
+    prompt_check = next(c for c in report["checks"] if c["key"] == "prompt")
+    assert prompt_check["status"] == "failed"
+    assert "№9999" in prompt_check["detail"]
+    # Файловый источник исключён: подставить другой текст нечем.
+    assert "файл" not in prompt_check["detail"].lower()
+    assert report["ready"] is False
+
+
 # --- Выбор моделей из списка сервиса ---------------------------------------------------
 #
 # Идентификаторы моделей больше не вводятся руками: список запрашивается у

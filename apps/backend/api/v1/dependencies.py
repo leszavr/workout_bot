@@ -156,15 +156,22 @@ def build_program_html_service() -> ProgramHtmlService:
 def build_ai_program_generator(http_client: httpx.AsyncClient | None = None) -> AIProgramGenerator:
     """Собирает AIProgramGenerator с AIGateway."""
     from apps.backend.api.v1.ai_dependencies import build_ai_components
-    from src.infrastructure.persistence.postgres.ai_repository import PromptTemplateRepository
+    from src.infrastructure.persistence.postgres.ai_repository import (
+        AITaskConfigRepository,
+        PromptTemplateRepository,
+    )
 
     components = build_ai_components(http_client)
     session_factory = get_session_factory()
-    prompt_repo = PromptTemplateRepository(session_factory)
 
     return AIProgramGenerator(
         gateway=components.gateway,
-        prompt_loader=PromptLoader(prompt_repo),
+        # Версию инструкции загрузчик берёт из настроек задачи: другого
+        # источника промптов нет.
+        prompt_loader=PromptLoader(
+            PromptTemplateRepository(session_factory),
+            AITaskConfigRepository(session_factory),
+        ),
         validator=ProgramValidator(),
         attempt_recorder=_record_model_attempts,
     )

@@ -13,10 +13,6 @@ COPY apps ./apps
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY scripts ./scripts
-# Файловые промпты — источник инструкций для ИИ, когда версия не задана в БД
-# (PromptLoader: DB-first, файловый fallback). Без них контейнер поднимается, но
-# AI-генерация падает на AIConfigurationError «промпты не найдены».
-COPY prompts ./prompts
 
 RUN pip install --no-cache-dir . \
     # Запуск от непривилегированного пользователя. Право на запись даётся только
