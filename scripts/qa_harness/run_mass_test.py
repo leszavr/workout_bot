@@ -68,10 +68,22 @@ SCENARIO_USER_OFFSET = {
 }
 
 # Автогенерация запускается фоновой задачей после финализации, поэтому программу
-# нужно дождаться. AI-генерация с перебором моделей и repair укладывается в
-# бюджет 240 с, плюс запас на доставку.
-GENERATION_TIMEOUT_SECONDS = 400
+# нужно дождаться.
+#
+# Ожидание заметно больше бюджета генерации (240 с) намеренно. Бюджет проверяется
+# между попытками и не прерывает уже начатый вызов провайдера: медленный ответ
+# (наблюдалось 125 с) плюс repair с собственным таймаутом задачи (120 с) плюс
+# ретраи адаптера дают суммарно больше бюджета. При коротком ожидании прогон
+# записывал «программа не появилась» там, где генерация продолжалась и позже
+# завершалась успешно — то есть измерял мой таймаут, а не поведение системы.
+GENERATION_TIMEOUT_SECONDS = 900
 POLL_INTERVAL_SECONDS = 3
+
+# Сколько ждать завершения фоновых задач pipeline перед выходом. Без этого
+# ожидания процесс закрывает event loop, задачи получают CancelledError, и job
+# закрывается кодом `unexpected_error` с пустым сообщением — отказ, которого в
+# действительности не было.
+BACKGROUND_DRAIN_SECONDS = 120
 
 
 @dataclass
@@ -144,6 +156,12 @@ async def main() -> int:
     admin = await AdminClient.login(args.base_url, login, password)
     users = SCENARIOS[: args.users] if args.users else SCENARIOS
 
+    # Диспетчер и симулятор создаются один раз на весь прогон. Роутеры aiogram —
+    # модульные singletons: повторный `build_dispatcher` для следующего сценария
+    # падает с «Router is already attached». Независимость сценариев обеспечивает
+    # смещение telegram_user_id, а не отдельный диспетчер.
+    simulator = _build_simulator()
+
     outcomes: list[ProgramOutcome] = []
     for scenario in args.scenarios:
         logger.info("=" * 78)
@@ -151,12 +169,10 @@ async def main() -> int:
         async with model_availability(admin, scenario) as models:
             _log_models(models)
             readiness = await admin.readiness()
-            logger.info(
-                "Готовность задачи: ready=%s, стратегия=%s",
-                readiness["ready"],
-                readiness.get("effective_strategy") or readiness.get("strategy"),
-            )
-            outcomes.extend(await _run_scenario(scenario, users, admin))
+            logger.info("Готовность задачи: ready=%s", readiness["ready"])
+            outcomes.extend(await _run_scenario(scenario, users, simulator))
+
+    await _drain_background_tasks()
 
     report = _build_report(outcomes)
     _print_summary(report, outcomes)
@@ -171,24 +187,49 @@ async def main() -> int:
     return 0 if report["failed"] == 0 else 1
 
 
-async def _run_scenario(
-    scenario: str, users: list[ScriptedUser], admin: AdminClient
-) -> list[ProgramOutcome]:
-    """Проходит анкеты и собирает результат по каждой."""
+def _build_simulator() -> TelegramUserSimulator:
+    """Собирает диспетчер и имитатор один раз на прогон.
+
+    Хранилище — in-memory: состояние анкеты нужно только на время прохождения, и
+    Redis staging не должен получать мусор от прогона.
+    """
     from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 
     from apps.telegram_gateway.main import build_dispatcher
 
-    # Диспетчер один на сценарий: роутеры aiogram — модульные singletons, и
-    # повторный include_router того же роутера падает с «Router is already
-    # attached». Хранилище — in-memory: состояние анкеты нужно только на время
-    # прохождения, а Redis staging не должен получать мусор от прогона.
     dispatcher: Dispatcher = build_dispatcher(
         storage=MemoryStorage(), events_isolation=SimpleEventIsolation()
     )
-    session = FakeTelegramSession()
-    simulator = TelegramUserSimulator(dispatcher, session)
+    return TelegramUserSimulator(dispatcher, FakeTelegramSession())
 
+
+async def _drain_background_tasks() -> None:
+    """Даёт фоновым задачам pipeline завершиться до выхода из процесса.
+
+    Автогенерация выполняется фоновой задачей. Если процесс завершится раньше,
+    задача получит CancelledError, и job закроется кодом `unexpected_error` с
+    пустым сообщением — в журнале появится отказ, которого не было.
+    """
+    from apps.telegram_gateway.handlers.review import _BACKGROUND_TASKS
+
+    pending = {task for task in _BACKGROUND_TASKS if not task.done()}
+    if not pending:
+        return
+    logger.info("Ожидаю завершения фоновых задач: %s", len(pending))
+    done, still_pending = await asyncio.wait(
+        pending, timeout=BACKGROUND_DRAIN_SECONDS
+    )
+    if still_pending:
+        logger.warning(
+            "Не дождался %s фоновых задач: их job закроется как отменённый",
+            len(still_pending),
+        )
+
+
+async def _run_scenario(
+    scenario: str, users: list[ScriptedUser], simulator: TelegramUserSimulator
+) -> list[ProgramOutcome]:
+    """Проходит анкеты и собирает результат по каждой."""
     offset = SCENARIO_USER_OFFSET[scenario]
     outcomes: list[ProgramOutcome] = []
     for user in users:
