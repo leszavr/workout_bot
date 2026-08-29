@@ -61,6 +61,10 @@ from src.infrastructure.persistence.postgres.models import (
 
 pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="DATABASE_URL is not set")
 
+# Инструкции этого модуля помечаются префиксом и вычищаются только по нему:
+# базовая инструкция из миграции 0009 общая для всех тестов.
+PROMPT_PREFIX = "cfgtest"
+
 REAL_SECRET = "sk-integration-test-secret-9999"
 
 
@@ -117,9 +121,12 @@ async def cleanup_ai_data():
                         AITaskConfigRow.task_type == "workout_generation"
                     )
                 )
+                # Только свои инструкции: базовая инструкция засеяна миграцией
+                # 0009 и нужна остальным тестам — без неё задачу нельзя
+                # включить, потому что файлового промпта больше нет.
                 await session.execute(
                     delete(PromptTemplateRow).where(
-                        PromptTemplateRow.task_type == "workout_generation"
+                        PromptTemplateRow.name.like(f"{PROMPT_PREFIX}%")
                     )
                 )
                 await session.execute(
@@ -320,50 +327,68 @@ async def test_secret_rotation(components):
     assert await components["secret_store"].get(endpoint.secret_reference) == "new-key-value-2222"
 
 
-async def test_prompt_versioning_immutable(components):
+async def test_prompt_version_numbers_are_unique(components):
+    """Одна пара «задача + версия» — один промпт.
+
+    Номера версий не фиксированы: базовая инструкция засеяна миграцией 0009,
+    поэтому тест берёт следующий свободный номер, а не предполагает, что база
+    пуста.
+    """
     admin: AIConfigurationService = components["admin"]
-    v1 = await admin.create_prompt_version(
+    first_version = await admin.next_prompt_version(AITaskType.WORKOUT_GENERATION)
+    created = await admin.create_prompt_version(
         PromptTemplate(
             task_type=AITaskType.WORKOUT_GENERATION,
-            version=1,
-            name="Base",
+            version=first_version,
+            name=f"{PROMPT_PREFIX} Base",
             system_prompt="You are a coach.",
             user_template="Generate for {profile}",
         ),
         actor="test",
     )
-    # Повторное создание той же версии запрещено.
+    assert created.version == first_version
+
+    # Повторное создание той же версии — конфликт, а не перезапись.
     from src.errors import WorkoutBotError
 
     duplicate = PromptTemplate(
         task_type=AITaskType.WORKOUT_GENERATION,
-        version=1,
-        name="Changed",
+        version=first_version,
+        name=f"{PROMPT_PREFIX} Changed",
         system_prompt="Hacked!",
         user_template="x",
     )
     with pytest.raises(WorkoutBotError):
         await admin.create_prompt_version(duplicate, actor="test")
-    # v1 остаётся неизменной.
-    loaded = await components["prompts"].get(AITaskType.WORKOUT_GENERATION, 1)
+
+    loaded = await components["prompts"].get(
+        AITaskType.WORKOUT_GENERATION, first_version
+    )
     assert loaded is not None
     assert loaded.system_prompt == "You are a coach."
-    assert loaded.id == v1.id
+    assert loaded.id == created.id
 
-    # Новая версия v2 создаётся отдельно.
-    assert await admin.next_prompt_version(AITaskType.WORKOUT_GENERATION) == 2
+    # Следующая версия — свободный номер, а не перезапись существующей.
+    second_version = await admin.next_prompt_version(AITaskType.WORKOUT_GENERATION)
+    assert second_version == first_version + 1
     await admin.create_prompt_version(
         PromptTemplate(
             task_type=AITaskType.WORKOUT_GENERATION,
-            version=2,
-            name="Improved",
+            version=second_version,
+            name=f"{PROMPT_PREFIX} Improved",
             system_prompt="You are a better coach.",
             user_template="Generate v2 for {profile}",
         ),
         actor="test",
     )
-    versions = await components["prompts"].list_for_task(AITaskType.WORKOUT_GENERATION)
-    assert [v.version for v in versions] == [2, 1]
+    versions = [
+        v.version
+        for v in await components["prompts"].list_for_task(
+            AITaskType.WORKOUT_GENERATION
+        )
+    ]
+    # Список отдаётся от новых к старым.
+    assert versions[:2] == [second_version, first_version]
 
 
 async def test_model_bound_to_task_cannot_be_deleted(components):

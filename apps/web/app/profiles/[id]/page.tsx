@@ -14,7 +14,7 @@ import {
   Tag,
   moment,
 } from "@/components/ui/Primitives";
-import { api, getToken, ProfileDetail, ProgramListItem } from "@/lib/api";
+import { ApiError, api, getToken, ProfileDetail, ProgramListItem } from "@/lib/api";
 import {
   consentLabel,
   generationSourceLabel,
@@ -177,6 +177,9 @@ export default function ProfileDetailPage() {
   // весит несколько мегабайт, и без индикатора нажатие выглядит безответным.
   const [htmlPending, setHtmlPending] = useState("");
   const [htmlError, setHtmlError] = useState("");
+  // program_id удаляемой программы: удаление затрагивает все её версии.
+  const [deletingProgram, setDeletingProgram] = useState("");
+  const [deleteNotice, setDeleteNotice] = useState("");
 
   const loadPrograms = useCallback(() => {
     api
@@ -241,6 +244,36 @@ export default function ProfileDetailPage() {
       // открытие документа, слишком поздний держит файл в памяти.
       if (url) setTimeout(() => URL.revokeObjectURL(url), 60_000);
       setHtmlPending("");
+    }
+  }
+
+  /**
+   * Удалить программу вместе со всеми её версиями.
+   *
+   * Анкета остаётся: программа производна от неё и может быть собрана заново.
+   * Обратный порядок запрещён сервером — анкету с программами удалить нельзя.
+   */
+  async function onDeleteProgram(program: ProgramListItem) {
+    if (
+      !window.confirm(
+        `Удалить программу «${program.title}»? Будут удалены все её версии и ` +
+          "записи об отправке. Анкета останется."
+      )
+    ) {
+      return;
+    }
+    setDeletingProgram(program.program_id);
+    setGenerateError("");
+    try {
+      await api.deleteProgram(program.program_id);
+      setDeleteNotice(`Программа «${program.title}» удалена`);
+      window.setTimeout(() => setDeleteNotice(""), 6000);
+      loadPrograms();
+    } catch (e) {
+      const apiError = e as ApiError;
+      setGenerateError(apiError.message);
+    } finally {
+      setDeletingProgram("");
     }
   }
 
@@ -342,6 +375,7 @@ export default function ProfileDetailPage() {
         >
           {generateError && <div className="error">{generateError}</div>}
           {htmlError && <div className="error">{htmlError}</div>}
+          {deleteNotice && <Notice tone="ok">{deleteNotice}</Notice>}
 
           {canWrite ? (
             <div className="subcard" style={{ marginBottom: "var(--s-4)" }}>
@@ -416,8 +450,10 @@ export default function ProfileDetailPage() {
                     <th>Название</th>
                     <th>Состояние</th>
                     <th>Собрана</th>
+                    <th>Отправлена</th>
                     <th>Когда</th>
                     <th>Файл программы</th>
+                    {canWrite && <th>Действия</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -436,6 +472,16 @@ export default function ProfileDetailPage() {
                         <Tag tone={p.generation_source === "ai" ? "info" : "neutral"}>
                           {generationSourceLabel(p.generation_source)}
                         </Tag>
+                      </td>
+                      <td>
+                        {/* Отправка в Telegram — единственный достоверный факт
+                            получения: открыл ли человек документ, Bot API не
+                            сообщает. */}
+                        {p.delivered ? (
+                          <Tag tone="ok">отправлена</Tag>
+                        ) : (
+                          <span className="muted">нет</span>
+                        )}
                       </td>
                       <td className="muted">{moment(p.created_at)}</td>
                       <td>
@@ -462,6 +508,20 @@ export default function ProfileDetailPage() {
                           </button>
                         </div>
                       </td>
+                      {canWrite && (
+                        <td className="actions">
+                          <button
+                            type="button"
+                            className="small danger"
+                            disabled={deletingProgram === p.program_id}
+                            onClick={() => onDeleteProgram(p)}
+                          >
+                            {deletingProgram === p.program_id
+                              ? "Удаляем…"
+                              : "Удалить"}
+                          </button>
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>

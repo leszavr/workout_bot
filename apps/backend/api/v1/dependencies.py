@@ -25,6 +25,7 @@ from src.application.programs.orchestrator import (
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.service import ProgramService
 from src.application.programs.validator import ProgramValidator
+from src.application.profiles.admin_service import ProfileAdminService
 from src.domain.ai.enums import AITaskType
 from src.infrastructure.config import (
     EXERCISE_MEDIA_MAX_PER_EXERCISE,
@@ -35,6 +36,9 @@ from src.infrastructure.config import (
 )
 from src.infrastructure.media.object_storage import create_object_storage
 from src.infrastructure.persistence.postgres.db import get_session_factory
+from src.infrastructure.persistence.postgres.delivery_repository import (
+    ProgramDeliveryRepository,
+)
 from src.infrastructure.persistence.postgres.exercise_media_repository import (
     ExerciseMediaRepository,
 )
@@ -70,6 +74,29 @@ def build_program_service() -> ProgramService:
     """Чтение сохранённых программ. Генерации здесь нет (Phase 1.2-C)."""
     return ProgramService(
         program_repository=PostgresProgramRepository(get_session_factory())
+    )
+
+
+def build_delivery_repository() -> ProgramDeliveryRepository:
+    """Записи доставки программ пользователю.
+
+    Нужны админке в двух местах: маркер «программа отправлена» в списке анкет и
+    очистка записей при удалении анкеты или программы.
+    """
+    return ProgramDeliveryRepository(get_session_factory())
+
+
+def build_profile_admin_service() -> ProfileAdminService:
+    """Удаление анкет и программ.
+
+    Целостность обеспечивает сервис, а не база: внешних ключей на
+    `workout_programs.profile_id` и `program_deliveries` в схеме нет.
+    """
+    session_factory = get_session_factory()
+    return ProfileAdminService(
+        profiles=PostgresProfileRepository(session_factory),
+        programs=PostgresProgramRepository(session_factory),
+        deliveries=ProgramDeliveryRepository(session_factory),
     )
 
 

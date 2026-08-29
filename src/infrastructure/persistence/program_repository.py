@@ -41,3 +41,17 @@ class ProgramRepository(abc.ABC):
     @abc.abstractmethod
     async def count(self) -> int:
         """Количество программ (последних версий)."""
+
+    @abc.abstractmethod
+    async def delete(self, program_id: str) -> int:
+        """Удаляет все версии программы. Возвращает число удалённых строк.
+
+        Версии не удаляются по одной: `program_id` — это программа, а версии —
+        её история. Оставить часть версий значило бы получить программу с
+        дырами в истории, а `next_version` перестал бы соответствовать
+        фактическому составу.
+        """
+
+    @abc.abstractmethod
+    async def delete_for_profile(self, profile_id: str) -> int:
+        """Удаляет все программы профиля. Возвращает число удалённых строк."""

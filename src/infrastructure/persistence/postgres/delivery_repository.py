@@ -7,9 +7,8 @@ Delivery retry независим от generation retry: программа уж
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from enum import StrEnum
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -43,6 +42,27 @@ class ProgramDeliveryRecord:
         self.last_error = last_error
         self.sent_message_id = sent_message_id
         self.source_media_mode = source_media_mode
+
+
+class ProgramDeliverySummary:
+    """Итог доставки программ одной анкеты для административного списка.
+
+    Отвечает на вопрос «эта анкета уже исполнена?»: была ли программа
+    отправлена пользователю и когда. Берётся последняя успешная отправка, а не
+    последняя запись: неудачная попытка после успешной не отменяет того, что
+    пользователь программу получил.
+    """
+
+    def __init__(
+        self,
+        *,
+        delivered: bool,
+        delivered_at: datetime | None,
+        last_status: ProgramDeliveryStatus | None,
+    ) -> None:
+        self.delivered = delivered
+        self.delivered_at = delivered_at
+        self.last_status = last_status
 
 
 class ProgramDeliveryRepository:
@@ -119,6 +139,83 @@ class ProgramDeliveryRepository:
         except SQLAlchemyError as exc:
             raise ProgramDeliveryError(f"Ошибка списка failed доставок: {exc}") from exc
         return [_to_record(r) for r in rows]
+
+    async def summaries_for_profiles(
+        self, profile_ids: list[str]
+    ) -> dict[str, ProgramDeliverySummary]:
+        """Сводка доставок по списку анкет — одним запросом.
+
+        Список анкет читается страницами, и запрос на каждую строку отдельно
+        превратил бы открытие раздела в N+1. Возвращаются только анкеты, у
+        которых доставки есть; отсутствие ключа означает «программу не
+        отправляли».
+        """
+        if not profile_ids:
+            return {}
+        try:
+            async with self._sessions() as session:
+                rows = (
+                    await session.execute(
+                        select(ProgramDeliveryRow)
+                        .where(ProgramDeliveryRow.profile_id.in_(profile_ids))
+                        .order_by(ProgramDeliveryRow.id)
+                    )
+                ).scalars().all()
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(f"Ошибка сводки доставок: {exc}") from exc
+
+        result: dict[str, ProgramDeliverySummary] = {}
+        for row in rows:
+            status = ProgramDeliveryStatus(row.status)
+            current = result.get(row.profile_id)
+            delivered = status is ProgramDeliveryStatus.SENT
+            result[row.profile_id] = ProgramDeliverySummary(
+                # Успешная отправка не отменяется более поздней неудачной
+                # попыткой: пользователь программу уже получил.
+                delivered=delivered or bool(current and current.delivered),
+                delivered_at=row.delivered_at
+                if delivered
+                else (current.delivered_at if current else None),
+                last_status=status,
+            )
+        return result
+
+    async def delete_for_program(self, program_id: str) -> int:
+        """Удаляет записи доставок программы. Возвращает число удалённых строк.
+
+        Внешнего ключа на `workout_programs` нет, поэтому осиротевшие записи
+        база не уберёт: доставка удалённой программы — мусор, который в журнале
+        уже ничего не объясняет.
+        """
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        delete(ProgramDeliveryRow).where(
+                            ProgramDeliveryRow.program_id == program_id
+                        )
+                    )
+                    return int(result.rowcount or 0)
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Не удалось удалить доставки программы {program_id}: {exc}"
+            ) from exc
+
+    async def delete_for_profile(self, profile_id: str) -> int:
+        """Удаляет записи доставок анкеты. Возвращает число удалённых строк."""
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        delete(ProgramDeliveryRow).where(
+                            ProgramDeliveryRow.profile_id == profile_id
+                        )
+                    )
+                    return int(result.rowcount or 0)
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Не удалось удалить доставки анкеты {profile_id}: {exc}"
+            ) from exc
 
 
 def _to_record(row: ProgramDeliveryRow) -> ProgramDeliveryRecord:

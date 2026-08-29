@@ -269,6 +269,25 @@ export interface ProfileListItem {
   primary_goal: string | null;
   status: string;
   created_at: string | null;
+  // Маркеры исполнения анкеты: собрана ли программа и ушла ли она человеку.
+  // Вычисляются на сервере по фактическому составу программ и доставок.
+  has_program: boolean;
+  delivered: boolean;
+  delivered_at: string | null;
+  delivery_status: string | null;
+}
+
+// Способы сортировки списка анкет. Сервер принимает только эти значения.
+export type ProfileSort =
+  | "created_desc"
+  | "created_asc"
+  | "generated_first"
+  | "not_generated_first"
+  | "delivered_first"
+  | "not_delivered_first";
+
+export interface ProfileListResponse extends ListResponse<ProfileListItem> {
+  sort: ProfileSort;
 }
 
 export interface ProfileDetail {
@@ -393,6 +412,8 @@ export interface ProgramListItem {
   training_days_per_week: number;
   duration_weeks: number;
   created_at: string | null;
+  // Отправлена ли программа пользователю в Telegram.
+  delivered?: boolean;
 }
 
 export interface ProgramVersionInfo {
@@ -730,6 +751,9 @@ export interface AIDeleteBlocker {
   task_type?: string;
   task_enabled?: boolean;
   model_id?: number;
+  prompt_version?: number;
+  // Для анкет: сколько программ мешает удалению.
+  count?: number;
   detail: string;
 }
 
@@ -876,15 +900,31 @@ export interface AIProviderForUI {
 
 export const api = {
   dashboard: () => request<Dashboard>("/api/v1/dashboard"),
-  profiles: (params?: { search?: string; status?: string; limit?: number; offset?: number }) => {
+  profiles: (params?: {
+    search?: string;
+    status?: string;
+    generated?: boolean;
+    delivered?: boolean;
+    sort?: ProfileSort;
+    limit?: number;
+    offset?: number;
+  }) => {
     const qs = new URLSearchParams();
     if (params?.search) qs.set("search", params.search);
     if (params?.status) qs.set("status", params.status);
+    // Явное false — это фильтр «без программы», а не отсутствие фильтра.
+    if (params?.generated !== undefined) qs.set("generated", String(params.generated));
+    if (params?.delivered !== undefined) qs.set("delivered", String(params.delivered));
+    if (params?.sort) qs.set("sort", params.sort);
     qs.set("limit", String(params?.limit ?? 50));
     qs.set("offset", String(params?.offset ?? 0));
-    return request<ListResponse<ProfileListItem>>(`/api/v1/profiles?${qs}`);
+    return request<ProfileListResponse>(`/api/v1/profiles?${qs}`);
   },
   profile: (id: string) => request<ProfileDetail>(`/api/v1/profiles/${id}`),
+  deleteProfile: (id: string) =>
+    request<void>(`/api/v1/profiles/${id}`, { method: "DELETE" }),
+  deleteProgram: (id: string) =>
+    request<void>(`/api/v1/programs/${id}`, { method: "DELETE" }),
   exercises: (params?: { search?: string; exercise_type?: string; difficulty?: string; limit?: number; offset?: number }) => {
     const qs = new URLSearchParams();
     if (params?.search) qs.set("search", params.search);
