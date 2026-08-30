@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Generic, Protocol, TypeVar
 
+from src.application.programs.generation_context import generation_job_context
 from src.domain.enums import GenerationJobStatus
 from src.domain.generation import (
     GenerationJob,
@@ -126,7 +127,12 @@ class GenerationJobService:
         )
 
         try:
-            result = await operation()
+            # Телеметрия AI-контура пишется внутри `operation` и должна знать,
+            # к какой операции генерации относится. Ссылка передаётся ambient-
+            # контекстом, а не аргументом: контракт `ProgramGenerator.generate`
+            # общий для AI и алгоритмического генератора, и последнему job не нужен.
+            with generation_job_context(job.job_id):
+                result = await operation()
         except BaseException as exc:  # noqa: BLE001 — любой отказ обязан закрыть job
             code = classify_error(exc)
             job = await self._jobs.mark_failed(

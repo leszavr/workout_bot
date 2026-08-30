@@ -558,11 +558,16 @@ class AIConfigurationService:
         reason_code: str,
         detail: str,
         ai_attempted: bool,
+        job_id: str | None = None,
     ) -> None:
         """Пишет fallback генерации в существующий журнал событий.
 
         Отдельной таблицы под это намеренно нет: администратору нужен один
         журнал событий AI-контура, а не параллельная подсистема.
+
+        `job_id` в `entity_id` связывает событие с operational-записью
+        генерации: без него журнал отвечает «сколько было fallback», но не «что
+        случилось в этой генерации».
 
         В metadata не попадают profile_id, содержимое программы и любые
         персональные данные — только технические поля.
@@ -571,7 +576,7 @@ class AIConfigurationService:
             FALLBACK_EVENT_TYPE,
             actor=None,  # системное событие, не действие администратора
             entity_type="program_generation",
-            entity_id=None,
+            entity_id=job_id,
             metadata={
                 "requested_generator": requested_generator,
                 "actual_generator": actual_generator,
@@ -588,7 +593,12 @@ class AIConfigurationService:
         )
 
     async def record_model_attempts(
-        self, attempts: list[dict], *, task_type: AITaskType
+        self,
+        attempts: list[dict],
+        *,
+        task_type: AITaskType,
+        job_id: str | None = None,
+        prompt_version: int | None = None,
     ) -> None:
         """Пишет историю попыток моделей одной AI-генерации.
 
@@ -597,6 +607,10 @@ class AIConfigurationService:
         отвергнут валидацией, запрашивалось ли исправление и перешла ли система
         к следующей модели. Событие пишется в тот же журнал AI-контура —
         отдельной подсистемы под это не вводится.
+
+        `job_id` в `entity_id` связывает попытки с operational-записью
+        генерации, а `prompt_version` — с версией инструкции: без неё нельзя
+        сравнить, какая формулировка чаще проходит проверку.
 
         В metadata только технические поля: приоритет, провайдер,
         идентификатор модели, исход, число repair-попыток. Промпта, ответа
@@ -608,9 +622,10 @@ class AIConfigurationService:
             MODEL_ATTEMPTS_EVENT_TYPE,
             actor=None,  # системное событие, не действие администратора
             entity_type="program_generation",
-            entity_id=None,
+            entity_id=job_id,
             metadata={
                 "task_type": task_type.value,
+                "prompt_version": prompt_version,
                 "models_tried": len(attempts),
                 "attempts": attempts,
             },

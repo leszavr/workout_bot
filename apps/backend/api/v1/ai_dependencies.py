@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import httpx
 
 from src.application.ai.admin_service import AIConfigurationService
+from src.application.ai.analytics_service import GenerationAnalyticsService
 from src.application.ai.gateway import AIGateway
 from src.application.ai.health import AIInfrastructureHealthService
 from src.application.ai.readiness import AIReadinessService
@@ -32,6 +33,9 @@ from src.infrastructure.persistence.postgres.ai_repository import (
     AIUsageRepository,
     PromptTemplateRepository,
 )
+from src.infrastructure.persistence.postgres.analytics_repository import (
+    GenerationAnalyticsRepository,
+)
 from src.infrastructure.persistence.postgres.db import get_session_factory
 from src.infrastructure.persistence.postgres.models import AISecretRow
 
@@ -51,6 +55,18 @@ class AIComponents:
     prompts: PromptTemplateRepository
     usage: AIUsageRepository
     audit: AIAuditRepository
+
+
+def build_generation_analytics_service() -> GenerationAnalyticsService:
+    """Read-only аналитика генерации.
+
+    Собирается отдельно от `build_ai_components`: аналитика не участвует в
+    генерации и не должна тянуть за собой gateway, секреты и адаптеры
+    провайдеров ради одного SELECT.
+    """
+    return GenerationAnalyticsService(
+        GenerationAnalyticsRepository(get_session_factory())
+    )
 
 
 def build_ai_components(http_client: httpx.AsyncClient | None = None) -> AIComponents:

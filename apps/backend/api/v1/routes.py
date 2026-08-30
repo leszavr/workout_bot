@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
+from enum import StrEnum
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,6 +18,7 @@ from sqlalchemy import func, select
 
 from apps.backend.api.v1.dependencies import (
     build_delivery_repository,
+    build_exercise_repository,
     build_generation_orchestrator,
     build_profile_admin_service,
     build_program_html_service,
@@ -59,6 +62,7 @@ from src.errors import (
     ProgramPersistenceError,
 )
 from src.infrastructure.persistence.postgres.db import get_session_factory
+from src.infrastructure.persistence.postgres.exercise_repository import ExerciseQuery
 from src.infrastructure.persistence.postgres.models import (
     ConsentRow,
     ExerciseRow,
@@ -504,52 +508,146 @@ async def get_user(user_id: int, _: Annotated[AuthenticatedUser, Depends(require
 
 # --- Exercises ----------------------------------------------------------------
 
+# Сортировка и трёхзначные фильтры объявлены перечислениями, а не свободными
+# строками: значение уходит в ORDER BY, и произвольная строка из запроса там
+# означала бы и инъекцию, и выдачу внутренних имён колонок наружу. Неверное
+# значение FastAPI отклоняет сам, до обращения к базе.
+
+
+class SortOrder(StrEnum):
+    ASC = "asc"
+    DESC = "desc"
+
+
+class ExerciseSort(StrEnum):
+    NAME = "name"
+    NAME_RU = "name_ru"
+    EXERCISE_TYPE = "exercise_type"
+    DIFFICULTY = "difficulty"
+    FORCE = "force"
+    MECHANIC = "mechanic"
+    CREATED_AT = "created_at"
+
+
+# Значения фильтров каталога приходят списками: «штанга или гантели» — один
+# запрос, а не два. FastAPI собирает повторяющийся query-параметр в список.
+def _clean(values: list[str] | None) -> tuple[str, ...]:
+    """Непустые значения фильтра без дублей, с сохранением порядка."""
+    if not values:
+        return ()
+    return tuple(dict.fromkeys(v for v in (value.strip() for value in values) if v))
+
+
+class ActiveFilter(StrEnum):
+    """Состояние упражнения в каталоге.
+
+    Отдельное перечисление вместо `bool | None`: пустая строка в
+    `?is_active=` отклонялась как невалидный bool, и «показать все» приходилось
+    выражать отсутствием параметра — то есть значение по умолчанию нельзя было
+    переопределить осознанно.
+    """
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    ALL = "all"
+
+
+class MediaFilter(StrEnum):
+    """Наличие фотографий у упражнения."""
+
+    WITH = "with"
+    WITHOUT = "without"
+    ALL = "all"
+
+
 @router.get("/exercises")
 async def list_exercises(
     _: Annotated[AuthenticatedUser, Depends(require_viewer)],
     search: Annotated[str | None, Query(max_length=100)] = None,
-    exercise_type: Annotated[str | None, Query(max_length=64)] = None,
-    difficulty: Annotated[str | None, Query(max_length=32)] = None,
-    equipment: Annotated[str | None, Query(max_length=64)] = None,
+    exercise_type: Annotated[list[str] | None, Query()] = None,
+    difficulty: Annotated[list[str] | None, Query()] = None,
+    equipment: Annotated[list[str] | None, Query()] = None,
+    primary_muscle: Annotated[list[str] | None, Query()] = None,
+    force: Annotated[list[str] | None, Query()] = None,
+    mechanic: Annotated[list[str] | None, Query()] = None,
+    # По умолчанию — только активные: из них собираются программы. Значение
+    # `all` нужно администратору, иначе «упражнений 873» в сводке не сходилось
+    # бы со списком, где отключённые скрыты.
+    is_active: Annotated[ActiveFilter, Query()] = ActiveFilter.ACTIVE,
+    media: Annotated[MediaFilter, Query()] = MediaFilter.ALL,
+    sort_by: Annotated[ExerciseSort, Query()] = ExerciseSort.NAME,
+    order: Annotated[SortOrder, Query()] = SortOrder.ASC,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    with_facets: Annotated[bool, Query()] = False,
 ) -> dict:
-    stmt = select(ExerciseRow).where(ExerciseRow.is_active.is_(True))
-    if search:
-        like = f"%{search}%"
-        stmt = stmt.where(ExerciseRow.name.ilike(like) | ExerciseRow.name_ru.ilike(like))
-    if exercise_type:
-        stmt = stmt.where(ExerciseRow.exercise_type == exercise_type)
-    if difficulty:
-        stmt = stmt.where(ExerciseRow.difficulty == difficulty)
-    if equipment:
-        stmt = stmt.where(ExerciseRow.equipment.contains([equipment]))
+    """Страница каталога с серверными фильтрами, сортировкой и счётчиками.
 
-    async with get_session_factory()() as session:
-        total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
-        rows = (
-            (await session.execute(stmt.order_by(ExerciseRow.name).limit(limit).offset(offset)))
-            .scalars()
-            .all()
+    Фильтры и сортировка выполняются в базе, а не на клиенте: 873 упражнения
+    можно передать целиком, но тогда «первые 50 по алфавиту» и «первые 50
+    сложных» — разные выборки, а фильтр применялся бы к произвольной части
+    каталога.
+
+    `with_facets=true` добавляет число упражнений по каждому значению признака
+    в текущей выборке. Счётчики считаются по тому же фильтру, что и список:
+    иначе они обещали бы результаты, которых после уточнения фильтра нет.
+    """
+    query = ExerciseQuery(
+        search=search,
+        exercise_types=_clean(exercise_type),
+        difficulties=_clean(difficulty),
+        equipment=_clean(equipment),
+        primary_muscles=_clean(primary_muscle),
+        forces=_clean(force),
+        mechanics=_clean(mechanic),
+        is_active=None
+        if is_active is ActiveFilter.ALL
+        else is_active is ActiveFilter.ACTIVE,
+        has_media=None if media is MediaFilter.ALL else media is MediaFilter.WITH,
+    )
+    repository = build_exercise_repository()
+    try:
+        total, rows = await repository.search_rows(
+            query,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by.value,
+            descending=order is SortOrder.DESC,
         )
-    return {
+        facets = asdict(await repository.facets(query)) if with_facets else None
+    except ProfilePersistenceError as exc:
+        raise HTTPException(status_code=422, detail=safe_error_message(exc)) from exc
+
+    payload: dict = {
         "total": total,
+        "limit": limit,
+        "offset": offset,
         "items": [
             {
-                "id": r.id,
-                "external_id": r.external_id,
-                "name": r.name,
-                "name_ru": r.name_ru,
-                "equipment": r.equipment or [],
-                "primary_muscles": r.primary_muscles or [],
-                "difficulty": r.difficulty,
-                "exercise_type": r.exercise_type,
-                "source": r.source,
-                "is_active": r.is_active,
+                # Surrogate id остаётся в списке: по нему открывается карточка
+                # (`/exercises/{id}`). Каноническим идентификатором остаётся
+                # (external_id, source) — на него ссылаются программы.
+                "id": row.id,
+                "external_id": row.external_id,
+                "name": row.name,
+                "name_ru": row.name_ru,
+                "equipment": row.equipment or [],
+                "primary_muscles": row.primary_muscles or [],
+                "secondary_muscles": row.secondary_muscles or [],
+                "difficulty": row.difficulty,
+                "exercise_type": row.exercise_type,
+                "force": row.force,
+                "mechanic": row.mechanic,
+                "source": row.source,
+                "is_active": row.is_active,
+                "has_media": bool(row.images),
             }
-            for r in rows
+            for row in rows
         ],
     }
+    if facets is not None:
+        payload["facets"] = facets
+    return payload
 
 
 def _serialize_exercise(row: ExerciseRow, media_items: list[dict] | None = None) -> dict:

@@ -269,7 +269,11 @@ class AIProgramGenerator:
         validator: ProgramValidator | None = None,
         max_repair_attempts: int = MAX_REPAIR_ATTEMPTS,
         total_budget_seconds: int = DEFAULT_TOTAL_BUDGET_SECONDS,
-        attempt_recorder: Callable[[list[ModelAttempt]], Awaitable[None]] | None = None,
+        # Второй аргумент — версия инструкции, с которой шла генерация. Без неё
+        # журнал попыток не позволяет сравнить формулировки: по нему видно, что
+        # ответ не прошёл проверку, но не видно, какая инструкция это вызвала.
+        attempt_recorder: Callable[[list[ModelAttempt], int | None], Awaitable[None]]
+        | None = None,
     ) -> None:
         self._gateway = gateway
         self._prompts = prompt_loader
@@ -370,7 +374,7 @@ class AIProgramGenerator:
                 continue
 
             attempts.append(attempt)
-            await self._record_attempts(attempts)
+            await self._record_attempts(attempts, actual_version)
 
             # 5. Заполняем AI-метаданные
             program.generation.source = GenerationSource.AI
@@ -391,7 +395,7 @@ class AIProgramGenerator:
             )
             return program
 
-        await self._record_attempts(attempts)
+        await self._record_attempts(attempts, actual_version)
         logger.error(
             "event=ai_generation_exhausted",
             extra={
@@ -640,7 +644,9 @@ class AIProgramGenerator:
             detail=safe_error_message(error)[:300] if error is not None else None,
         )
 
-    async def _record_attempts(self, attempts: list[ModelAttempt]) -> None:
+    async def _record_attempts(
+        self, attempts: list[ModelAttempt], prompt_version: int | None
+    ) -> None:
         """Пишет историю попыток в журнал администратора.
 
         Журнал не должен ломать генерацию: сбой записи только логируется.
@@ -648,7 +654,7 @@ class AIProgramGenerator:
         if self._attempt_recorder is None or not attempts:
             return
         try:
-            await self._attempt_recorder(list(attempts))
+            await self._attempt_recorder(list(attempts), prompt_version)
         except Exception:  # noqa: BLE001 — телеметрия не критична для генерации
             logger.exception("Не удалось записать историю попыток AI-моделей")
 
