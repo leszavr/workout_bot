@@ -515,3 +515,47 @@ class AdminIdentityRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class ComponentInstanceRow(Base):
+    """Зарегистрированный экземпляр распределённого компонента.
+
+    Хранится только metadata. Никаких credentials здесь быть не может:
+    содержимое строки целиком отдаётся Admin API.
+
+    Уникален `component_id`, а не `component_type`: экземпляров одного типа
+    может быть несколько (`telegram-eu-1`, `telegram-eu-2`), и второй не
+    должен затирать первый.
+
+    `capabilities` — JSONB-список строк. Отдельная таблица связей здесь была бы
+    лишней: набор возможностей приходит целиком в каждом heartbeat и не
+    существует независимо от компонента. Тип указан явно, а не через
+    `Mapped[list]`: по умолчанию SQLAlchemy взял бы `JSON`, и модель разошлась
+    бы с миграцией.
+
+    `last_heartbeat_at` намеренно отделён от `updated_at`: heartbeat приходит
+    каждую минуту и без изменения metadata, а `updated_at` показывает, когда
+    компонент действительно изменился (новая версия, контракт, capabilities).
+    """
+
+    __tablename__ = "component_instances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    component_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    component_type: Mapped[str] = mapped_column(String(32), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    region: Mapped[str] = mapped_column(String(32), default="RU")
+    version: Mapped[str] = mapped_column(String(32))
+    build_sha: Mapped[str | None] = mapped_column(String(40))
+    contract_version: Mapped[int] = mapped_column(Integer)
+    capabilities: Mapped[list] = mapped_column(JSONB, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="healthy", index=True)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

@@ -205,6 +205,26 @@ Bot API не сообщает об открытии присланного до�
 
 **Важно:** 1.2-0 не реализует Connector Registry, Admin CRUD или runtime hot-swap. Это архитектурный baseline и deployment gate.
 
+### 1.2-0.1 — Component Registry & compatibility: ГОТОВО
+
+Компоненты (backend, admin web, telegram gateway) разворачиваются независимо, поэтому Backend должен знать, какая версия каждого фактически работает, и уметь ответить до деплоя, не сломает ли обновление уже развёрнутые компоненты. Отчёт — `docs/infrastructure/COMPONENT_CONNECTOR_ARCHITECTURE_REPORT.md`.
+
+- [x] `/version` у backend и machine-readable metadata компонента;
+- [x] Component Registry в PostgreSQL (миграция `0011`), только metadata без credentials;
+- [x] идемпотентная регистрация/heartbeat через `/internal/v1` с отдельным service-токеном;
+- [x] compatibility engine: контракт как критерий совместимости, git SHA и равенство версий не требуются;
+- [x] множество поддерживаемых контрактов у backend — модель EXPAND → MIGRATE → CONTRACT;
+- [x] deployment safety gate `SAFE`/`BLOCKED` для CI;
+- [x] `deploy/release-manifest.json`, сверяемый тестом с контрактами в коде;
+- [x] connector-абстракция через capability (готовность к MAX Gateway без ветвления по типу);
+- [x] раздел «Инфраструктура» в админке;
+- [x] несколько экземпляров одного типа (`telegram-eu-1`, `telegram-eu-2`);
+- [x] staging deployment и проверка heartbeat/реестра/EU routing;
+- [ ] включить `/internal/v1/deployment-safety` в CI как обязательный шаг перед деплоем backend;
+- [ ] вынести Gateway → Backend взаимодействие за HTTP-границу (остаётся deployment blocker целевой topology).
+
+**Важно:** MAX Gateway, CRUD коннекторов и универсальное управление PostgreSQL/Redis/MinIO/SMTP через админку по-прежнему не реализуются.
+
 ### 1.3 Operations and security
 - [ ] structured logging и correlation IDs;
 - [ ] error tracking/metrics;

@@ -14,6 +14,10 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set in .env}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set in .env}
       MEDIA_BUCKET: ${MEDIA_BUCKET:-workout-media}
+      # Внутри compose backend доступен по имени сервиса, а не по localhost из
+      # .env, поэтому адрес регистрации переопределяется здесь.
+      BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://backend:8000}
+      BUILD_SHA: ${BUILD_SHA:-}
     volumes:
       - bot-data:/app/data
     depends_on:
@@ -40,6 +44,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set in .env}
       MEDIA_BUCKET: ${MEDIA_BUCKET:-workout-media}
       MEDIA_PUBLIC_BASE_URL: ${MEDIA_PUBLIC_BASE_URL:-http://localhost:8000}
+      BUILD_SHA: ${BUILD_SHA:-}
     volumes:
       - bot-data:/app/data
     ports:

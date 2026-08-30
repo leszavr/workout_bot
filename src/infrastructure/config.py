@@ -64,6 +64,23 @@ AUTO_GENERATE_PROGRAM_AFTER_FINALIZE = (
     os.getenv("AUTO_GENERATE_PROGRAM_AFTER_FINALIZE", "true").lower() in ("1", "true", "yes")
 )
 
+# --- Распределённые компоненты (Component Registry) ---------------------------
+# Компоненты разворачиваются независимо и в разных сегментах сети (RU/EU),
+# поэтому каждый экземпляр должен уметь назвать себя. Значения по умолчанию
+# рассчитаны на локальную разработку с одним экземпляром каждого типа.
+BUILD_SHA = os.getenv("BUILD_SHA", "")
+COMPONENT_REGION = os.getenv("COMPONENT_REGION", "RU")
+# Идентификатор экземпляра Telegram Gateway. Разные экземпляры одного типа
+# обязаны иметь разные значения, иначе они перезапишут друг друга в реестре.
+TELEGRAM_COMPONENT_ID = os.getenv("TELEGRAM_COMPONENT_ID", "telegram-local-1")
+TELEGRAM_COMPONENT_NAME = os.getenv("TELEGRAM_COMPONENT_NAME", "Telegram Gateway")
+# Адрес Backend для регистрации и heartbeat. Пусто — компонент работает без
+# регистрации (локальная разработка): реестр не должен быть условием запуска.
+BACKEND_INTERNAL_URL = os.getenv("BACKEND_INTERNAL_URL", "")
+# Общий секрет service-to-service вызовов внутреннего API. Пусто — internal
+# API отвечает 503: принимать неаутентифицированные heartbeat нельзя.
+INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
 DEFAULT_TIMEZONE = "UTC"
 MAX_TEXT_LENGTH = 2000
 MAX_PHOTOS = 10

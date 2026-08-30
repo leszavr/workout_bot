@@ -1259,6 +1259,90 @@ export const aiApi = {
     request<AnalyticsFilterOptions>("/api/v1/admin/ai/analytics/filters"),
 };
 
+// --- Инфраструктура: компоненты (Component Registry) -----------------------------
+//
+// Список приходит с сервера целиком, включая вердикт совместимости: интерфейс
+// не сравнивает версии сам. Иначе фронтенд стал бы вторым источником правил
+// совместимости и со временем расходился бы с backend.
+
+export type ComponentCompatibilityState =
+  | "unknown"
+  | "healthy"
+  | "compatible"
+  | "update_recommended"
+  | "update_required"
+  | "incompatible"
+  | "offline";
+
+export interface ComponentItem {
+  component_id: string;
+  component_type: string;
+  name: string;
+  region: string;
+  version: string;
+  build_sha: string | null;
+  contract_version: number;
+  supported_contracts: number[];
+  capabilities: string[];
+  status: string;
+  compatibility_state: ComponentCompatibilityState;
+  compatibility_detail: string;
+  required_contract?: number | null;
+  min_version?: string | null;
+  last_heartbeat_at: string | null;
+  registered_at: string | null;
+  // Backend описывает себя сам и в реестре не хранится.
+  self_reported: boolean;
+}
+
+export interface ComponentRequirementInfo {
+  supported_contracts: number[];
+  required_contract: number;
+  min_version: string;
+  recommended_version: string | null;
+}
+
+export interface ComponentsResponse extends ListResponse<ComponentItem> {
+  backend: {
+    version: string;
+    build_sha: string | null;
+    contract_version: number;
+    supported_contracts: number[];
+  };
+  requirements: Record<string, ComponentRequirementInfo>;
+}
+
+export interface DeploymentSafetyVerdict {
+  component_id: string;
+  component_type: string;
+  state: ComponentCompatibilityState;
+  contract_version: number | null;
+  required_contract: number | null;
+  supported_contracts: number[];
+  version: string | null;
+  min_version: string | null;
+  detail: string;
+}
+
+export interface DeploymentSafetyReport {
+  result: "SAFE" | "BLOCKED";
+  generated_at: string;
+  backend_version: string;
+  backend_contracts: number[];
+  blocking: DeploymentSafetyVerdict[];
+  verdicts: DeploymentSafetyVerdict[];
+}
+
+export const componentsApi = {
+  list: () => request<ComponentsResponse>("/api/v1/admin/components"),
+  deploymentSafety: () =>
+    request<DeploymentSafetyReport>("/api/v1/admin/components/deployment-safety"),
+  forget: (componentId: string) =>
+    request<void>(`/api/v1/admin/components/${encodeURIComponent(componentId)}`, {
+      method: "DELETE",
+    }),
+};
+
 // --- AI Providers для UI (публичный API) ----------------------------------------
 
 export interface AIProviderForUI {
