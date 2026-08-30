@@ -286,7 +286,38 @@ Endpoint доступен по service-токену, потому что его 
   независимыми вердиктами;
 - манифест: соответствие кода и `release-manifest.json`.
 
-## 13. Дальнейшие шаги
+## 13. Staging deployment (30.08.2026)
+
+Хост `192.168.1.3`, `BUILD_SHA=13913fd`. Процедура — по
+`STAGING_ADMIN_ANALYTICS_DEPLOYMENT.md`: rsync → build трёх образов → миграция
+из свежесобранного образа (`run --rm --no-deps backend alembic upgrade head`) →
+`up -d`.
+
+В `staging-app.env` добавлены `INTERNAL_SERVICE_TOKEN` (сгенерирован
+`openssl rand -hex 32` на самом хосте, в Git не попадает),
+`BACKEND_INTERNAL_URL=http://backend:8000`, `TELEGRAM_COMPONENT_ID=telegram-eu-1`,
+`TELEGRAM_REGION=EU`, `BACKEND_REGION=RU`. Прежний файл сохранён как
+`staging-app.env.bak.*`, режим 0600. S1-инфраструктура (postgres/redis/minio) не
+перезапускалась, volumes не затрагивались.
+
+| Проверка | Результат |
+| --- | --- |
+| Миграция | `0010 → 0011` применена |
+| `/health`, `/ready` | `ok`, `storage: true` |
+| `/version` | `2.2.0`, `build_sha=13913fd`, contract `v1` |
+| Heartbeat Gateway | `event=component_heartbeat_ok state=compatible`, HTTP 200 |
+| Реестр | `telegram-eu-1`, region `EU`, capabilities `telegram_polling`+`telegram_delivery` |
+| Deployment safety | `SAFE`, `blocking: []` |
+| Admin API | `/api/v1/admin/components` → 2 записи (backend self-reported + Gateway) |
+| Admin UI | `/infrastructure` → 200 |
+| EU routing | `ip rule ... from 172.18.0.20 lookup 51820` на месте, IP бота `172.18.0.20`, `api.telegram.org` отвечает 302 из контейнера |
+| `RestartCount` | 0 у всех трёх контейнеров |
+
+Полный destructive E2E не выполнялся: изменения не затрагивают генерацию,
+доставку и данные. Проверялся только контур, добавленный этим этапом, плюс
+регрессия health/routing/restart.
+
+## 14. Дальнейшие шаги
 
 1. Вынести Gateway → Backend взаимодействие за HTTP-границу (единственный
    оставшийся deployment blocker целевой topology);
