@@ -549,3 +549,56 @@ export function shortDateTime(value: string | null | undefined): string {
     hour: "2-digit",
   });
 }
+
+// --- Инфраструктура: компоненты ---------------------------------------------------
+
+export const COMPONENT_TYPE_LABELS: Record<string, string> = {
+  backend: "Сервер",
+  admin_web: "Веб-интерфейс",
+  telegram_gateway: "Шлюз Telegram",
+  worker: "Фоновый обработчик",
+  max_gateway: "Шлюз MAX",
+  smtp_connector: "Почтовый коннектор",
+};
+
+export function componentTypeLabel(value: string): string {
+  return COMPONENT_TYPE_LABELS[value] ?? value;
+}
+
+export const CAPABILITY_LABELS: Record<string, string> = {
+  telegram_polling: "приём сообщений Telegram",
+  telegram_delivery: "отправка в Telegram",
+};
+
+export function capabilityLabel(value: string): string {
+  return CAPABILITY_LABELS[value] ?? value;
+}
+
+export const COMPONENT_STATE_LABELS: Record<string, string> = {
+  unknown: "не проверено",
+  healthy: "работает",
+  compatible: "совместим",
+  update_recommended: "есть обновление",
+  update_required: "требуется обновление",
+  incompatible: "несовместим",
+  offline: "не отвечает",
+};
+
+export function componentStateLabel(value: string): string {
+  return COMPONENT_STATE_LABELS[value] ?? value;
+}
+
+/**
+ * Тон состояния компонента. `update_required` и `incompatible` — красные:
+ * это отказ работы, а не предупреждение. `offline` — тоже красный: компонент
+ * не выполняет свою функцию.
+ */
+export function componentStateTone(
+  value: string
+): "ok" | "warn" | "bad" | "neutral" {
+  if (value === "compatible" || value === "healthy") return "ok";
+  if (value === "update_recommended") return "warn";
+  if (value === "update_required" || value === "incompatible" || value === "offline")
+    return "bad";
+  return "neutral";
+}
