@@ -14,8 +14,8 @@ from __future__ import annotations
 import asyncio
 from typing import Protocol
 
+from src.application.programs.session_planning import plan_session
 from src.domain.enums import (
-    ExperienceLevel,
     PrimaryGoal,
     ProgramStatus,
     movement_restriction_title,
@@ -81,18 +81,6 @@ def classify_role(exercise: Exercise) -> str:
 
 # --- Параметры нагрузки по цели -------------------------------------------------
 
-# goal → (sets, reps_min, reps_max, rest_seconds)
-GOAL_PRESCRIPTIONS: dict[PrimaryGoal | None, tuple[int, int, int, int]] = {
-    PrimaryGoal.STRENGTH: (4, 4, 6, 150),
-    PrimaryGoal.MUSCLE_GAIN: (3, 8, 12, 75),
-    PrimaryGoal.WEIGHT_LOSS: (3, 12, 15, 60),
-    PrimaryGoal.ENDURANCE: (3, 15, 20, 45),
-    PrimaryGoal.HEALTH_FITNESS: (2, 10, 15, 60),
-    PrimaryGoal.RETURN_TO_TRAINING: (2, 10, 12, 75),
-    PrimaryGoal.OTHER: (3, 10, 12, 75),
-    None: (3, 10, 12, 75),
-}
-
 # Цель → приоритет ролей при ранжировании (чем раньше, тем выше приоритет).
 GOAL_ROLE_PRIORITY: dict[PrimaryGoal | None, tuple[str, ...]] = {
     PrimaryGoal.STRENGTH: (ROLE_LEG, ROLE_PUSH, ROLE_PULL, ROLE_CORE, ROLE_CARDIO, ROLE_OTHER),
@@ -117,18 +105,101 @@ GOAL_DURATION_WEEKS: dict[PrimaryGoal | None, int] = {
     None: 8,
 }
 
-# Опыт → максимальная сложность выбираемых упражнений уже учтена фильтром;
-# здесь опыт влияет на объём тренировки.
-EXPERIENCE_EXERCISES_PER_DAY: dict[ExperienceLevel | None, int] = {
-    ExperienceLevel.NEVER: 4,
-    ExperienceLevel.LONG_BREAK: 4,
-    ExperienceLevel.UNDER_3_MONTHS: 5,
-    ExperienceLevel.THREE_TWELVE_MONTHS: 6,
-    ExperienceLevel.OVER_1_YEAR: 6,
-    None: 5,
+
+
+# --- Схемы сплита по числу занятий ----------------------------------------------
+#
+# От числа занятий зависит, сколько раз за неделю мышечная группа получает
+# нагрузку, — это и есть смысл сплита. Раньше схемы не было: первые два дня были
+# осмысленными, а третий и последующие копировали full body, поэтому при шести
+# занятиях человек получал четыре одинаковых дня.
+#
+# Схемы соответствуют методике (раздел 1.1): «условно разделить тело на 2 части»
+# при малом числе занятий, на 3 при большем. Полный разбор —
+# docs/methodology/TRAINING_PRINCIPLES.md.
+
+_FULL_BODY = ("Всё тело", (ROLE_LEG, ROLE_PUSH, ROLE_PULL, ROLE_CORE, ROLE_CARDIO))
+_UPPER = ("Верх тела", (ROLE_PUSH, ROLE_PULL, ROLE_CORE))
+_LOWER = ("Низ тела", (ROLE_LEG, ROLE_CORE, ROLE_CARDIO))
+_PUSH = ("Жимовые движения", (ROLE_PUSH, ROLE_CORE))
+_PULL = ("Тяговые движения", (ROLE_PULL, ROLE_CORE))
+_LEGS = ("Ноги", (ROLE_LEG, ROLE_CORE))
+_CARDIO_CORE = ("Кардио и корпус", (ROLE_CARDIO, ROLE_CORE, ROLE_LEG))
+
+DaySchema = tuple[str, tuple[str, ...]]
+
+
+def _one_or_two_days(sessions: int) -> list[DaySchema]:
+    """Одно-два занятия: только full body.
+
+    Делить тело на части бессмысленно: при двух занятиях каждая часть получала бы
+    нагрузку раз в неделю, чего недостаточно для любой цели.
+    """
+    return [_FULL_BODY] * sessions
+
+
+def _three_days(_: int) -> list[DaySchema]:
+    """Три занятия: жим — тяга — ноги.
+
+    Классический трёхдневный сплит: каждая группа раз в неделю, но с полным
+    объёмом за занятие.
+    """
+    return [_PUSH, _PULL, _LEGS]
+
+
+def _four_days(_: int) -> list[DaySchema]:
+    """Четыре занятия: верх — низ — верх — низ.
+
+    Каждая часть тела дважды в неделю: при четырёх занятиях это даёт лучшую
+    частоту стимуляции, чем деление на четыре отдельные группы.
+    """
+    return [_UPPER, _LOWER, _UPPER, _LOWER]
+
+
+def _five_days(_: int) -> list[DaySchema]:
+    """Пять занятий: жим — тяга — ноги — верх — низ."""
+    return [_PUSH, _PULL, _LEGS, _UPPER, _LOWER]
+
+
+def _six_days(_: int) -> list[DaySchema]:
+    """Шесть занятий: два круга «жим — тяга — ноги».
+
+    Каждая группа дважды в неделю — режим, для которого шесть занятий и нужны.
+    """
+    return [_PUSH, _PULL, _LEGS, _PUSH, _PULL, _LEGS]
+
+
+def _seven_days(_: int) -> list[DaySchema]:
+    """Семь занятий: два круга «жим — тяга — ноги» и день кардио с корпусом.
+
+    Седьмой день не повторяет силовую работу: ежедневная силовая нагрузка без
+    выходного не оставляет времени на восстановление.
+    """
+    return [_PUSH, _PULL, _LEGS, _PUSH, _PULL, _LEGS, _CARDIO_CORE]
+
+
+SPLIT_SCHEMES = {
+    1: _one_or_two_days,
+    2: _one_or_two_days,
+    3: _three_days,
+    4: _four_days,
+    5: _five_days,
+    6: _six_days,
+    7: _seven_days,
+    # Значение по умолчанию: full body по числу занятий. Недостижимо при текущих
+    # границах, но оставлено, чтобы расширение диапазона в анкете не приводило к
+    # исключению вместо программы.
+    None: _one_or_two_days,
 }
 
+
 MIN_POOL_SIZE = 4
+
+# Границы числа тренировок в неделю. Верхняя совпадает с ограничением домена
+# (`WorkoutProgram.training_days_per_week` ≤ 7): генератор не вправе сужать то,
+# что анкета уже разрешила выбрать.
+MAX_SESSIONS_PER_WEEK = 7
+DEFAULT_SESSIONS_PER_WEEK = 3
 
 
 class ProgramGenerator(Protocol):
@@ -184,10 +255,21 @@ class DeterministicProgramGenerator:
 
     @staticmethod
     def _sessions_per_week(profile: FitnessProfile) -> int:
+        """Число тренировок из анкеты, без обрезки.
+
+        Раньше здесь стояло `min(requested, 5)`, и человек, выбравший шесть
+        занятий, получал пять — молча, без объяснения. Ограничение осталось от
+        Stage 3A и продуктовым не было: анкета предлагает до шести, домен
+        допускает до семи, а ИИ на тех же профилях собирал шесть дней корректно.
+
+        Верхняя граница — предел домена (`training_days_per_week` ≤ 7), а не
+        решение генератора: назначать её здесь значило бы второй раз решать
+        вопрос, уже решённый в анкете.
+        """
         requested = profile.training_plan_preferences.sessions_per_week
         if requested <= 0:
-            requested = 3
-        return max(1, min(requested, 5))
+            requested = DEFAULT_SESSIONS_PER_WEEK
+        return max(1, min(requested, MAX_SESSIONS_PER_WEEK))
 
     # --- Построение дней ---------------------------------------------------------
 
@@ -197,50 +279,39 @@ class DeterministicProgramGenerator:
         pool: SafeExercisePool,
         sessions: int,
     ) -> list[TrainingDay]:
+        """Строит дни по схеме сплита, соответствующей числу занятий.
+
+        Раньше третий и последующие дни были копиями full body: при шести
+        занятиях человек получал два осмысленных дня и четыре одинаковых. Схема
+        выбирается по числу дней, потому что от него зависит, сколько раз за
+        неделю мышечная группа получает нагрузку — а это и есть смысл сплита.
+
+        Объём и нагрузка берутся из расчёта занятия (`session_planning`): он
+        учитывает заявленное время, цель и опыт. Прежние таблицы
+        «опыт → N упражнений» и «цель → подходы» давали объём, не связанный со
+        временем: при заявленных 90 минутах собиралось занятие на 44.
+        """
         by_role = self._group_by_role(profile, pool)
-        goal = profile.goals.primary
-        sets, reps_min, reps_max, rest = GOAL_PRESCRIPTIONS.get(goal, (3, 10, 12, 75))
-        per_day = EXPERIENCE_EXERCISES_PER_DAY.get(
-            profile.training_background.experience_level, 5
-        )
+        plan = plan_session(profile)
+        prescription = plan.prescription
+        per_day = plan.exercises
 
-        if sessions <= 2:
-            return [
-                self._full_body_day(i, by_role, pool, per_day, sets, reps_min, reps_max, rest)
-                for i in range(1, sessions + 1)
-            ]
-
-        days: list[TrainingDay] = [
+        schema = SPLIT_SCHEMES.get(sessions, SPLIT_SCHEMES[None])
+        return [
             self._split_day(
-                1,
-                "Ноги и жимовые движения",
-                (ROLE_LEG, ROLE_PUSH, ROLE_CORE),
+                index,
+                title,
+                roles,
                 by_role,
                 pool,
                 per_day,
-                sets,
-                reps_min,
-                reps_max,
-                rest,
-            ),
-            self._split_day(
-                2,
-                "Тяговые движения и корпус",
-                (ROLE_PULL, ROLE_CORE, ROLE_CARDIO),
-                by_role,
-                pool,
-                per_day,
-                sets,
-                reps_min,
-                reps_max,
-                rest,
-            ),
-        ]
-        for i in range(3, sessions + 1):
-            days.append(
-                self._full_body_day(i, by_role, pool, per_day, sets, reps_min, reps_max, rest)
+                prescription.sets,
+                prescription.reps_min,
+                prescription.reps_max,
+                prescription.rest_seconds,
             )
-        return days
+            for index, (title, roles) in enumerate(schema(sessions), start=1)
+        ]
 
     def _group_by_role(
         self, profile: FitnessProfile, pool: SafeExercisePool
