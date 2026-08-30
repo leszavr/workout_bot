@@ -855,13 +855,18 @@ class TestAttemptTelemetry:
             prompt_loader=FakePromptLoader(),
             validator=ProgramValidator(),
             max_repair_attempts=1,
-            attempt_recorder=lambda attempts: _collect(recorded, attempts),
+            attempt_recorder=lambda attempts, prompt_version: _collect(
+                recorded, attempts, prompt_version
+            ),
         )
 
         await generator.generate(profile, pool)
 
         assert len(recorded) == 1
-        attempts = AIProgramGenerator.attempts_metadata(recorded[0])
+        recorded_attempts, recorded_version = recorded[0]
+        # Версия инструкции обязана попасть в журнал вместе с попытками.
+        assert recorded_version == 1
+        attempts = AIProgramGenerator.attempts_metadata(recorded_attempts)
         assert [a["model_id"] for a in attempts] == ["model-a", "model-b"]
 
         first, second = attempts
@@ -889,13 +894,15 @@ class TestAttemptTelemetry:
             gateway=gateway,
             prompt_loader=FakePromptLoader(),
             validator=ProgramValidator(),
-            attempt_recorder=lambda attempts: _collect(recorded, attempts),
+            attempt_recorder=lambda attempts, prompt_version: _collect(
+                recorded, attempts, prompt_version
+            ),
         )
 
         with pytest.raises(AIProviderError):
             await generator.generate(profile, pool)
 
-        attempts = AIProgramGenerator.attempts_metadata(recorded[0])
+        attempts = AIProgramGenerator.attempts_metadata(recorded[0][0])
         assert attempts[0]["outcome"] == "provider_error"
         assert attempts[0]["error_type"] == "AIProviderError"
 
@@ -905,7 +912,7 @@ class TestAttemptTelemetry:
         pool = make_safe_pool()
         profile = make_profile()
 
-        async def _broken(_attempts):
+        async def _broken(_attempts, _prompt_version):
             raise RuntimeError("audit is down")
 
         generator = AIProgramGenerator(
@@ -919,8 +926,10 @@ class TestAttemptTelemetry:
         assert program.title == "AI Test Program"
 
 
-async def _collect(sink: list, attempts) -> None:
-    sink.append(attempts)
+async def _collect(sink: list, attempts, prompt_version) -> None:
+    # Версия инструкции пишется рядом с попытками: без неё журнал не отвечает,
+    # какая формулировка привела к отказу.
+    sink.append((attempts, prompt_version))
 
 
 # --- PromptLoader: единственный источник инструкций --------------------------------

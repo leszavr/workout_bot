@@ -423,6 +423,10 @@ class AIUsageRecordRow(Base):
     )
     profile_id: Mapped[str | None] = mapped_column(String(64), index=True)
     program_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    # Операция генерации, в рамках которой сделан вызов. Не внешний ключ:
+    # journal переживает удаление анкеты, а `generation_jobs` уходит вместе с
+    # ней каскадом — FK уничтожил бы историю вызовов.
+    job_id: Mapped[str | None] = mapped_column(String(64), index=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     total_tokens: Mapped[int | None] = mapped_column(Integer)

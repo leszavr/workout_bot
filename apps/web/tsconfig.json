@@ -10,6 +10,11 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
+    // Тесты запускаются встроенным test runner Node, который разрешает импорт
+    // только по точному пути файла (`./api.ts`). Без этого флага компилятор
+    // отвергал бы такой импорт, хотя во время выполнения верен именно он;
+    // на сборку Next это не влияет — она идёт через собственный резолвер.
+    "allowImportingTsExtensions": true,
     "jsx": "preserve",
     "incremental": true,
     "plugins": [

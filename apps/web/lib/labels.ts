@@ -405,3 +405,147 @@ export const ROLE_HINTS: Record<string, string> = {
 export function roleHint(role: string): string {
   return ROLE_HINTS[role] ?? "";
 }
+
+// --- Аналитика генерации -------------------------------------------------------
+//
+// Единица анализа — операция генерации: попытка построить программу. Программа
+// существует только при успехе, поэтому «генераций» и «программ» — разные числа,
+// и подписи не должны их смешивать.
+
+export const GENERATION_STATUS_LABELS: Record<string, string> = {
+  pending: "ожидает",
+  running: "выполняется",
+  succeeded: "успешно",
+  failed: "ошибка",
+};
+
+export function generationStatusLabel(status: string): string {
+  return GENERATION_STATUS_LABELS[status] ?? status;
+}
+
+export function generationStatusTone(
+  status: string,
+): "ok" | "warn" | "bad" | "neutral" {
+  if (status === "succeeded") return "ok";
+  if (status === "running" || status === "pending") return "warn";
+  if (status === "failed") return "bad";
+  return "neutral";
+}
+
+export const GENERATION_TRIGGER_LABELS: Record<string, string> = {
+  auto_finalization: "после подтверждения анкеты",
+  admin_request: "запрос администратора",
+};
+
+export function generationTriggerLabel(trigger: string): string {
+  return GENERATION_TRIGGER_LABELS[trigger] ?? trigger;
+}
+
+export const GENERATION_ERROR_LABELS: Record<string, string> = {
+  profile_not_found: "анкета не найдена",
+  validation_failed: "результат не прошёл проверку",
+  ai_not_configured: "ИИ не настроен",
+  ai_unsupported_protocol: "способ подключения не поддерживается",
+  ai_timeout: "ИИ не ответил вовремя",
+  ai_connection_failed: "не удалось соединиться с ИИ",
+  ai_rate_limited: "сервис ИИ ограничил число запросов",
+  ai_invalid_response: "ИИ вернул некорректный ответ",
+  ai_runtime_failure: "сбой при обращении к ИИ",
+  generation_failed: "не удалось собрать программу",
+  persistence_failed: "не удалось сохранить программу",
+  unexpected_error: "непредвиденная ошибка",
+};
+
+export function generationErrorLabel(code: string): string {
+  return GENERATION_ERROR_LABELS[code] ?? code;
+}
+
+export const VALIDATION_STATE_LABELS: Record<string, string> = {
+  valid: "принято сразу",
+  repaired: "принято после исправления",
+  failed: "не прошло проверку",
+};
+
+export function validationStateLabel(state: string): string {
+  return VALIDATION_STATE_LABELS[state] ?? state;
+}
+
+/** Названия показателей в сравнении версий инструкции. */
+export const METRIC_LABELS: Record<string, string> = {
+  success_rate: "Доля успешных генераций",
+  failure_rate: "Доля отказов",
+  validation_failure_rate: "Доля непройденных проверок",
+  fallback_rate: "Доля сборок без ИИ",
+  avg_duration_ms: "Среднее время генерации",
+  avg_latency_ms: "Средний ответ модели",
+};
+
+export function metricLabel(metric: string): string {
+  return METRIC_LABELS[metric] ?? metric;
+}
+
+export const TIME_BUCKET_LABELS: Record<string, string> = {
+  hour: "по часам",
+  day: "по дням",
+};
+
+// --- Форматирование значений ----------------------------------------------------
+
+/**
+ * Доля в процентах. `null` — это не ноль: значение показывается как «—»,
+ * потому что 0% означало бы «отказов не было», а не «считать не на чем».
+ */
+export function percent(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+/** Целое число или «—», если значения нет. */
+export function count(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  return value.toLocaleString("ru-RU");
+}
+
+/** Длительность из миллисекунд в человекочитаемый вид. */
+export function duration(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return "—";
+  if (ms < 1000) return `${ms} мс`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} с`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds - minutes * 60);
+  return rest ? `${minutes} мин ${rest} с` : `${minutes} мин`;
+}
+
+/** Дата и время в локальном формате; «—», если значения нет. */
+export function dateTime(value: string | null | undefined): string {
+  if (!value) return "—";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Только дата: для подписей осей графика, где время не нужно. */
+export function shortDate(value: string | null | undefined): string {
+  if (!value) return "—";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit" });
+}
+
+export function shortDateTime(value: string | null | undefined): string {
+  if (!value) return "—";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+  });
+}

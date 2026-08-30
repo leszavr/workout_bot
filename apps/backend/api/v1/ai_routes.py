@@ -11,12 +11,17 @@ request/response DTO; database-модели наружу не возвращаю
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
+from enum import StrEnum
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from apps.backend.api.v1.ai_dependencies import build_ai_components
+from apps.backend.api.v1.ai_dependencies import (
+    build_ai_components,
+    build_generation_analytics_service,
+)
 from apps.backend.auth import AuthenticatedUser, require_admin, require_viewer
 from src.application.ai.admin_service import AIDependencyError
 from src.domain.ai.config import (
@@ -29,7 +34,12 @@ from src.domain.ai.config import (
 )
 from src.domain.ai.enums import IMPLEMENTED_TASK_TYPES, AIProtocol, AITaskType
 from src.domain.ai.errors import AIConfigurationError, AIError
+from src.domain.enums import GenerationJobStatus, GenerationSource
+from src.domain.generation import GenerationTrigger
 from src.errors import ProfilePersistenceError, WorkoutBotError
+from src.infrastructure.persistence.postgres.analytics_repository import (
+    AnalyticsFilter,
+)
 
 router = APIRouter(prefix="/api/v1/admin/ai")
 
@@ -42,6 +52,60 @@ _UNPROCESSABLE = {422: {"description": "Validation or configuration error"}}
 _PROVIDER_NOT_FOUND = "Provider not found"
 _ENDPOINT_NOT_FOUND = "Endpoint not found"
 _MODEL_NOT_FOUND = "Model not found"
+
+
+# --- Параметры аналитики ---------------------------------------------------------
+#
+# Значения сортировки и группировки объявлены перечислениями, а не свободными
+# строками: они попадают в ORDER BY и GROUP BY, и произвольная строка из запроса
+# там означала бы и инъекцию, и выдачу внутренних имён колонок наружу. Ошибочное
+# значение FastAPI отклоняет с 422 сам, до обращения к базе.
+
+
+class SortOrder(StrEnum):
+    ASC = "asc"
+    DESC = "desc"
+
+
+class TimeBucket(StrEnum):
+    HOUR = "hour"
+    DAY = "day"
+
+
+class ValidationState(StrEnum):
+    """Итог проверки результата генерации."""
+
+    VALID = "valid"
+    FAILED = "failed"
+    REPAIRED = "repaired"
+
+
+class ModelSort(StrEnum):
+    USAGE = "usage"
+    SUCCESS_RATE = "success_rate"
+    FAILURE_RATE = "failure_rate"
+    FALLBACK_RATE = "fallback_rate"
+    AVG_LATENCY_MS = "avg_latency_ms"
+    REPAIR_ATTEMPTS = "repair_attempts"
+    MODEL = "model"
+
+
+class PromptSort(StrEnum):
+    PROMPT_VERSION = "prompt_version"
+    USAGE = "usage"
+    SUCCESS_RATE = "success_rate"
+    FAILURE_RATE = "failure_rate"
+    VALIDATION_FAILURES = "validation_failures"
+    FALLBACK_RATE = "fallback_rate"
+    AVG_DURATION_MS = "avg_duration_ms"
+    REPAIR_ATTEMPTS = "repair_attempts"
+
+
+class GenerationSort(StrEnum):
+    CREATED_AT = "created_at"
+    DURATION_MS = "duration_ms"
+    ATTEMPTS = "attempts"
+    STATUS = "status"
 
 
 # --- Request/Response DTO -------------------------------------------------------
@@ -1108,3 +1172,274 @@ async def refresh_infrastructure_health(
     components = build_ai_components()
     report = await components.health.refresh(components.gateway.test_endpoint)
     return asdict(report)
+
+
+# --- Analytics: качество генерации -------------------------------------------------
+#
+# Единица анализа — операция генерации (`generation_jobs`), а не программа:
+# программа существует только при успехе, и по ней не видно отказов.
+#
+# Доступ — `require_viewer`: это чтение агрегатов без персональных данных.
+# Идентификатор анкеты в списке генераций есть (иначе разобрать инцидент
+# невозможно), содержимого анкеты и программы — нет.
+
+
+def _analytics_filter(
+    date_from: datetime | None,
+    date_to: datetime | None,
+    provider: str | None,
+    model: str | None,
+    prompt_version: int | None,
+    generator: str | None,
+    result: str | None,
+    fallback: bool | None,
+    validation: str | None,
+    trigger: str | None,
+) -> AnalyticsFilter:
+    return AnalyticsFilter(
+        date_from=date_from,
+        date_to=date_to,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        generator=generator,
+        result=result,
+        fallback=fallback,
+        validation=validation,
+        trigger=trigger,
+    )
+
+
+@router.get("/analytics/overview")
+async def analytics_overview(
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+    date_from: Annotated[datetime | None, Query()] = None,
+    date_to: Annotated[datetime | None, Query()] = None,
+    provider: Annotated[str | None, Query(max_length=64)] = None,
+    model: Annotated[str | None, Query(max_length=200)] = None,
+    prompt_version: Annotated[int | None, Query(ge=1)] = None,
+    generator: Annotated[GenerationSource | None, Query()] = None,
+    result: Annotated[GenerationJobStatus | None, Query()] = None,
+    fallback: Annotated[bool | None, Query()] = None,
+    validation: Annotated[ValidationState | None, Query()] = None,
+    trigger: Annotated[GenerationTrigger | None, Query()] = None,
+) -> dict:
+    """Сводка по генерациям и отдельно по обращениям к ИИ.
+
+    Обращения не сводятся с генерациями в один показатель: одна генерация
+    делает от нуля до нескольких вызовов, поэтому «успешность вызовов» и
+    «успешность генераций» — разные величины.
+
+    Доли равны `null`, а не нулю, когда выборка пуста: 0% означало бы
+    «отказов не было», хотя генераций не было вовсе. Поле `sample` сообщает,
+    достаточно ли данных, чтобы опираться на проценты.
+    """
+    spec = _analytics_filter(
+        date_from, date_to, provider, model, prompt_version,
+        generator.value if generator else None,
+        result.value if result else None,
+        fallback,
+        validation.value if validation else None,
+        trigger.value if trigger else None,
+    )
+    return await build_generation_analytics_service().overview(spec)
+
+
+@router.get("/analytics/timeseries")
+async def analytics_timeseries(
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+    bucket: Annotated[TimeBucket, Query()] = TimeBucket.DAY,
+    date_from: Annotated[datetime | None, Query()] = None,
+    date_to: Annotated[datetime | None, Query()] = None,
+    provider: Annotated[str | None, Query(max_length=64)] = None,
+    model: Annotated[str | None, Query(max_length=200)] = None,
+    prompt_version: Annotated[int | None, Query(ge=1)] = None,
+    generator: Annotated[GenerationSource | None, Query()] = None,
+    result: Annotated[GenerationJobStatus | None, Query()] = None,
+    fallback: Annotated[bool | None, Query()] = None,
+    validation: Annotated[ValidationState | None, Query()] = None,
+    trigger: Annotated[GenerationTrigger | None, Query()] = None,
+) -> dict:
+    """Генерации по интервалам времени.
+
+    Интервалы без генераций в ряду отсутствуют: нуль в них означал бы
+    «пробовали и не вышло», хотя попыток не было. График рисует ряд как есть.
+    """
+    spec = _analytics_filter(
+        date_from, date_to, provider, model, prompt_version,
+        generator.value if generator else None,
+        result.value if result else None,
+        fallback,
+        validation.value if validation else None,
+        trigger.value if trigger else None,
+    )
+    items = await build_generation_analytics_service().timeseries(
+        spec, bucket=bucket.value
+    )
+    return {"bucket": bucket.value, "total": len(items), "items": items}
+
+
+@router.get("/analytics/models")
+async def analytics_models(
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+    sort_by: Annotated[ModelSort, Query()] = ModelSort.USAGE,
+    order: Annotated[SortOrder, Query()] = SortOrder.DESC,
+    date_from: Annotated[datetime | None, Query()] = None,
+    date_to: Annotated[datetime | None, Query()] = None,
+    provider: Annotated[str | None, Query(max_length=64)] = None,
+    model: Annotated[str | None, Query(max_length=200)] = None,
+    prompt_version: Annotated[int | None, Query(ge=1)] = None,
+    generator: Annotated[GenerationSource | None, Query()] = None,
+    result: Annotated[GenerationJobStatus | None, Query()] = None,
+    fallback: Annotated[bool | None, Query()] = None,
+    validation: Annotated[ValidationState | None, Query()] = None,
+    trigger: Annotated[GenerationTrigger | None, Query()] = None,
+) -> dict:
+    """Показатели по каждой модели, участвовавшей в генерациях.
+
+    Единица подсчёта — попытка модели: одна генерация обращается к нескольким
+    моделям, поэтому суммы здесь не совпадают со сводкой и не должны совпадать.
+    Строка помечается `confident=false`, если попыток слишком мало, чтобы
+    доверять её процентам.
+    """
+    spec = _analytics_filter(
+        date_from, date_to, provider, model, prompt_version,
+        generator.value if generator else None,
+        result.value if result else None,
+        fallback,
+        validation.value if validation else None,
+        trigger.value if trigger else None,
+    )
+    items = await build_generation_analytics_service().models(
+        spec, sort_by=sort_by.value, descending=order is SortOrder.DESC
+    )
+    return {"total": len(items), "items": items}
+
+
+@router.get("/analytics/prompts")
+async def analytics_prompts(
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+    sort_by: Annotated[PromptSort, Query()] = PromptSort.PROMPT_VERSION,
+    order: Annotated[SortOrder, Query()] = SortOrder.DESC,
+    date_from: Annotated[datetime | None, Query()] = None,
+    date_to: Annotated[datetime | None, Query()] = None,
+    provider: Annotated[str | None, Query(max_length=64)] = None,
+    model: Annotated[str | None, Query(max_length=200)] = None,
+    generator: Annotated[GenerationSource | None, Query()] = None,
+    result: Annotated[GenerationJobStatus | None, Query()] = None,
+    fallback: Annotated[bool | None, Query()] = None,
+    validation: Annotated[ValidationState | None, Query()] = None,
+    trigger: Annotated[GenerationTrigger | None, Query()] = None,
+) -> dict:
+    """Показатели по версиям инструкции.
+
+    Единица подсчёта — генерация: инструкция участвует в ней целиком,
+    независимо от числа перебранных моделей. Версия инструкции здесь не
+    фильтруется — таблица и существует, чтобы сравнивать версии между собой.
+    """
+    spec = _analytics_filter(
+        date_from, date_to, provider, model, None,
+        generator.value if generator else None,
+        result.value if result else None,
+        fallback,
+        validation.value if validation else None,
+        trigger.value if trigger else None,
+    )
+    items = await build_generation_analytics_service().prompts(
+        spec, sort_by=sort_by.value, descending=order is SortOrder.DESC
+    )
+    return {"total": len(items), "items": items}
+
+
+@router.get("/analytics/prompts/compare")
+async def analytics_prompts_compare(
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+    left: Annotated[int, Query(ge=1)],
+    right: Annotated[int, Query(ge=1)],
+    date_from: Annotated[datetime | None, Query()] = None,
+    date_to: Annotated[datetime | None, Query()] = None,
+    provider: Annotated[str | None, Query(max_length=64)] = None,
+    model: Annotated[str | None, Query(max_length=200)] = None,
+) -> dict:
+    """Сравнение двух версий инструкции по ключевым показателям.
+
+    Вывод «какая версия лучше» не делается, если данных мало или разница в
+    пределах погрешности: объявлять победителя по разнице в пределах шума
+    значило бы выдавать случайность за результат. Переключение рабочей версии
+    остаётся действием администратора — автоматически оно не производится.
+    """
+    spec = _analytics_filter(
+        date_from, date_to, provider, model, None, None, None, None, None, None
+    )
+    return await build_generation_analytics_service().compare_prompts(
+        spec, left=left, right=right
+    )
+
+
+@router.get("/analytics/generations")
+async def analytics_generations(
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+    sort_by: Annotated[GenerationSort, Query()] = GenerationSort.CREATED_AT,
+    order: Annotated[SortOrder, Query()] = SortOrder.DESC,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    date_from: Annotated[datetime | None, Query()] = None,
+    date_to: Annotated[datetime | None, Query()] = None,
+    provider: Annotated[str | None, Query(max_length=64)] = None,
+    model: Annotated[str | None, Query(max_length=200)] = None,
+    prompt_version: Annotated[int | None, Query(ge=1)] = None,
+    generator: Annotated[GenerationSource | None, Query()] = None,
+    result: Annotated[GenerationJobStatus | None, Query()] = None,
+    fallback: Annotated[bool | None, Query()] = None,
+    validation: Annotated[ValidationState | None, Query()] = None,
+    trigger: Annotated[GenerationTrigger | None, Query()] = None,
+) -> dict:
+    """Список генераций: фильтры, сортировка и пагинация на сервере.
+
+    Сортировка серверная не ради скорости: отсортированная страница отвечает
+    на вопрос «самая долгая генерация» неверно — только внутри показанных строк.
+    """
+    spec = _analytics_filter(
+        date_from, date_to, provider, model, prompt_version,
+        generator.value if generator else None,
+        result.value if result else None,
+        fallback,
+        validation.value if validation else None,
+        trigger.value if trigger else None,
+    )
+    total, items = await build_generation_analytics_service().generations(
+        spec,
+        limit=limit,
+        offset=offset,
+        sort_by=sort_by.value,
+        descending=order is SortOrder.DESC,
+    )
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+
+@router.get("/analytics/generations/{job_id}", responses=_NOT_FOUND)
+async def analytics_generation(
+    job_id: str,
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+) -> dict:
+    """Карточка одной генерации: попытки моделей и вызовы ИИ.
+
+    Промптов, ответов моделей и содержимого анкеты здесь нет: карточка отвечает
+    на вопрос «что происходило», а не «что было отправлено».
+    """
+    detail = await build_generation_analytics_service().generation(job_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Generation not found")
+    return detail
+
+
+@router.get("/analytics/filters")
+async def analytics_filter_options(
+    _: Annotated[AuthenticatedUser, Depends(require_viewer)],
+) -> dict:
+    """Значения фильтров, которые реально встречаются в данных.
+
+    Список строится по истории, а не по текущей конфигурации ИИ: удалённая
+    модель остаётся в прошлых генерациях, и без неё их нельзя было бы найти.
+    """
+    return await build_generation_analytics_service().filter_options()

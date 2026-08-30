@@ -48,7 +48,13 @@ IDEMPOTENCY_KEY_MAX_LENGTH = 191
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    """Текущее время с микросекундами.
+
+    Обрезка до секунды здесь недопустима: по `started_at`/`completed_at`
+    считается длительность генерации, а генерация короче секунды после
+    округления давала бы нулевую или отрицательную длительность.
+    """
+    return datetime.now(timezone.utc)
 
 
 class GenerationTrigger(StrEnum):

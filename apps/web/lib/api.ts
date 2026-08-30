@@ -314,10 +314,64 @@ export interface ExerciseListItem {
   name_ru: string | null;
   equipment: string[];
   primary_muscles: string[];
+  secondary_muscles: string[];
   difficulty: string | null;
   exercise_type: string | null;
+  force: string | null;
+  mechanic: string | null;
   source: string;
   is_active: boolean;
+  has_media: boolean;
+}
+
+/** Число упражнений по одному значению признака в текущей выборке. */
+export interface FacetCount {
+  value: string;
+  count: number;
+}
+
+export interface ExerciseFacets {
+  exercise_types: FacetCount[];
+  difficulties: FacetCount[];
+  equipment: FacetCount[];
+  primary_muscles: FacetCount[];
+  forces: FacetCount[];
+  mechanics: FacetCount[];
+}
+
+export type ExerciseSort =
+  | "name"
+  | "name_ru"
+  | "exercise_type"
+  | "difficulty"
+  | "force"
+  | "mechanic"
+  | "created_at";
+
+export type ActiveFilter = "active" | "inactive" | "all";
+export type MediaFilter = "with" | "without" | "all";
+
+/** Фильтр каталога. Списки внутри поля — OR, разные поля — AND. */
+export interface ExerciseQueryParams {
+  search?: string;
+  exercise_type?: string[];
+  difficulty?: string[];
+  equipment?: string[];
+  primary_muscle?: string[];
+  force?: string[];
+  mechanic?: string[];
+  is_active?: ActiveFilter;
+  media?: MediaFilter;
+  sort_by?: ExerciseSort;
+  order?: SortOrder;
+  limit?: number;
+  offset?: number;
+  with_facets?: boolean;
+}
+
+export interface ExerciseListResponse extends PagedResponse<ExerciseListItem> {
+  /** Приходит только при `with_facets=true`. */
+  facets?: ExerciseFacets;
 }
 
 export interface ExerciseMediaItem {
@@ -338,9 +392,6 @@ export interface ExerciseDetail extends ExerciseListItem {
   technique: string | null;
   technique_ru: string | null;
   common_mistakes: string | null;
-  secondary_muscles: string[];
-  force: string | null;
-  mechanic: string | null;
   contraindications: string[];
   limitations: string[];
   images: string[];
@@ -350,6 +401,12 @@ export interface ExerciseDetail extends ExerciseListItem {
 export interface ListResponse<T> {
   total: number;
   items: T[];
+}
+
+/** Список со страницей: `total` относится ко всей выборке, не к странице. */
+export interface PagedResponse<T> extends ListResponse<T> {
+  limit: number;
+  offset: number;
 }
 
 export interface ProgramExercise {
@@ -757,6 +814,261 @@ export interface AIDeleteBlocker {
   detail: string;
 }
 
+// --- Аналитика генерации --------------------------------------------------------
+//
+// Единица анализа — операция генерации, а не программа: программа существует
+// только при успехе, и по ней не видно отказов.
+//
+// Доли объявлены `number | null`. Ноль здесь означал бы «отказов не было», а
+// null — «считать не на чем»; сводить их к нулю в интерфейсе нельзя.
+
+export type SortOrder = "asc" | "desc";
+export type TimeBucket = "hour" | "day";
+export type ValidationState = "valid" | "failed" | "repaired";
+export type GeneratorKind = "ai" | "deterministic" | "manual";
+export type GenerationResult = "pending" | "running" | "succeeded" | "failed";
+
+export type ModelSort =
+  | "usage"
+  | "success_rate"
+  | "failure_rate"
+  | "fallback_rate"
+  | "avg_latency_ms"
+  | "repair_attempts"
+  | "model";
+
+export type PromptSort =
+  | "prompt_version"
+  | "usage"
+  | "success_rate"
+  | "failure_rate"
+  | "validation_failures"
+  | "fallback_rate"
+  | "avg_duration_ms"
+  | "repair_attempts";
+
+export type GenerationSort = "created_at" | "duration_ms" | "attempts" | "status";
+
+export interface AnalyticsFilter {
+  date_from?: string;
+  date_to?: string;
+  provider?: string;
+  model?: string;
+  prompt_version?: number;
+  generator?: GeneratorKind;
+  result?: GenerationResult;
+  fallback?: boolean;
+  validation?: ValidationState;
+  trigger?: string;
+}
+
+/** Query-строка аналитики: пустые фильтры не отправляются. */
+export function analyticsQuery(
+  filter?: AnalyticsFilter,
+  extra?: Record<string, string | number | boolean | undefined>
+): string {
+  const qs = new URLSearchParams();
+  const merged: Record<string, unknown> = { ...(filter ?? {}), ...(extra ?? {}) };
+  for (const [key, value] of Object.entries(merged)) {
+    // Явное false — это фильтр «без подмены генератора», а не его отсутствие,
+    // поэтому отбрасываются только undefined, null и пустая строка.
+    if (value === undefined || value === null || value === "") continue;
+    qs.set(key, String(value));
+  }
+  const query = qs.toString();
+  return query ? `?${query}` : "";
+}
+
+export interface AnalyticsGenerationTotals {
+  total: number;
+  succeeded: number;
+  failed: number;
+  active: number;
+  by_ai: number;
+  by_deterministic: number;
+  fallback: number;
+  deterministic_fallback: number;
+  validation_failures: number;
+  repaired: number;
+  repair_attempts: number;
+  job_attempts: number;
+  success_rate: number | null;
+  failure_rate: number | null;
+  fallback_rate: number | null;
+  ai_share: number | null;
+  avg_duration_ms: number | null;
+  p95_duration_ms: number | null;
+}
+
+export interface AnalyticsCallTotals {
+  total: number;
+  succeeded: number;
+  failed: number;
+  success_rate: number | null;
+  avg_latency_ms: number | null;
+  p95_latency_ms: number | null;
+  total_tokens: number;
+}
+
+export interface AnalyticsOverview {
+  generations: AnalyticsGenerationTotals;
+  calls: AnalyticsCallTotals;
+  sample: {
+    generations: number;
+    confident: boolean;
+    min_confident: number;
+  };
+}
+
+export interface AnalyticsTimeseriesPoint {
+  bucket: string | null;
+  total: number;
+  succeeded: number;
+  failed: number;
+  by_ai: number;
+  fallback: number;
+  avg_duration_ms: number | null;
+  success_rate: number | null;
+}
+
+export interface AnalyticsTimeseriesResponse
+  extends ListResponse<AnalyticsTimeseriesPoint> {
+  bucket: TimeBucket;
+}
+
+export interface AnalyticsModelRow {
+  model: string;
+  provider: string | null;
+  usage: number;
+  succeeded: number;
+  failed: number;
+  invalid_outputs: number;
+  provider_errors: number;
+  budget_exhausted: number;
+  repair_attempts: number;
+  initial_valid: number;
+  as_primary: number;
+  as_fallback: number;
+  generation_fallbacks: number;
+  success_rate: number | null;
+  failure_rate: number | null;
+  fallback_rate: number | null;
+  first_answer_rate: number | null;
+  avg_latency_ms: number | null;
+  calls: number;
+  confident: boolean;
+}
+
+export interface AnalyticsPromptRow {
+  prompt_version: number;
+  name: string | null;
+  enabled: boolean | null;
+  usage: number;
+  succeeded: number;
+  failed: number;
+  validation_failures: number;
+  fallback: number;
+  repaired: number;
+  repair_attempts: number;
+  avg_duration_ms: number | null;
+  success_rate: number | null;
+  failure_rate: number | null;
+  validation_failure_rate: number | null;
+  fallback_rate: number | null;
+  first_used_at: string | null;
+  last_used_at: string | null;
+  confident: boolean;
+}
+
+export interface PromptComparisonMetric {
+  metric: string;
+  left_version: number;
+  right_version: number;
+  left_value: number | null;
+  right_value: number | null;
+  difference_pp: number | null;
+  /** null — вывода нет: мало данных или разница в пределах погрешности. */
+  better_version: number | null;
+  confident: boolean;
+  note: string;
+}
+
+export interface PromptComparisonResponse {
+  left: AnalyticsPromptRow | null;
+  right: AnalyticsPromptRow | null;
+  metrics: PromptComparisonMetric[];
+  missing_versions: number[];
+}
+
+export interface AnalyticsGenerationRow {
+  job_id: string;
+  profile_id: string;
+  trigger: string;
+  requested_generator: string;
+  actual_generator: string | null;
+  status: GenerationResult;
+  attempts: number;
+  program_id: string | null;
+  program_version: number | null;
+  program_title: string | null;
+  last_error_code: string | null;
+  created_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  fallback_used: boolean | null;
+  fallback_reason_code: string | null;
+  model: string | null;
+  provider: string | null;
+  prompt_version: number | null;
+  models_tried: number;
+  repair_attempts: number;
+  invalid_outputs: number;
+  repaired: boolean;
+}
+
+export interface AnalyticsAttemptDetail {
+  priority: number;
+  is_primary: boolean;
+  provider: string;
+  model_id: string;
+  model_pk: number | null;
+  initial_valid: boolean;
+  repair_attempts: number;
+  outcome: string;
+  error_type: string | null;
+  detail: string | null;
+}
+
+export interface AnalyticsCallRow {
+  id: number;
+  status: string;
+  error_type: string | null;
+  latency_ms: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+  created_at: string | null;
+  model: string | null;
+  provider: string | null;
+  endpoint: string | null;
+}
+
+export interface AnalyticsGenerationDetail extends AnalyticsGenerationRow {
+  started_at: string | null;
+  last_error_message: string | null;
+  program_status: string | null;
+  fallback_reason: string | null;
+  attempt_details: AnalyticsAttemptDetail[];
+  calls: AnalyticsCallRow[];
+}
+
+export interface AnalyticsFilterOptions {
+  models: Array<{ model: string; provider: string | null }>;
+  providers: string[];
+  prompt_versions: number[];
+  triggers: string[];
+}
+
 export const aiApi = {
   providers: () =>
     request<ListResponse<AIProviderItem>>("/api/v1/admin/ai/providers"),
@@ -881,6 +1193,70 @@ export const aiApi = {
     }),
   deletePrompt: (id: number) =>
     request<void>(`/api/v1/admin/ai/prompts/detail/${id}`, { method: "DELETE" }),
+
+  // --- Аналитика генерации ------------------------------------------------------
+  //
+  // Все фильтры уходят на сервер: сортировка и фильтрация показанной страницы
+  // отвечали бы на вопрос «какая модель худшая» неверно.
+
+  analyticsOverview: (filter?: AnalyticsFilter) =>
+    request<AnalyticsOverview>(
+      `/api/v1/admin/ai/analytics/overview${analyticsQuery(filter)}`
+    ),
+  analyticsTimeseries: (bucket: TimeBucket, filter?: AnalyticsFilter) =>
+    request<AnalyticsTimeseriesResponse>(
+      `/api/v1/admin/ai/analytics/timeseries${analyticsQuery(filter, {
+        bucket,
+      })}`
+    ),
+  analyticsModels: (
+    filter?: AnalyticsFilter,
+    sort?: { sort_by?: ModelSort; order?: SortOrder }
+  ) =>
+    request<ListResponse<AnalyticsModelRow>>(
+      `/api/v1/admin/ai/analytics/models${analyticsQuery(filter, sort)}`
+    ),
+  analyticsPrompts: (
+    filter?: AnalyticsFilter,
+    sort?: { sort_by?: PromptSort; order?: SortOrder }
+  ) =>
+    request<ListResponse<AnalyticsPromptRow>>(
+      `/api/v1/admin/ai/analytics/prompts${analyticsQuery(filter, sort)}`
+    ),
+  analyticsComparePrompts: (
+    left: number,
+    right: number,
+    filter?: AnalyticsFilter
+  ) =>
+    request<PromptComparisonResponse>(
+      `/api/v1/admin/ai/analytics/prompts/compare${analyticsQuery(filter, {
+        left,
+        right,
+      })}`
+    ),
+  analyticsGenerations: (
+    filter?: AnalyticsFilter,
+    page?: {
+      limit?: number;
+      offset?: number;
+      sort_by?: GenerationSort;
+      order?: SortOrder;
+    }
+  ) =>
+    request<PagedResponse<AnalyticsGenerationRow>>(
+      `/api/v1/admin/ai/analytics/generations${analyticsQuery(filter, {
+        limit: page?.limit ?? 25,
+        offset: page?.offset ?? 0,
+        sort_by: page?.sort_by,
+        order: page?.order,
+      })}`
+    ),
+  analyticsGeneration: (jobId: string) =>
+    request<AnalyticsGenerationDetail>(
+      `/api/v1/admin/ai/analytics/generations/${encodeURIComponent(jobId)}`
+    ),
+  analyticsFilters: () =>
+    request<AnalyticsFilterOptions>("/api/v1/admin/ai/analytics/filters"),
 };
 
 // --- AI Providers для UI (публичный API) ----------------------------------------
@@ -925,14 +1301,29 @@ export const api = {
     request<void>(`/api/v1/profiles/${id}`, { method: "DELETE" }),
   deleteProgram: (id: string) =>
     request<void>(`/api/v1/programs/${id}`, { method: "DELETE" }),
-  exercises: (params?: { search?: string; exercise_type?: string; difficulty?: string; limit?: number; offset?: number }) => {
+  exercises: (params?: ExerciseQueryParams) => {
     const qs = new URLSearchParams();
     if (params?.search) qs.set("search", params.search);
-    if (params?.exercise_type) qs.set("exercise_type", params.exercise_type);
-    if (params?.difficulty) qs.set("difficulty", params.difficulty);
+    // Многозначные фильтры уходят повторяющимся параметром: FastAPI собирает
+    // их в список, и «штанга или гантели» — это один запрос, а не два.
+    for (const [key, values] of [
+      ["exercise_type", params?.exercise_type],
+      ["difficulty", params?.difficulty],
+      ["equipment", params?.equipment],
+      ["primary_muscle", params?.primary_muscle],
+      ["force", params?.force],
+      ["mechanic", params?.mechanic],
+    ] as const) {
+      for (const value of values ?? []) qs.append(key, value);
+    }
+    if (params?.is_active) qs.set("is_active", params.is_active);
+    if (params?.media) qs.set("media", params.media);
+    if (params?.sort_by) qs.set("sort_by", params.sort_by);
+    if (params?.order) qs.set("order", params.order);
+    if (params?.with_facets) qs.set("with_facets", "true");
     qs.set("limit", String(params?.limit ?? 50));
     qs.set("offset", String(params?.offset ?? 0));
-    return request<ListResponse<ExerciseListItem>>(`/api/v1/exercises?${qs}`);
+    return request<ExerciseListResponse>(`/api/v1/exercises?${qs}`);
   },
   exercise: (id: number) => request<ExerciseDetail>(`/api/v1/exercises/${id}`),
   exerciseByExternalId: (externalId: string, source?: string) => {

@@ -14,6 +14,7 @@ from src.application.ai.program_generator import (
 )
 from src.application.media.service import ExerciseMediaService
 from src.application.programs.filtering import ExerciseFilter
+from src.application.programs.generation_context import current_generation_job_id
 from src.application.programs.generation_jobs import GenerationJobService
 from src.application.programs.generator import DeterministicProgramGenerator
 from src.application.programs.html_service import ProgramHtmlService
@@ -158,7 +159,17 @@ async def _record_generation_fallback(event: FallbackEvent) -> None:
         reason_code=event.reason_code,
         detail=event.detail,
         ai_attempted=event.ai_attempted,
+        job_id=current_generation_job_id(),
     )
+
+
+def build_exercise_repository() -> ExerciseRepository:
+    """Каталог упражнений для чтения из API.
+
+    Отдельная фабрика нужна, чтобы роут не собирал репозиторий сам и не
+    дублировал session factory: поиск и счётчики каталога живут в репозитории.
+    """
+    return ExerciseRepository(get_session_factory())
 
 
 def build_exercise_media_service() -> ExerciseMediaService:
@@ -204,16 +215,24 @@ def build_ai_program_generator(http_client: httpx.AsyncClient | None = None) -> 
     )
 
 
-async def _record_model_attempts(attempts: list[ModelAttempt]) -> None:
+async def _record_model_attempts(
+    attempts: list[ModelAttempt], prompt_version: int | None
+) -> None:
     """Кладёт историю попыток моделей в журнал AI-контура.
 
     Без неё администратор видит только «программа собрана без ИИ» и не может
     отличить «резервные модели тоже не справились» от «до них дело не дошло».
+
+    Версия инструкции и ссылка на операцию генерации нужны аналитике: по ним
+    попытки сводятся к конкретной генерации и к конкретной формулировке
+    инструкции.
     """
     from apps.backend.api.v1.ai_dependencies import build_ai_components
 
     await build_ai_components().admin.record_model_attempts(
         AIProgramGenerator.attempts_metadata(attempts),
         task_type=AITaskType.WORKOUT_GENERATION,
+        job_id=current_generation_job_id(),
+        prompt_version=prompt_version,
     )
 

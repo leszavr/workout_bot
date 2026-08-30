@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass
 
 from src.application.ai.selection import ModelCandidate, ModelSelector
+from src.application.programs.generation_context import current_generation_job_id
 from src.domain.ai.config import AITaskConfig, AIUsageRecord
 from src.domain.ai.enums import AIProtocol, AIUsageStatus
 from src.domain.ai.errors import (
@@ -255,6 +256,9 @@ class AIGateway:
                     model_id=candidate.model.id,
                     profile_id=request.profile_id,
                     program_id=request.program_id,
+                    # Ссылка на операцию генерации берётся из ambient-контекста:
+                    # запрос к AI формирует генератор, который про job не знает.
+                    job_id=current_generation_job_id(),
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=total_tokens,

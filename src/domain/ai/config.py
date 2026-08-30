@@ -136,6 +136,11 @@ class AIUsageRecord(BaseModel):
     model_id: int | None = None
     profile_id: str | None = Field(default=None, max_length=64)
     program_id: str | None = Field(default=None, max_length=64)
+    # Операция генерации, в рамках которой сделан вызов (`generation_jobs.job_id`).
+    # Без него журнал вызовов отвечает на «сколько было обращений к ИИ», но не на
+    # «что происходило в этой генерации»: profile_id один на все её версии, а
+    # program_id у неудачной генерации отсутствует вовсе.
+    job_id: str | None = Field(default=None, max_length=64)
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
