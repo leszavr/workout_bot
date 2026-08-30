@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from src.application.questionnaire.questions import (
     QUESTIONS_BY_ID,
     QuestionDefinition,
@@ -103,13 +105,28 @@ class QuestionnaireService:
                 raise QuestionnaireValidationError("Этот вопрос обязателен — его нельзя пропустить.")
             return self._skip(profile, question)
 
+        if question.kind is QuestionKind.PHOTOS:
+            # Текст на вопрос с фотографиями принимать нельзя: у поля тип
+            # «список файлов», и строка вида «пока нет» записалась бы в него как
+            # есть. Присваивание Pydantic не валидирует, поэтому запись прошла
+            # бы молча, а падало бы уже следующее чтение профиля — анкета
+            # застревала без объяснения.
+            #
+            # Такой ответ НЕ трактуется как пропуск: «сейчас пришлю» означает
+            # обратное, и автоматический переход к следующему вопросу потерял бы
+            # присланное потом фото.
+            raise QuestionnaireValidationError(
+                "Здесь нужна фотография. Отправьте снимок или нажмите «Пропустить», "
+                "если фотографий нет."
+            )
+
         if question.validate is not None:
             error = question.validate(text)
             if error:
                 raise QuestionnaireValidationError(error)
 
         value = question.parse(text) if question.parse else text
-        question.set_value(profile, value)
+        self._set_value(question, profile, value)
         return self._advance(profile, question)
 
     def answer_choice(self, profile: FitnessProfile, question_id: str, callback_data: str) -> AnswerResult:
@@ -117,7 +134,7 @@ class QuestionnaireService:
         option = question.option_by_data(callback_data)
         if option is None:
             raise QuestionnaireValidationError("Неизвестный вариант ответа.")
-        question.set_value(profile, option.value)
+        self._set_value(question, profile, option.value)
         return self._advance(profile, question)
 
     def toggle_day(self, profile: FitnessProfile, day: str) -> tuple[list[str], str]:
@@ -170,6 +187,25 @@ class QuestionnaireService:
         return self.build_prompt(profile, question_id)
 
     # --- Внутреннее -------------------------------------------------------------
+
+    @staticmethod
+    def _set_value(
+        question: QuestionDefinition, profile: FitnessProfile, value: object
+    ) -> None:
+        """Записывает ответ в профиль, превращая отказ модели в ошибку анкеты.
+
+        Профиль валидирует присваивание (`validate_assignment`), поэтому
+        несовместимое значение не попадёт в состояние и не сломает следующее
+        чтение анкеты. Пользователю нужен ответ на его сообщение, а не молчание,
+        поэтому `ValidationError` переводится в обычную ошибку вопроса: он
+        останется на том же шаге и сможет ответить заново.
+        """
+        try:
+            question.set_value(profile, value)
+        except ValidationError as exc:
+            raise QuestionnaireValidationError(
+                "Не удалось сохранить такой ответ. Проверьте формат и попробуйте снова."
+            ) from exc
 
     def _skip(self, profile: FitnessProfile, question: QuestionDefinition) -> AnswerResult:
         if question.id not in profile.questionnaire.skipped_questions:

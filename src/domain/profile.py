@@ -3,6 +3,13 @@
 Профиль больше не является произвольным ``dict[str, Any]``:
 перед сохранением он обязан пройти Pydantic-валидацию.
 Структура полей совместима с существующими JSON-файлами (schema_version 1.0).
+
+Все модели используют ``validate_assignment=True``. Без него Pydantic
+проверяет данные только при создании и разборе, а присваивание полю проходит
+без проверки: код анкеты мог записать в ``list[str]`` обычную строку, ошибка
+всплывала лишь при следующем чтении профиля — то есть на следующем шаге
+анкеты, где причина уже не видна. С валидацией присваивания несовместимое
+значение отклоняется в точке записи.
 """
 from __future__ import annotations
 
@@ -35,7 +42,7 @@ def _utcnow() -> datetime:
 class UserIdentity(BaseModel):
     """Идентификация пользователя в источнике (Telegram)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     platform: str = "telegram"
     bot_user_id: str | None = Field(default=None, description="Telegram user id")
@@ -45,7 +52,7 @@ class UserIdentity(BaseModel):
 class ClientData(BaseModel):
     """Базовые антропометрические данные клиента."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     name: str | None = Field(default=None, min_length=2, max_length=50)
     age_years: int | None = Field(default=None, ge=14, le=100)
@@ -56,7 +63,7 @@ class ClientData(BaseModel):
 
 
 class Goals(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     primary: PrimaryGoal | None = None
     primary_custom: str | None = Field(default=None, max_length=MAX_TEXT_LENGTH)
@@ -66,7 +73,7 @@ class Goals(BaseModel):
 
 
 class WorkingWeight(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     exercise: str = Field(default="", max_length=200)
     weight: float = Field(default=0.0, ge=0)
@@ -76,7 +83,7 @@ class WorkingWeight(BaseModel):
 
 
 class TrainingBackground(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     experience_level: ExperienceLevel | None = None
     current_frequency_per_week: int = Field(default=0, ge=0, le=14)
@@ -87,7 +94,7 @@ class TrainingBackground(BaseModel):
 
 
 class TrainingPlanPreferences(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     sessions_per_week: int = Field(default=0, ge=0, le=7)
     preferred_days: list[Weekday] = Field(default_factory=list)
@@ -96,7 +103,7 @@ class TrainingPlanPreferences(BaseModel):
 
 
 class TrainingLocation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     primary_location: TrainingLocationType | None = None
     gym_name: str | None = Field(default=None, max_length=200)
@@ -106,7 +113,7 @@ class TrainingLocation(BaseModel):
 
 
 class LimitationDetail(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     category: str = "general"
     user_description: str | None = Field(default=None, max_length=MAX_TEXT_LENGTH)
@@ -115,7 +122,7 @@ class LimitationDetail(BaseModel):
 
 
 class HealthAndLimitations(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     has_limitations: bool = False
     categories: list[str] = Field(default_factory=list)
@@ -126,7 +133,7 @@ class HealthAndLimitations(BaseModel):
 
 
 class ExercisePreferences(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     preferred_exercises: list[str] = Field(default_factory=list)
     disliked_exercises: list[str] = Field(default_factory=list)
@@ -135,7 +142,7 @@ class ExercisePreferences(BaseModel):
 
 
 class Lifestyle(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     daily_activity_level: DailyActivityLevel | None = None
     cardio_preference: CardioPreference | None = None
@@ -143,7 +150,7 @@ class Lifestyle(BaseModel):
 
 
 class AdditionalInformation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     schedule_constraints: str | None = Field(default=None, max_length=MAX_TEXT_LENGTH)
     special_requests: str | None = Field(default=None, max_length=MAX_TEXT_LENGTH)
@@ -151,7 +158,7 @@ class AdditionalInformation(BaseModel):
 
 
 class QuestionnaireMeta(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     completed: bool = False
     completion_status: CompletionStatus = CompletionStatus.DRAFT
@@ -160,7 +167,7 @@ class QuestionnaireMeta(BaseModel):
 
 
 class ReviewMeta(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     client_summary_confirmed: bool = False
     client_corrections: list[str] = Field(default_factory=list)
@@ -170,7 +177,7 @@ class ReviewMeta(BaseModel):
 class FitnessProfile(BaseModel):
     """Агрегат анкеты клиента. Единственная структура, которую сохраняет репозиторий."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     schema_version: str = "1.0"
     profile_id: str | None = None
