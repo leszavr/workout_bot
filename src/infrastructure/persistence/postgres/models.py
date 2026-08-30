@@ -529,7 +529,9 @@ class ComponentInstanceRow(Base):
 
     `capabilities` — JSONB-список строк. Отдельная таблица связей здесь была бы
     лишней: набор возможностей приходит целиком в каждом heartbeat и не
-    существует независимо от компонента.
+    существует независимо от компонента. Тип указан явно, а не через
+    `Mapped[list]`: по умолчанию SQLAlchemy взял бы `JSON`, и модель разошлась
+    бы с миграцией.
 
     `last_heartbeat_at` намеренно отделён от `updated_at`: heartbeat приходит
     каждую минуту и без изменения metadata, а `updated_at` показывает, когда
@@ -546,7 +548,7 @@ class ComponentInstanceRow(Base):
     version: Mapped[str] = mapped_column(String(32))
     build_sha: Mapped[str | None] = mapped_column(String(40))
     contract_version: Mapped[int] = mapped_column(Integer)
-    capabilities: Mapped[list] = mapped_column(JSON, default=list)
+    capabilities: Mapped[list] = mapped_column(JSONB, default=list)
     status: Mapped[str] = mapped_column(String(16), default="healthy", index=True)
     last_heartbeat_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
