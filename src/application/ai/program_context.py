@@ -23,6 +23,10 @@ from src.domain.enums import (
     Sex,
     TrainingLocationType,
 )
+from src.application.programs.session_planning import (
+    TOLERANCE_MINUTES,
+    plan_session,
+)
 from src.domain.pools import SafeExercisePool
 from src.domain.profile import FitnessProfile
 
@@ -43,6 +47,34 @@ class ExerciseBrief(BaseModel):
     exercise_type: str | None = None
     difficulty: str | None = None
     mechanic: str | None = None
+
+
+class SessionPlanBrief(BaseModel):
+    """Расчёт одного занятия для промпта.
+
+    Модель не умеет оценивать длительность тренировки: прошлый прогон дал разброс
+    от 4 до 84 минут при заявленных 60–90. Расчёт выполняет приложение
+    (`session_planning`) и передаёт числа как ориентир — тот же, что использует
+    алгоритмический генератор, поэтому оба пути дают сопоставимый объём.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total_minutes: int
+    warmup_minutes: int
+    cooldown_minutes: int
+    main_minutes: int
+    tolerance_minutes: int
+    exercises: int
+    sets: int
+    reps_min: int
+    reps_max: int
+    rest_seconds: int
+    approach: str
+    # True — заявленное время занять нечем без потери характера тренировки
+    # (например, 150 минут щадящей программы). Модель должна сообщить
+    # фактическую длительность, а не обещать заявленную.
+    capped: bool = False
 
 
 class AIProgramGenerationContext(BaseModel):
@@ -82,6 +114,17 @@ class AIProgramGenerationContext(BaseModel):
     movement_restrictions: list[MovementRestriction] = Field(default_factory=list)
     cardio_preference: CardioPreference | None = None
 
+    # Текущее самочувствие: жалобы, о которых человек сообщил перед генерацией.
+    # Поле есть до появления соответствующего вопроса в анкете и остаётся пустым:
+    # модель должна получать состояние человека тем же путём, что цель и опыт, а
+    # не отдельной подсистемой, когда вопрос появится.
+    current_condition: str | None = None
+
+    # Расчёт занятия: сколько работы вмещается в заявленное время. Передаётся как
+    # ориентир, а не как готовый ответ — модель вправе отступить, если состояние
+    # человека того требует, но обязана уложиться в заявленное время.
+    session_plan: SessionPlanBrief | None = None
+
     # SafeExercisePool — единственные упражнения, которые AI может использовать
     safe_pool: list[ExerciseBrief] = Field(default_factory=list)
     safe_pool_size: int = 0
@@ -103,7 +146,22 @@ def build_generation_context(
     # Ограничиваем количество упражнений в промпте
     exercises = safe_pool.allowed[:MAX_EXERCISES_IN_PROMPT]
 
+    plan = plan_session(profile)
     return AIProgramGenerationContext(
+        session_plan=SessionPlanBrief(
+            total_minutes=plan.total_minutes,
+            warmup_minutes=plan.warmup_minutes,
+            cooldown_minutes=plan.cooldown_minutes,
+            main_minutes=plan.main_minutes,
+            tolerance_minutes=TOLERANCE_MINUTES,
+            exercises=plan.exercises,
+            sets=plan.prescription.sets,
+            reps_min=plan.prescription.reps_min,
+            reps_max=plan.prescription.reps_max,
+            rest_seconds=plan.prescription.rest_seconds,
+            approach=plan.prescription.tempo,
+            capped=plan.capped,
+        ),
         age_years=profile.client.age_years,
         sex=profile.client.sex,
         height_cm=profile.client.height_cm,

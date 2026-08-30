@@ -691,8 +691,11 @@ class AIProgramGenerator:
             else "нет"
         )
 
+        plan = context.session_plan
         return template.format(
             age_years=context.age_years or "не указан",
+            current_condition=context.current_condition or "не сообщал",
+            session_plan=_render_session_plan(plan),
             sex=context.sex.value if context.sex else "не указан",
             height_cm=context.height_cm or "не указан",
             weight_kg=context.weight_kg or "не указан",
@@ -711,3 +714,34 @@ class AIProgramGenerator:
             safe_pool_exercises="\n".join(exercises_lines),
             pool_warnings="\n".join(warnings_lines) or "нет",
         )
+
+
+def _render_session_plan(plan) -> str:
+    """Расчёт занятия в виде текста для промпта.
+
+    Числа передаются как ориентир, а не приказ: модель вправе отступить, если
+    состояние человека того требует, но обязана уложиться в заявленное время.
+    Формулировка объясняет, откуда взяты числа, — модели в роли консультанта нужно
+    основание для решения, а не готовый ответ.
+    """
+    if plan is None:
+        return "не рассчитан"
+
+    lines = [
+        f"Общая длительность занятия: {plan.total_minutes} минут "
+        f"(допустимое отклонение ±{plan.tolerance_minutes} минут).",
+        f"Из них разминка {plan.warmup_minutes} мин, основная часть "
+        f"{plan.main_minutes} мин, заминка {plan.cooldown_minutes} мин.",
+        f"Расчётный объём основной части: {plan.exercises} упражнений, "
+        f"{plan.sets} подхода по {plan.reps_min}-{plan.reps_max} повторений, "
+        f"отдых {plan.rest_seconds} секунд между подходами.",
+        f"Характер нагрузки для этой цели: {plan.approach}.",
+    ]
+    if plan.capped:
+        lines.append(
+            "ВАЖНО: заявленное пользователем время невозможно занять, не изменив "
+            "характер тренировки для его цели. Составь занятие на "
+            f"{plan.total_minutes} минут и укажи эту длительность в описании — не "
+            "растягивай программу до заявленного времени."
+        )
+    return "\n".join(lines)

@@ -1037,3 +1037,82 @@ class TestPromptLoader:
         assert not hasattr(module, "PROMPTS_DIR")
         assert "read_text" not in source
         assert "prompts/program_generator" not in source
+
+
+# --- Расчёт занятия в промпте -----------------------------------------------------
+
+
+class TestSessionPlanInPrompt:
+    """Модель получает расчёт занятия, а не оценивает время сама.
+
+    Прогон 24 программ на staging дал разброс от 4 до 84 минут при заявленных
+    60–90: модель видела `session_duration_minutes` в контексте, но что с ним
+    делать, ей не сообщалось. Расчёт выполняет приложение и передаёт как ориентир.
+    """
+
+    @staticmethod
+    def _plan(**overrides):
+        from src.application.ai.program_context import SessionPlanBrief
+
+        data = {
+            "total_minutes": 90,
+            "warmup_minutes": 8,
+            "cooldown_minutes": 5,
+            "main_minutes": 77,
+            "tolerance_minutes": 5,
+            "exercises": 7,
+            "sets": 4,
+            "reps_min": 4,
+            "reps_max": 6,
+            "rest_seconds": 150,
+            "approach": "силовой, с полным восстановлением между подходами",
+        }
+        data.update(overrides)
+        return SessionPlanBrief(**data)
+
+    def test_plan_is_rendered_with_all_numbers(self):
+        from src.application.ai.program_generator import _render_session_plan
+
+        text = _render_session_plan(self._plan())
+
+        # Заявленное время и допуск: без них требование «уложиться» бессодержательно.
+        assert "90 минут" in text
+        assert "±5 минут" in text
+        # Структура занятия: разминка и заминка занимают время и должны быть учтены.
+        assert "разминка 8" in text
+        assert "заминка 5" in text
+        # Объём и характер нагрузки.
+        assert "7 упражнений" in text
+        assert "4 подхода" in text
+        assert "150 секунд" in text
+        assert "силовой" in text
+
+    def test_capped_plan_tells_model_not_to_stretch_program(self):
+        """Недостижимое время не скрывается: модель сообщает фактическое."""
+        from src.application.ai.program_generator import _render_session_plan
+
+        text = _render_session_plan(self._plan(total_minutes=96, capped=True))
+
+        assert "невозможно занять" in text
+        assert "96 минут" in text
+        assert "не" in text and "растягивай" in text
+
+    def test_missing_plan_does_not_break_prompt(self):
+        """Отсутствие расчёта не роняет генерацию: промпт остаётся валидным."""
+        from src.application.ai.program_generator import _render_session_plan
+
+        assert _render_session_plan(None) == "не рассчитан"
+
+    def test_context_carries_plan_and_condition(self):
+        """Контекст несёт расчёт и состояние человека тем же путём, что цель."""
+        from src.application.ai.program_context import build_generation_context
+
+        profile = make_profile()
+        profile.training_plan_preferences.session_duration_minutes = 75
+        context = build_generation_context(profile, make_safe_pool())
+
+        assert context.session_plan is not None
+        assert context.session_plan.total_minutes == 75
+        # Поле состояния существует до появления вопроса в анкете: когда вопрос
+        # появится, состояние пойдёт тем же путём, а не отдельной подсистемой.
+        assert context.current_condition is None
