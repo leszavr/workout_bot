@@ -191,12 +191,13 @@ class AIOutputParser:
         - Чистый JSON
         - JSON в markdown code block
         - JSON с текстом до/после
+        - JSON, завёрнутый шлюзом в служебное поле (см. `_unwrap`)
         """
         content = content.strip()
 
         # Пробуем распарсить напрямую
         try:
-            return json.loads(content)
+            return AIOutputParser._unwrap(json.loads(content))
         except json.JSONDecodeError:
             pass
 
@@ -206,7 +207,9 @@ class AIOutputParser:
         )
         if code_block_match:
             try:
-                return json.loads(code_block_match.group(1).strip())
+                return AIOutputParser._unwrap(
+                    json.loads(code_block_match.group(1).strip())
+                )
             except json.JSONDecodeError:
                 pass
 
@@ -215,11 +218,47 @@ class AIOutputParser:
         end = content.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
-                return json.loads(content[start : end + 1])
+                return AIOutputParser._unwrap(json.loads(content[start : end + 1]))
             except json.JSONDecodeError:
                 pass
 
         raise ProgramGenerationError("Не удалось извлечь JSON из ответа AI")
+
+    @staticmethod
+    def _unwrap(payload: dict) -> dict:
+        """Разворачивает программу, завёрнутую шлюзом в служебное поле.
+
+        У части моделей нет нативного JSON-режима, и шлюз эмулирует
+        `response_format: json_object` через вызов инструмента. Когда аргументы
+        инструмента не описаны, результат приходит строкой внутри служебного
+        поля:
+
+            {"_noargs": "{\"title\": ..., \"training_days\": [...]}"}
+
+        Наблюдалось на routerai для `anthropic/claude-sonnet-5` и
+        `z-ai/glm-5.3-flash`: модель отвечала корректной программой, а валидатор
+        сообщал «title: Field required», потому что видел обёртку.
+
+        Разворачивается только однозначный случай: единственный ключ, значение —
+        строка, внутри которой объект. Имя ключа не проверяется: оно зависит от
+        шлюза, а признак обёртки — структура. Список известных имён пришлось бы
+        пополнять после каждого нового провайдера.
+
+        Программа с единственным полем-строкой невозможна: обязательных полей у
+        неё пять, поэтому спутать обёртку с настоящим ответом нельзя.
+        """
+        if len(payload) != 1:
+            return payload
+        (value,) = payload.values()
+        if not isinstance(value, str):
+            return payload
+        try:
+            inner = json.loads(value)
+        except json.JSONDecodeError:
+            # Строка не JSON: это не обёртка, а поле со текстом. Возвращаем как
+            # есть — пусть решает валидатор.
+            return payload
+        return inner if isinstance(inner, dict) else payload
 
 
 def _apply_catalog_sources(payload: dict, catalog_sources: dict[str, str]) -> None:

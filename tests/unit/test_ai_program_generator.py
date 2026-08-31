@@ -1266,3 +1266,83 @@ class TestProbeSkipsDeadModels:
 
         program = await generator.generate(profile, pool)
         assert program.title == "AI Test Program"
+
+
+# --- JSON в служебной обёртке шлюза -----------------------------------------------
+
+
+class TestGatewayWrappedJson:
+    """Программа, завёрнутая шлюзом в служебное поле, распознаётся.
+
+    У части моделей нет нативного JSON-режима, и шлюз эмулирует
+    `response_format: json_object` через вызов инструмента. Результат приходит
+    строкой внутри служебного поля. Наблюдалось на routerai для
+    `anthropic/claude-sonnet-5` (4 отказа из 4) и `z-ai/glm-5.3-flash`: модель
+    отвечала корректной программой, а валидатор сообщал «title: Field required»,
+    потому что видел обёртку.
+    """
+
+    def test_wrapped_program_is_unwrapped(self):
+        pool = make_safe_pool()
+        inner = make_valid_program_json(pool)
+        wrapped = json.dumps({"_noargs": inner}, ensure_ascii=False)
+
+        payload = AIOutputParser.extract_json(wrapped)
+
+        assert payload["title"] == "AI Test Program"
+        assert len(payload["training_days"]) == 1
+
+    def test_wrapper_key_name_is_not_hardcoded(self):
+        """Имя служебного поля зависит от шлюза, признак обёртки — структура.
+
+        Список известных имён пришлось бы пополнять после каждого нового
+        провайдера, а сама обёртка распознаётся однозначно и без него.
+        """
+        pool = make_safe_pool()
+        for key in ("_noargs", "arguments", "result", "tool_input"):
+            wrapped = json.dumps(
+                {key: make_valid_program_json(pool)}, ensure_ascii=False
+            )
+            assert AIOutputParser.extract_json(wrapped)["title"] == "AI Test Program"
+
+    def test_plain_response_is_untouched(self):
+        pool = make_safe_pool()
+        payload = AIOutputParser.extract_json(make_valid_program_json(pool))
+        assert payload["title"] == "AI Test Program"
+
+    def test_single_field_with_plain_text_is_not_unwrapped(self):
+        """Строка, которая не JSON, — это поле с текстом, а не обёртка."""
+        payload = AIOutputParser.extract_json('{"description": "просто текст"}')
+        assert payload == {"description": "просто текст"}
+
+    def test_single_field_with_json_array_is_not_unwrapped(self):
+        """Разворачивается только объект: массив не может быть программой."""
+        payload = AIOutputParser.extract_json('{"items": "[1, 2, 3]"}')
+        assert payload == {"items": "[1, 2, 3]"}
+
+    def test_wrapped_inside_markdown_block(self):
+        """Обёртка распознаётся и когда шлюз добавил markdown."""
+        pool = make_safe_pool()
+        wrapped = json.dumps({"_noargs": make_valid_program_json(pool)}, ensure_ascii=False)
+        content = f"```json\n{wrapped}\n```"
+
+        assert AIOutputParser.extract_json(content)["title"] == "AI Test Program"
+
+    @pytest.mark.asyncio
+    async def test_generation_succeeds_on_wrapped_answer(self):
+        """Сквозная проверка: завёрнутый ответ проходит генерацию целиком."""
+        pool = make_safe_pool()
+        profile = make_profile()
+        wrapped = json.dumps(
+            {"_noargs": make_valid_program_json(pool)}, ensure_ascii=False
+        )
+
+        generator = AIProgramGenerator(
+            gateway=FakeAIGateway([wrapped]),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+        )
+
+        program = await generator.generate(profile, pool)
+        assert program.title == "AI Test Program"
+        assert program.generation.source is GenerationSource.AI
