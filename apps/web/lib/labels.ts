@@ -323,6 +323,9 @@ export const AI_ATTEMPT_OUTCOME_LABELS: Record<string, string> = {
   invalid_output: "ответ не прошёл проверку",
   provider_error: "сервис не ответил",
   budget_exhausted: "время вышло",
+  // Модель отсеяна проверкой готовности: полный запрос к ней не отправлялся.
+  // Отличать от «сервис не ответил» важно — это разные причины и разная цена.
+  probe_failed: "не прошла проверку готовности",
 };
 
 export function aiAttemptOutcomeLabel(outcome: string): string {
@@ -334,7 +337,7 @@ export function aiAttemptOutcomeTone(
 ): "ok" | "warn" | "bad" | "neutral" {
   if (outcome === "success") return "ok";
   if (outcome === "invalid_output") return "warn";
-  if (outcome === "provider_error") return "bad";
+  if (outcome === "provider_error" || outcome === "probe_failed") return "bad";
   return "neutral";
 }
 

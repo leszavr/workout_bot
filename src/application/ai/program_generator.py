@@ -80,6 +80,10 @@ ATTEMPT_SUCCESS = "success"
 ATTEMPT_INVALID_OUTPUT = "invalid_output"
 ATTEMPT_PROVIDER_ERROR = "provider_error"
 ATTEMPT_BUDGET_EXHAUSTED = "budget_exhausted"
+# Модель не прошла пробу готовности: полный запрос к ней не отправлялся.
+# Отдельный исход, а не provider_error: администратору важно различать «модель не
+# ответила на рабочий запрос» и «модель отсеяна до запроса».
+ATTEMPT_PROBE_FAILED = "probe_failed"
 
 
 @dataclass(frozen=True)
@@ -274,6 +278,7 @@ class AIProgramGenerator:
         # ответ не прошёл проверку, но не видно, какая инструкция это вызвала.
         attempt_recorder: Callable[[list[ModelAttempt], int | None], Awaitable[None]]
         | None = None,
+        probe_service=None,
     ) -> None:
         self._gateway = gateway
         self._prompts = prompt_loader
@@ -281,6 +286,9 @@ class AIProgramGenerator:
         self._max_repair_attempts = max_repair_attempts
         self._total_budget_seconds = total_budget_seconds
         self._attempt_recorder = attempt_recorder
+        # Проба готовности модели. Необязательна: без неё генерация работает как
+        # раньше — отказ обнаруживается настоящим запросом, а не пробой.
+        self._probe = probe_service
 
     async def generate(
         self,
@@ -345,6 +353,36 @@ class AIProgramGenerator:
                 )
                 break
 
+            # Проба готовности перед первым обращением к кандидату. Лениво, а не
+            # для всей цепочки сразу: рабочая основная модель стоит одну пробу
+            # (1-3 с), а до резервных дело доходит только при отказе — там проба
+            # экономит минуты ожидания вместо секунд.
+            if self._probe is not None:
+                verdict = await self._probe.check(candidate)
+                if not verdict.available:
+                    probe_error = ProgramGenerationError(
+                        f"Модель не прошла проверку готовности: {verdict.detail}"
+                    )
+                    attempts.append(
+                        self._attempt(
+                            candidate,
+                            initial_valid=False,
+                            repair_attempts=0,
+                            outcome=ATTEMPT_PROBE_FAILED,
+                            error=probe_error,
+                        )
+                    )
+                    last_error = probe_error
+                    logger.warning(
+                        "event=ai_model_skipped_probe_failed",
+                        extra={
+                            "model_pk": candidate.model.id,
+                            "priority": candidate.priority,
+                            "error_type": verdict.error_type,
+                            "cached": verdict.cached,
+                        },
+                    )
+                    continue
             try:
                 program, response, attempt = await self._run_candidate(
                     candidate,
