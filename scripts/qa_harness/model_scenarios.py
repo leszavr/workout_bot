@@ -126,6 +126,13 @@ class AdminClient:
             raise RuntimeError(f"Инструкции №{version} нет у задачи {task_type}")
         return await self.prompt(item["id"])
 
+    async def create_model(self, endpoint_id: int, body: dict) -> dict:
+        return (
+            await self._request(
+                "POST", f"/api/v1/admin/ai/endpoints/{endpoint_id}/models", json=body
+            )
+        ).json()
+
     async def create_prompt(self, body: dict) -> dict:
         return (
             await self._request("POST", "/api/v1/admin/ai/prompts", json=body)
