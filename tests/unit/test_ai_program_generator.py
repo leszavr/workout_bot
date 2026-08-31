@@ -1037,3 +1037,232 @@ class TestPromptLoader:
         assert not hasattr(module, "PROMPTS_DIR")
         assert "read_text" not in source
         assert "prompts/program_generator" not in source
+
+
+# --- Расчёт занятия в промпте -----------------------------------------------------
+
+
+class TestSessionPlanInPrompt:
+    """Модель получает расчёт занятия, а не оценивает время сама.
+
+    Прогон 24 программ на staging дал разброс от 4 до 84 минут при заявленных
+    60–90: модель видела `session_duration_minutes` в контексте, но что с ним
+    делать, ей не сообщалось. Расчёт выполняет приложение и передаёт как ориентир.
+    """
+
+    @staticmethod
+    def _plan(**overrides):
+        from src.application.ai.program_context import SessionPlanBrief
+
+        data = {
+            "total_minutes": 90,
+            "warmup_minutes": 8,
+            "cooldown_minutes": 5,
+            "main_minutes": 77,
+            "tolerance_minutes": 5,
+            "exercises": 7,
+            "sets": 4,
+            "reps_min": 4,
+            "reps_max": 6,
+            "rest_seconds": 150,
+            "approach": "силовой, с полным восстановлением между подходами",
+        }
+        data.update(overrides)
+        return SessionPlanBrief(**data)
+
+    def test_plan_is_rendered_with_all_numbers(self):
+        from src.application.ai.program_generator import _render_session_plan
+
+        text = _render_session_plan(self._plan())
+
+        # Заявленное время и допуск: без них требование «уложиться» бессодержательно.
+        assert "90 минут" in text
+        assert "±5 минут" in text
+        # Структура занятия: разминка и заминка занимают время и должны быть учтены.
+        assert "разминка 8" in text
+        assert "заминка 5" in text
+        # Объём и характер нагрузки.
+        assert "7 упражнений" in text
+        assert "4 подхода" in text
+        assert "150 секунд" in text
+        assert "силовой" in text
+
+    def test_capped_plan_tells_model_not_to_stretch_program(self):
+        """Недостижимое время не скрывается: модель сообщает фактическое."""
+        from src.application.ai.program_generator import _render_session_plan
+
+        text = _render_session_plan(self._plan(total_minutes=96, capped=True))
+
+        assert "невозможно занять" in text
+        assert "96 минут" in text
+        assert "не" in text and "растягивай" in text
+
+    def test_missing_plan_does_not_break_prompt(self):
+        """Отсутствие расчёта не роняет генерацию: промпт остаётся валидным."""
+        from src.application.ai.program_generator import _render_session_plan
+
+        assert _render_session_plan(None) == "не рассчитан"
+
+    def test_context_carries_plan_and_condition(self):
+        """Контекст несёт расчёт и состояние человека тем же путём, что цель."""
+        from src.application.ai.program_context import build_generation_context
+
+        profile = make_profile()
+        profile.training_plan_preferences.session_duration_minutes = 75
+        context = build_generation_context(profile, make_safe_pool())
+
+        assert context.session_plan is not None
+        assert context.session_plan.total_minutes == 75
+        # Поле состояния существует до появления вопроса в анкете: когда вопрос
+        # появится, состояние пойдёт тем же путём, а не отдельной подсистемой.
+        assert context.current_condition is None
+
+
+# --- Проба готовности модели в цепочке --------------------------------------------
+
+
+class TestProbeSkipsDeadModels:
+    """Недоступная модель отсеивается до полного запроса.
+
+    Наблюдалось на staging: две сломанные модели исчерпывали бюджет генерации за
+    ~400 секунд (одна рвала соединение на 200 с, другая молчала до бюджета), и до
+    рабочих моделей в конце цепочки дело не доходило — программу собирал алгоритм,
+    хотя рабочая модель была.
+    """
+
+    class FakeProbe:
+        """Проба со сценарием вердиктов по model_id."""
+
+        def __init__(self, unavailable: set[str]) -> None:
+            self.unavailable = unavailable
+            self.checked: list[str] = []
+
+        async def check(self, candidate):
+            from src.application.ai.model_probe import ProbeVerdict
+
+            self.checked.append(candidate.model.model_id)
+            if candidate.model.model_id in self.unavailable:
+                return ProbeVerdict(
+                    available=False,
+                    error_type="AIConnectionError",
+                    detail="не удалось соединиться с сервисом ИИ",
+                )
+            return ProbeVerdict(available=True)
+
+    @pytest.mark.asyncio
+    async def test_dead_model_is_skipped_without_request(self):
+        pool = make_safe_pool()
+        profile = make_profile()
+        probe = self.FakeProbe({"model-a"})
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={"model-b": [make_valid_program_json(pool)]},
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            probe_service=probe,
+        )
+
+        program = await generator.generate(profile, pool)
+
+        assert program.generation.model == "model-b"
+        # Обе модели пробовались, но запрос ушёл только в рабочую.
+        assert probe.checked == ["model-a", "model-b"]
+        assert [model for model, _ in gateway.model_calls] == ["model-b"]
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_is_recorded_as_separate_outcome(self):
+        """`probe_failed` отличается от `provider_error`: запроса не было."""
+        pool = make_safe_pool()
+        profile = make_profile()
+        recorded: list[list] = []
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")],
+            per_model={"model-b": [make_valid_program_json(pool)]},
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            probe_service=self.FakeProbe({"model-a"}),
+            attempt_recorder=lambda attempts, version: _collect(
+                recorded, attempts, version
+            ),
+        )
+
+        await generator.generate(profile, pool)
+
+        # `_collect` пишет пару (попытки, версия инструкции).
+        attempts = AIProgramGenerator.attempts_metadata(recorded[0][0])
+        assert attempts[0]["model_id"] == "model-a"
+        assert attempts[0]["outcome"] == "probe_failed"
+        assert attempts[1]["outcome"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_all_models_failing_probe_ends_generation(self):
+        """Если ни одна модель не прошла пробу, генерация отказывает.
+
+        Дальше решает оркестратор: программу соберёт алгоритм.
+        """
+        pool = make_safe_pool()
+        profile = make_profile()
+        probe = self.FakeProbe({"model-a", "model-b"})
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a"), make_candidate(2, "model-b")]
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            probe_service=probe,
+        )
+
+        with pytest.raises(ProgramGenerationError, match="проверку готовности"):
+            await generator.generate(profile, pool)
+        # Ни одного полного запроса: бюджет генерации не потрачен впустую.
+        assert gateway.model_calls == []
+
+    @pytest.mark.asyncio
+    async def test_repair_does_not_reprobe(self):
+        """Исправление не пробуется: модель только что ответила."""
+        pool = make_safe_pool()
+        profile = make_profile()
+        probe = self.FakeProbe(set())
+
+        gateway = FakeAIGateway(
+            candidates=[make_candidate(1, "model-a")],
+            per_model={"model-a": ["invalid", make_valid_program_json(pool)]},
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=1,
+            probe_service=probe,
+        )
+
+        await generator.generate(profile, pool)
+
+        # Проба один раз, а запросов два (ответ + исправление).
+        assert probe.checked == ["model-a"]
+        assert len(gateway.model_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_generation_works_without_probe(self):
+        """Без пробы поведение прежнее: отказ ловит настоящий запрос."""
+        pool = make_safe_pool()
+        profile = make_profile()
+
+        generator = AIProgramGenerator(
+            gateway=FakeAIGateway([make_valid_program_json(pool)]),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+        )
+
+        program = await generator.generate(profile, pool)
+        assert program.title == "AI Test Program"

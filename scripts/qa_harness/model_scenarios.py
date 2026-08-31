@@ -96,6 +96,48 @@ class AdminClient:
             "PATCH", f"/api/v1/admin/ai/models/{model_pk}", json={"enabled": enabled}
         )
 
+    async def put_task(self, body: dict, task_type: str = "workout_generation") -> dict:
+        response = await self._request(
+            "PUT", f"/api/v1/admin/ai/tasks/{task_type}", json=body
+        )
+        return response.json()
+
+    async def prompts(self, task_type: str = "workout_generation") -> dict:
+        return (
+            await self._request("GET", f"/api/v1/admin/ai/prompts/{task_type}")
+        ).json()
+
+    async def prompt(self, prompt_id: int) -> dict:
+        return (
+            await self._request("GET", f"/api/v1/admin/ai/prompts/detail/{prompt_id}")
+        ).json()
+
+    async def prompt_by_version(
+        self, version: int, task_type: str = "workout_generation"
+    ) -> dict:
+        """Полный текст инструкции по номеру версии.
+
+        Список отдаёт превью, а не текст: детальный ответ приходится запрашивать
+        отдельно по id.
+        """
+        listing = await self.prompts(task_type)
+        item = next((i for i in listing["items"] if i["version"] == version), None)
+        if item is None:
+            raise RuntimeError(f"Инструкции №{version} нет у задачи {task_type}")
+        return await self.prompt(item["id"])
+
+    async def create_model(self, endpoint_id: int, body: dict) -> dict:
+        return (
+            await self._request(
+                "POST", f"/api/v1/admin/ai/endpoints/{endpoint_id}/models", json=body
+            )
+        ).json()
+
+    async def create_prompt(self, body: dict) -> dict:
+        return (
+            await self._request("POST", "/api/v1/admin/ai/prompts", json=body)
+        ).json()
+
     async def readiness(self, task_type: str = "workout_generation") -> dict:
         return (
             await self._request("GET", f"/api/v1/admin/ai/readiness?task_type={task_type}")

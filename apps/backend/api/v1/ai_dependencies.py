@@ -13,6 +13,7 @@ import httpx
 
 from src.application.ai.admin_service import AIConfigurationService
 from src.application.ai.analytics_service import GenerationAnalyticsService
+from src.application.ai.model_probe import ModelProbeService
 from src.application.ai.gateway import AIGateway
 from src.application.ai.health import AIInfrastructureHealthService
 from src.application.ai.readiness import AIReadinessService
@@ -55,6 +56,22 @@ class AIComponents:
     prompts: PromptTemplateRepository
     usage: AIUsageRepository
     audit: AIAuditRepository
+    probe: ModelProbeService
+
+
+# Кеш отказов пробы переживает отдельные вызовы `build_ai_components`: сборка
+# компонентов происходит на каждый запрос, и создание нового сервиса каждый раз
+# обнуляло бы кеш — мёртвая модель пробовалась бы снова и снова.
+_PROBE_SERVICE: ModelProbeService | None = None
+
+
+def _probe_service(adapter_registry, secret_store) -> ModelProbeService:
+    global _PROBE_SERVICE
+    if _PROBE_SERVICE is None:
+        _PROBE_SERVICE = ModelProbeService(
+            adapter_registry=adapter_registry, secret_store=secret_store
+        )
+    return _PROBE_SERVICE
 
 
 def build_generation_analytics_service() -> GenerationAnalyticsService:
@@ -129,11 +146,16 @@ def build_ai_components(http_client: httpx.AsyncClient | None = None) -> AICompo
         usage=usage,
         adapter_registry=adapter_registry,
     )
+    # Проба готовности модели. Один экземпляр на сборку компонентов: кеш отказов
+    # должен переживать отдельную генерацию, иначе в прогоне из двадцати анкет
+    # мёртвая модель пробуется двадцать раз.
+    probe = _probe_service(adapter_registry, secret_store)
     return AIComponents(
         gateway=gateway,
         admin=admin,
         readiness=readiness,
         health=health,
+        probe=probe,
         providers=providers,
         endpoints=endpoints,
         models=models,

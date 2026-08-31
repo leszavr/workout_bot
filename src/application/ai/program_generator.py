@@ -80,6 +80,10 @@ ATTEMPT_SUCCESS = "success"
 ATTEMPT_INVALID_OUTPUT = "invalid_output"
 ATTEMPT_PROVIDER_ERROR = "provider_error"
 ATTEMPT_BUDGET_EXHAUSTED = "budget_exhausted"
+# Модель не прошла пробу готовности: полный запрос к ней не отправлялся.
+# Отдельный исход, а не provider_error: администратору важно различать «модель не
+# ответила на рабочий запрос» и «модель отсеяна до запроса».
+ATTEMPT_PROBE_FAILED = "probe_failed"
 
 
 @dataclass(frozen=True)
@@ -274,6 +278,7 @@ class AIProgramGenerator:
         # ответ не прошёл проверку, но не видно, какая инструкция это вызвала.
         attempt_recorder: Callable[[list[ModelAttempt], int | None], Awaitable[None]]
         | None = None,
+        probe_service=None,
     ) -> None:
         self._gateway = gateway
         self._prompts = prompt_loader
@@ -281,6 +286,9 @@ class AIProgramGenerator:
         self._max_repair_attempts = max_repair_attempts
         self._total_budget_seconds = total_budget_seconds
         self._attempt_recorder = attempt_recorder
+        # Проба готовности модели. Необязательна: без неё генерация работает как
+        # раньше — отказ обнаруживается настоящим запросом, а не пробой.
+        self._probe = probe_service
 
     async def generate(
         self,
@@ -345,6 +353,36 @@ class AIProgramGenerator:
                 )
                 break
 
+            # Проба готовности перед первым обращением к кандидату. Лениво, а не
+            # для всей цепочки сразу: рабочая основная модель стоит одну пробу
+            # (1-3 с), а до резервных дело доходит только при отказе — там проба
+            # экономит минуты ожидания вместо секунд.
+            if self._probe is not None:
+                verdict = await self._probe.check(candidate)
+                if not verdict.available:
+                    probe_error = ProgramGenerationError(
+                        f"Модель не прошла проверку готовности: {verdict.detail}"
+                    )
+                    attempts.append(
+                        self._attempt(
+                            candidate,
+                            initial_valid=False,
+                            repair_attempts=0,
+                            outcome=ATTEMPT_PROBE_FAILED,
+                            error=probe_error,
+                        )
+                    )
+                    last_error = probe_error
+                    logger.warning(
+                        "event=ai_model_skipped_probe_failed",
+                        extra={
+                            "model_pk": candidate.model.id,
+                            "priority": candidate.priority,
+                            "error_type": verdict.error_type,
+                            "cached": verdict.cached,
+                        },
+                    )
+                    continue
             try:
                 program, response, attempt = await self._run_candidate(
                     candidate,
@@ -691,8 +729,11 @@ class AIProgramGenerator:
             else "нет"
         )
 
+        plan = context.session_plan
         return template.format(
             age_years=context.age_years or "не указан",
+            current_condition=context.current_condition or "не сообщал",
+            session_plan=_render_session_plan(plan),
             sex=context.sex.value if context.sex else "не указан",
             height_cm=context.height_cm or "не указан",
             weight_kg=context.weight_kg or "не указан",
@@ -711,3 +752,34 @@ class AIProgramGenerator:
             safe_pool_exercises="\n".join(exercises_lines),
             pool_warnings="\n".join(warnings_lines) or "нет",
         )
+
+
+def _render_session_plan(plan) -> str:
+    """Расчёт занятия в виде текста для промпта.
+
+    Числа передаются как ориентир, а не приказ: модель вправе отступить, если
+    состояние человека того требует, но обязана уложиться в заявленное время.
+    Формулировка объясняет, откуда взяты числа, — модели в роли консультанта нужно
+    основание для решения, а не готовый ответ.
+    """
+    if plan is None:
+        return "не рассчитан"
+
+    lines = [
+        f"Общая длительность занятия: {plan.total_minutes} минут "
+        f"(допустимое отклонение ±{plan.tolerance_minutes} минут).",
+        f"Из них разминка {plan.warmup_minutes} мин, основная часть "
+        f"{plan.main_minutes} мин, заминка {plan.cooldown_minutes} мин.",
+        f"Расчётный объём основной части: {plan.exercises} упражнений, "
+        f"{plan.sets} подхода по {plan.reps_min}-{plan.reps_max} повторений, "
+        f"отдых {plan.rest_seconds} секунд между подходами.",
+        f"Характер нагрузки для этой цели: {plan.approach}.",
+    ]
+    if plan.capped:
+        lines.append(
+            "ВАЖНО: заявленное пользователем время невозможно занять, не изменив "
+            "характер тренировки для его цели. Составь занятие на "
+            f"{plan.total_minutes} минут и укажи эту длительность в описании — не "
+            "растягивай программу до заявленного времени."
+        )
+    return "\n".join(lines)

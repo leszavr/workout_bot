@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace, field
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -44,6 +44,18 @@ _EDGE_REJECTION_STATUS = {400, 401, 403, 405, 406, 408, 421, 429}
 # тратят таймаут задачи, ничего не меняя.
 _RETRY_BACKOFF_BASE = 2.0
 _MAX_RETRY_DELAY = 20.0
+
+# Параметры пробы готовности модели. Запрос предельно короткий: проверяется, что
+# модель отвечает работоспособной структурой, а не качество ответа.
+#
+# Таймаут 20 секунд — граница между «модель думает» и «модель недоступна».
+# Замеры на staging: рабочая модель отвечала на такой запрос за 1-3 секунды,
+# сломанная либо рвала соединение на 30-90 с, либо отдавала ответ без `choices`
+# через 600 с. Двадцати секунд достаточно, чтобы отличить одно от другого, и
+# мало, чтобы проба шести моделей уложилась в бюджет генерации.
+PROBE_TIMEOUT_SECONDS = 20
+PROBE_MAX_TOKENS = 8
+PROBE_PROMPT = "Ответь одним словом: готов"
 
 # Подсказки по типовым отказам API. Формулировки нейтральные: правила общие
 # для любого OpenAI-совместимого сервиса, а не для конкретного поставщика.
@@ -143,6 +155,25 @@ class AIProviderAdapter(abc.ABC):
         """
         raise AIUnsupportedProtocolError(
             "Этот протокол не умеет перечислять доступные модели"
+        )
+
+    async def probe(
+        self, connection: EndpointConnection, model_id: str
+    ) -> AdapterResult:
+        """Минимальный запрос: отвечает ли эта модель работоспособно.
+
+        Проба выполняется тем же путём, что настоящая генерация, и это её смысл.
+        `GET /models` показал бы только доступность подключения: на практике
+        подключение отвечало за секунду, а модель либо рвала соединение, либо
+        возвращала структуру без `choices` после десяти минут ожидания. Проверять
+        нужно ровно то, что потом используется.
+
+        Реализация по умолчанию отсутствует намеренно: у протокола без
+        chat-запроса проба означала бы что-то другое, и подменять её похожей
+        операцией нельзя.
+        """
+        raise AIUnsupportedProtocolError(
+            "Этот протокол не умеет проверять готовность модели"
         )
 
 
@@ -283,6 +314,47 @@ class OpenAICompatibleAdapter(AIProviderAdapter):
         # Все попытки исчерпаны.
         assert last_error is not None
         raise last_error
+
+    async def probe(
+        self, connection: EndpointConnection, model_id: str
+    ) -> AdapterResult:
+        """Минимальная проба модели: один короткий chat-запрос.
+
+        Ретраев нет и таймаут свой, короткий: проба должна отвечать быстро или не
+        отвечать вовсе. Повторять её бессмысленно — цель не добиться ответа, а
+        узнать, стоит ли тратить на эту модель полный запрос.
+        """
+        probe_connection = replace(
+            connection,
+            timeout_seconds=min(connection.timeout_seconds, PROBE_TIMEOUT_SECONDS),
+            max_retries=0,
+        )
+        request = AdapterRequest(
+            messages=[AIMessage(role="user", content=PROBE_PROMPT)],
+            max_tokens=PROBE_MAX_TOKENS,
+            temperature=0.0,
+        )
+        outcome = await self._attempt_once(
+            probe_connection.base_url.rstrip("/") + "/chat/completions",
+            self._headers(probe_connection),
+            self._build_payload(request, model_id),
+            probe_connection,
+            model_id,
+        )
+        if isinstance(outcome, AdapterResult):
+            return outcome
+        raise outcome.error
+
+    @staticmethod
+    def _headers(connection: EndpointConnection) -> dict:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": _USER_AGENT,
+        }
+        if connection.api_key:
+            headers["Authorization"] = f"Bearer {connection.api_key}"
+        return headers
 
     async def list_models(
         self, connection: EndpointConnection

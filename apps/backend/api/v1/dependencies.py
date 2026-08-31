@@ -212,6 +212,10 @@ def build_ai_program_generator(http_client: httpx.AsyncClient | None = None) -> 
         ),
         validator=ProgramValidator(),
         attempt_recorder=_record_model_attempts,
+        # Проба отсеивает недоступную модель до полного запроса: наблюдалось, что
+        # две сломанные модели исчерпывали бюджет генерации за 400 секунд, и до
+        # рабочих в конце цепочки дело не доходило.
+        probe_service=components.probe,
     )
 
 
