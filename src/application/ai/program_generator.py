@@ -32,6 +32,7 @@ Repair получает контекст, достаточный для испр
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -45,7 +46,7 @@ from src.application.ai.program_context import (
 )
 from src.application.programs.validator import ProgramValidator
 from src.domain.ai.enums import AIResponseFormat, AITaskType
-from src.domain.ai.errors import AIConfigurationError, AIError
+from src.domain.ai.errors import AIConfigurationError, AIError, AITimeoutError
 from src.domain.ai.gateway import AIMessage, AIRequest, AIResponse
 from src.domain.enums import GenerationSource, ProgramStatus
 from src.domain.generation import safe_error_message
@@ -63,11 +64,33 @@ AI_GENERATOR_VERSION = "ai-1.0.0"
 # Исчерпав их, генератор переходит к следующей модели цепочки, а не сдаётся.
 MAX_REPAIR_ATTEMPTS = 2
 
-# Предельное время всей генерации, включая повторы внутри адаптера, перебор
-# моделей и repair-запросы. Без общего бюджета таймауты перемножаются
-# (модели × попытки × таймаут) и запрос «висит» минутами: администратор в
-# интерфейсе видит зависание вместо понятного отказа.
-DEFAULT_TOTAL_BUDGET_SECONDS = 240
+# Предел времени на одну модель — основа расчёта бюджета.
+#
+# Без него длинная цепочка бесполезна: замеры на staging показали 16 отказов по
+# бюджету, и ни один из них не был самостоятельной причиной. Две недоступные
+# модели по ~200 секунд каждая выбирали весь бюджет, и рабочие модели в конце
+# цепочки не опрашивались вовсе — программу собирал алгоритм, хотя работающая
+# модель была.
+#
+# Восемьдесят секунд: успешные генерации на staging укладывались в 60-70 секунд
+# (включая repair), а неисправная модель либо рвала соединение раньше, либо
+# молчала минутами. Предел отсекает второе, не мешая первому.
+DEFAULT_MODEL_BUDGET_SECONDS = 80
+
+# Общий бюджет генерации считается от числа кандидатов, а не задаётся числом:
+# `len(candidates) × DEFAULT_MODEL_BUDGET_SECONDS`.
+#
+# Абсолютная константа была бы привязана к текущей конфигурации: при шести
+# моделях 600 секунд, а после добавления администратором ещё десяти — обрыв
+# цепочки на седьмой модели, то есть возврат к той же проблеме и правка кода
+# ради изменения настроек. Число моделей выбирает администратор в админке, и
+# бюджет обязан следовать за ним.
+#
+# Потолок нужен только против вырожденного случая (кто-то привязал к задаче
+# десятки моделей): полчаса ожидания программы бессмысленны независимо от
+# конфигурации. Это защита, а не рабочее ограничение — при разумной цепочке он
+# не достигается.
+MAX_TOTAL_BUDGET_SECONDS = 1800
 
 # Предыдущий ответ модели передаётся в repair целиком: без документа править
 # нечего. Ограничение защищает от вырожденного случая, когда модель вместо
@@ -311,7 +334,10 @@ class AIProgramGenerator:
         prompt_loader: PromptLoader,
         validator: ProgramValidator | None = None,
         max_repair_attempts: int = MAX_REPAIR_ATTEMPTS,
-        total_budget_seconds: int = DEFAULT_TOTAL_BUDGET_SECONDS,
+        # None — считать от числа кандидатов (обычный режим). Явное значение
+        # нужно тестам и вызывающим сторонам с собственным ограничением.
+        total_budget_seconds: int | None = None,
+        model_budget_seconds: int = DEFAULT_MODEL_BUDGET_SECONDS,
         # Второй аргумент — версия инструкции, с которой шла генерация. Без неё
         # журнал попыток не позволяет сравнить формулировки: по нему видно, что
         # ответ не прошёл проверку, но не видно, какая инструкция это вызвала.
@@ -324,6 +350,7 @@ class AIProgramGenerator:
         self._validator = validator or ProgramValidator()
         self._max_repair_attempts = max_repair_attempts
         self._total_budget_seconds = total_budget_seconds
+        self._model_budget_seconds = model_budget_seconds
         self._attempt_recorder = attempt_recorder
         # Проба готовности модели. Необязательна: без неё генерация работает как
         # раньше — отказ обнаруживается настоящим запросом, а не пробой.
@@ -336,7 +363,7 @@ class AIProgramGenerator:
         prompt_version: int | None = None,
     ) -> WorkoutProgram:
         """Генерирует программу: цепочка моделей × (ответ + repair) + валидация."""
-        deadline = time.monotonic() + self._total_budget_seconds
+        started = time.monotonic()
 
         # 1. Создаём минимизированный контекст (без персональных данных)
         context = build_generation_context(profile, pool)
@@ -366,6 +393,11 @@ class AIProgramGenerator:
             profile_id=profile.profile_id,
         )
         chain = await self._gateway.prepare(request)
+
+        # Бюджет считается здесь, а не в начале: число кандидатов известно только
+        # после `prepare()`. Отсчёт идёт от старта генерации — подготовка промпта
+        # и чтение инструкции тоже отнимают время у пользователя.
+        deadline = started + self._budget_for(len(chain.candidates))
 
         # Модель видела ровно эти упражнения (контекст ограничен), поэтому
         # repair предлагает выбирать из того же набора, а не из всего пула.
@@ -500,11 +532,29 @@ class AIProgramGenerator:
         allowed_prompt_ids: list[str],
         deadline: float,
     ) -> tuple[WorkoutProgram, AIResponse, ModelAttempt]:
-        """Ответ модели + repair-попытки. Отказ — это `_CandidateFailed`."""
+        """Ответ модели + repair-попытки. Отказ — это `_CandidateFailed`.
+
+        Время одной модели ограничено отдельно от общего бюджета: недоступная
+        модель не должна выбирать бюджет, оставляя рабочие модели цепочки
+        неопрошенными. Замеры на staging: две модели по ~200 секунд забирали все
+        240 секунд бюджета, и до работающих в конце дело не доходило.
+
+        Предел применяется и к первому вызову, и к repair — обе операции идут к
+        той же модели, и «зависла на исправлении» ничем не лучше «зависла на
+        ответе».
+        """
         repair_attempts = 0
+        # Раньше из двух пределов: своё время модели и остаток общего бюджета.
+        # Общий бюджет здесь тоже нужен — иначе последняя модель могла бы выйти
+        # за него на величину своего предела.
+        model_deadline = min(
+            time.monotonic() + self._model_budget_seconds, deadline
+        )
 
         try:
-            response = await self._gateway.generate_once(candidate, request, chain)
+            response = await self._call_within(
+                candidate, request, chain, model_deadline
+            )
         except AIError as exc:
             raise _CandidateFailed(
                 self._attempt(
@@ -535,7 +585,9 @@ class AIProgramGenerator:
 
                 # Исправлять ответ имеет смысл только если на это осталось
                 # время: иначе администратор ждёт заведомо безнадёжный запрос.
-                if time.monotonic() >= deadline:
+                # Проверяется предел модели, а не общий бюджет: у следующей
+                # модели своё время, и оно ещё может остаться.
+                if time.monotonic() >= model_deadline:
                     budget_error = ProgramGenerationError(
                         f"Отведённое время на генерацию через ИИ исчерпано. "
                         f"Последняя ошибка: {exc}"
@@ -570,8 +622,8 @@ class AIProgramGenerator:
                     allowed_prompt_ids=allowed_prompt_ids,
                 )
                 try:
-                    response = await self._gateway.generate_once(
-                        candidate, repair_request, chain
+                    response = await self._call_within(
+                        candidate, repair_request, chain, model_deadline
                     )
                 except AIError as provider_exc:
                     raise _CandidateFailed(
@@ -600,6 +652,48 @@ class AIProgramGenerator:
 
         # Недостижимо: цикл либо возвращает результат, либо бросает.
         raise ProgramGenerationError("AI-генерация не удалась")
+
+    def _budget_for(self, candidates: int) -> int:
+        """Общий бюджет генерации под фактическую длину цепочки.
+
+        Считается от числа кандидатов, потому что цепочку определяет
+        администратор в админке: абсолютная константа обрывала бы перебор после
+        добавления моделей и требовала правки кода ради изменения настроек.
+        """
+        if self._total_budget_seconds is not None:
+            return self._total_budget_seconds
+        derived = max(1, candidates) * self._model_budget_seconds
+        return min(derived, MAX_TOTAL_BUDGET_SECONDS)
+
+    async def _call_within(
+        self, candidate, request: AIRequest, chain, model_deadline: float
+    ) -> AIResponse:
+        """Вызов модели с жёстким пределом времени.
+
+        `asyncio.wait_for`, а не расчёт таймаута для адаптера: таймаут адаптера
+        относится к одному HTTP-запросу, а внутри вызова есть ретраи, и их сумма
+        превышала предел. Наблюдалось 200 секунд при таймауте задачи 120.
+
+        Отмена по времени превращается в `AITimeoutError`: для вызывающей стороны
+        это транспортный отказ модели, а не особый случай, и обрабатывается тем же
+        переходом к следующему кандидату.
+        """
+        remaining = model_deadline - time.monotonic()
+        if remaining <= 0:
+            raise AITimeoutError(
+                "время, отведённое этой модели, истекло до начала запроса"
+            )
+        try:
+            return await asyncio.wait_for(
+                self._gateway.generate_once(candidate, request, chain),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError as exc:
+            error = AITimeoutError(
+                f"модель не ответила за отведённые ей {self._model_budget_seconds} с"
+            )
+            error.__cause__ = exc
+            raise error from exc
 
     def _parse_and_validate(
         self,

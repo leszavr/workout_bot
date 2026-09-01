@@ -29,7 +29,7 @@ from src.domain.ai.config import (
     PromptTemplate,
 )
 from src.domain.ai.enums import AITaskType
-from src.domain.ai.errors import AIConfigurationError, AIProviderError
+from src.domain.ai.errors import AIConfigurationError, AIError, AIProviderError
 from src.domain.ai.gateway import AIResponse
 from src.domain.enums import (
     ExperienceLevel,
@@ -345,8 +345,12 @@ class TestAIProgramGenerator:
     async def test_repair_is_skipped_when_time_budget_exhausted(self):
         """Исчерпанный бюджет времени прекращает попытки исправления.
 
-        Без общего бюджета таймауты складывались (попытки × таймаут × repair) и
-        запрос «висел» минутами вместо понятного отказа.
+        Без бюджета таймауты складывались (попытки × таймаут × repair) и запрос
+        «висел» минутами вместо понятного отказа.
+
+        Ожидается `AIError`, а не `ProgramGenerationError`: истёкшее время модели
+        — транспортный отказ, и вызывающая сторона обрабатывает его тем же
+        переходом к следующему кандидату, что обрыв соединения.
         """
         pool = make_safe_pool()
         profile = make_profile()
@@ -360,10 +364,10 @@ class TestAIProgramGenerator:
             total_budget_seconds=0,  # время вышло ещё до первой попытки
         )
 
-        with pytest.raises(ProgramGenerationError, match="время"):
+        with pytest.raises(AIError, match="время"):
             await generator.generate(profile, pool)
-        # Исправление не запрашивалось: был только первоначальный вызов.
-        assert len(gateway.calls) == 1
+        # Запросов не было вовсе: отказ до обращения к модели.
+        assert gateway.calls == []
 
     @pytest.mark.asyncio
     async def test_exercise_outside_safe_pool_rejected(self):
@@ -807,7 +811,12 @@ class TestModelChainFallback:
 
     @pytest.mark.asyncio
     async def test_exhausted_budget_stops_the_chain(self):
-        """Исчерпанный бюджет не переносится на следующую модель."""
+        """Исчерпанный общий бюджет прекращает перебор.
+
+        Предел одной модели и общий бюджет — разные ограничители: первый не даёт
+        недоступной модели съесть чужое время, второй ограничивает генерацию
+        целиком.
+        """
         pool = make_safe_pool()
         profile = make_profile()
 
@@ -828,7 +837,11 @@ class TestModelChainFallback:
 
         with pytest.raises(ProgramGenerationError, match="время"):
             await generator.generate(profile, pool)
-        assert [model for model, _ in gateway.model_calls] == ["model-a"]
+        # Первая модель получила свой вызов и провалилась по своему пределу;
+        # к следующей перебор не пошёл — общий бюджет исчерпан. Это разные
+        # ограничители: предел модели не даёт ей съесть чужое время, общий бюджет
+        # ограничивает генерацию целиком.
+        assert [model for model, _ in gateway.model_calls] == []
 
 
 # --- Телеметрия попыток ----------------------------------------------------------
@@ -1346,3 +1359,86 @@ class TestGatewayWrappedJson:
         program = await generator.generate(profile, pool)
         assert program.title == "AI Test Program"
         assert program.generation.source is GenerationSource.AI
+
+
+# --- Бюджет генерации от числа моделей --------------------------------------------
+
+
+class TestBudgetFollowsChainLength:
+    """Общий бюджет считается от числа кандидатов, а не задан числом.
+
+    Абсолютная константа была привязана к текущей конфигурации: при шести моделях
+    её хватало, а после добавления администратором ещё десяти цепочка обрывалась
+    на седьмой — та же проблема, из-за которой предел на модель и вводился, плюс
+    правка кода ради изменения настроек в админке.
+    """
+
+    @staticmethod
+    def _generator(**kwargs):
+        return AIProgramGenerator(
+            gateway=FakeAIGateway(),
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            **kwargs,
+        )
+
+    def test_budget_grows_with_chain_length(self):
+        from src.application.ai.program_generator import (
+            DEFAULT_MODEL_BUDGET_SECONDS,
+        )
+
+        generator = self._generator()
+
+        assert generator._budget_for(1) == DEFAULT_MODEL_BUDGET_SECONDS
+        assert generator._budget_for(6) == 6 * DEFAULT_MODEL_BUDGET_SECONDS
+        assert generator._budget_for(16) == 16 * DEFAULT_MODEL_BUDGET_SECONDS
+
+    def test_budget_is_capped_against_degenerate_configuration(self):
+        """Потолок защищает от десятков привязанных моделей, а не ограничивает.
+
+        Полчаса ожидания программы бессмысленны независимо от конфигурации.
+        """
+        from src.application.ai.program_generator import MAX_TOTAL_BUDGET_SECONDS
+
+        assert self._generator()._budget_for(500) == MAX_TOTAL_BUDGET_SECONDS
+
+    def test_empty_chain_still_has_budget(self):
+        """Пустая цепочка не даёт нулевой бюджет: отказ должен быть осмысленным."""
+        assert self._generator()._budget_for(0) > 0
+
+    def test_explicit_budget_overrides_calculation(self):
+        """Явное значение нужно тестам и вызывающим со своим ограничением."""
+        assert self._generator(total_budget_seconds=42)._budget_for(6) == 42
+
+    @pytest.mark.asyncio
+    async def test_long_chain_reaches_last_model(self):
+        """Шесть моделей: до последней доходит очередь, бюджет не обрывает перебор.
+
+        Регрессия: при абсолютном бюджете 240 с и пределе 80 с на модель перебор
+        обрывался на третьей, и рабочие модели в конце не опрашивались.
+        """
+        pool = make_safe_pool()
+        profile = make_profile()
+        chain = [make_candidate(i, f"model-{i}") for i in range(1, 7)]
+
+        gateway = FakeAIGateway(
+            candidates=chain,
+            per_model={
+                # Первые пять отвечают невалидно, последняя — корректно.
+                **{f"model-{i}": ["invalid"] for i in range(1, 6)},
+                "model-6": [make_valid_program_json(pool)],
+            },
+        )
+        generator = AIProgramGenerator(
+            gateway=gateway,
+            prompt_loader=FakePromptLoader(),
+            validator=ProgramValidator(),
+            max_repair_attempts=0,
+        )
+
+        program = await generator.generate(profile, pool)
+
+        assert program.generation.model == "model-6"
+        assert [model for model, _ in gateway.model_calls] == [
+            f"model-{i}" for i in range(1, 7)
+        ]
