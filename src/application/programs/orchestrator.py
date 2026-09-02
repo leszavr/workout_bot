@@ -305,6 +305,58 @@ class ProgramGenerationOrchestrator:
         run.result.job = run.job
         return run.result
 
+    async def retry(self, job: GenerationJob) -> OrchestratorResult:
+        """Повторная попытка захваченного job (Phase 1.2-D).
+
+        Точка входа для worker'а. Отдельный метод, а не флаг в
+        `GenerationRequest`, потому что вход другой: у повтора уже есть job,
+        захваченный и переведённый в `RUNNING`, и заново проходить контур
+        идемпотентности (номер попытки, ключ, разбор дубликата) нельзя — это
+        привело бы ко второму job.
+
+        Всё остальное совпадает с обычной генерацией: тот же `_generate`, тот же
+        readiness gate, safety, validator и запись программы. Worker не получает
+        собственного pipeline — именно это и требует граница 1.2-C.
+
+        Стратегия восстанавливается из самого job: `requested_generator` записан
+        при создании. Fallback разрешён, потому что повторяются только transient
+        отказы, и подменить генератор здесь — ровно то поведение, которое
+        задумано для автогенерации. Для запроса администратора это отступление
+        от `allow_fallback=False`, поэтому повтор административных job не
+        планируется вовсе (см. `GenerationRetryService`).
+        """
+        profile = await self._profiles.get(job.profile_id)
+        if profile is None:
+            raise GenerationFailedError(
+                f"Профиль {job.profile_id} не найден",
+                generation_error_code=GenerationErrorCode.PROFILE_NOT_FOUND.value,
+            )
+        if self._generation_jobs is None:
+            raise GenerationFailedError(
+                "Повтор генерации требует job-контура",
+                generation_error_code=GenerationErrorCode.GENERATION_FAILED.value,
+            )
+
+        strategy = self._resolve_strategy(
+            GenerationRequest(
+                profile_id=job.profile_id,
+                trigger=job.trigger,
+                requested_generator=job.requested_generator or None,
+                allow_fallback=True,
+            )
+        )
+        run = await self._generation_jobs.run_claimed(
+            job,
+            operation=lambda: self._generate(profile, job.profile_id, strategy),
+        )
+        if run.result is None:
+            raise GenerationFailedError(
+                "Повтор генерации не вернул результат",
+                generation_error_code=GenerationErrorCode.GENERATION_FAILED.value,
+            )
+        run.result.job = run.job
+        return run.result
+
     # --- internals --------------------------------------------------------------
 
     def _resolve_strategy(self, request: GenerationRequest) -> GenerationStrategy:

@@ -231,6 +231,17 @@ COMPONENT_REQUIREMENTS: dict[ComponentType, ComponentRequirement] = {
         min_version="2.2.0",
         recommended_version="2.2.0",
     ),
+    # Worker (Phase 1.2-D) собирается из того же пакета, что и Backend, и
+    # общается с ним только через реестр, поэтому требования к нему совпадают
+    # с требованиями к Gateway. Требование объявлено явно, а не унаследовано:
+    # без записи в этой таблице компонент получал бы вердикт `UNKNOWN`, и
+    # deployment gate не мог бы судить о его совместимости.
+    ComponentType.WORKER: ComponentRequirement(
+        component_type=ComponentType.WORKER,
+        supported_contracts=BACKEND_SUPPORTED_CONTRACTS,
+        min_version="2.2.0",
+        recommended_version="2.2.0",
+    ),
 }
 
 # Сколько ждём heartbeat, прежде чем считать экземпляр офлайном. Порог заметно

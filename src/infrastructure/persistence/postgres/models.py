@@ -21,6 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -180,9 +181,27 @@ class ProgramDeliveryRow(Base):
 
     Delivery retry независим от generation retry: после успешной генерации
     повторные попытки доставки не запускают новую генерацию.
+
+    `next_attempt_at`/`lease_*` (Phase 1.2-D) делают повтор межпроцессным:
+    до них состояние повторов жило внутри одного вызова, и `failed`-запись
+    никто не подхватывал.
     """
 
     __tablename__ = "program_deliveries"
+    __table_args__ = (
+        Index(
+            "ix_program_deliveries_retry_queue",
+            "status",
+            "next_attempt_at",
+            postgresql_where=text("next_attempt_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_program_deliveries_lease",
+            "status",
+            "lease_expires_at",
+            postgresql_where=text("lease_expires_at IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     program_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -194,6 +213,9 @@ class ProgramDeliveryRow(Base):
     last_error: Mapped[str | None] = mapped_column(String(500))
     sent_message_id: Mapped[int | None] = mapped_column(Integer)
     source_media_mode: Mapped[str | None] = mapped_column(String(32))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -215,6 +237,10 @@ class GenerationJobRow(Base):
 
     Секретов, промптов, ответов провайдера и персональных данных здесь нет:
     только код ошибки и короткое безопасное описание.
+
+    Phase 1.2-D добавляет `next_attempt_at` (когда повтор допустим) и аренду
+    `lease_owner`/`lease_expires_at` (кто выполняет сейчас). Без аренды
+    «застрявший в RUNNING» неотличим от «идёт легальная длинная генерация».
     """
 
     __tablename__ = "generation_jobs"
@@ -230,6 +256,19 @@ class GenerationJobRow(Base):
         # Номер попытки вычисляется по завершённым job того же триггера;
         # индекс обслуживает именно этот запрос.
         Index("ix_generation_jobs_profile_trigger", "profile_id", "trigger"),
+        # Очередь повторов воркера: только job с назначенным повтором.
+        Index(
+            "ix_generation_jobs_retry_queue",
+            "status",
+            "next_attempt_at",
+            postgresql_where=text("next_attempt_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_generation_jobs_lease",
+            "status",
+            "lease_expires_at",
+            postgresql_where=text("lease_expires_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -246,6 +285,9 @@ class GenerationJobRow(Base):
     program_version: Mapped[int | None] = mapped_column(Integer)
     last_error_code: Mapped[str | None] = mapped_column(String(64))
     last_error_message: Mapped[str | None] = mapped_column(String(500))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )

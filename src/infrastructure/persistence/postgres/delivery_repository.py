@@ -3,18 +3,27 @@
 Хранит статусы доставки (pending/sending/sent/failed) и число попыток.
 Delivery retry независим от generation retry: программа уже сохранена,
 повторяется только отправка файла.
+
+Phase 1.2-D добавляет межпроцессный повтор: `next_attempt_at` (когда повтор
+допустим) и аренду (`lease_owner`/`lease_expires_at`). До этого повторы жили
+внутри одного вызова `_send_with_retry`, и после его завершения `failed`-запись
+никто не подхватывал.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.domain.enums import ProgramDeliveryStatus
 from src.errors import ProgramDeliveryError
 from src.infrastructure.persistence.postgres.models import ProgramDeliveryRow
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class ProgramDeliveryRecord:
@@ -31,6 +40,9 @@ class ProgramDeliveryRecord:
         last_error: str | None = None,
         sent_message_id: int | None = None,
         source_media_mode: str | None = None,
+        next_attempt_at: datetime | None = None,
+        lease_owner: str | None = None,
+        lease_expires_at: datetime | None = None,
     ) -> None:
         self.id = id
         self.program_id = program_id
@@ -42,6 +54,9 @@ class ProgramDeliveryRecord:
         self.last_error = last_error
         self.sent_message_id = sent_message_id
         self.source_media_mode = source_media_mode
+        self.next_attempt_at = next_attempt_at
+        self.lease_owner = lease_owner
+        self.lease_expires_at = lease_expires_at
 
 
 class ProgramDeliverySummary:
@@ -105,6 +120,9 @@ class ProgramDeliveryRepository:
                     row.sent_message_id = record.sent_message_id
                     row.chat_id = record.chat_id or row.chat_id
                     row.filename = record.filename or row.filename
+                    row.next_attempt_at = record.next_attempt_at
+                    row.lease_owner = record.lease_owner
+                    row.lease_expires_at = record.lease_expires_at
                     if record.status is ProgramDeliveryStatus.SENT:
                         row.delivered_at = datetime.now(timezone.utc)
         except SQLAlchemyError as exc:
@@ -180,6 +198,143 @@ class ProgramDeliveryRepository:
             )
         return result
 
+    # --- worker: захват, аренда, recovery (Phase 1.2-D) ------------------------
+
+    async def claim_due(
+        self,
+        *,
+        owner: str,
+        lease_seconds: float,
+        limit: int = 1,
+        now: datetime | None = None,
+    ) -> list[ProgramDeliveryRecord]:
+        """Забирает failed-доставки, которым назначен повтор.
+
+        Взаимное исключение — ``FOR UPDATE SKIP LOCKED`` в той же транзакции,
+        что и перевод в `SENDING`: второй worker не увидит заблокированную
+        строку и не будет её ждать. Статус меняется сразу, потому что
+        отправка уже началась с точки зрения любого другого читателя.
+
+        Записи без `chat_id` не берутся: повторить отправку некуда, и попытка
+        только сожгла бы лимит попыток.
+        """
+        moment = now or _utcnow()
+        expires = moment + timedelta(seconds=lease_seconds)
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    rows = (
+                        await session.execute(
+                            select(ProgramDeliveryRow)
+                            .where(
+                                ProgramDeliveryRow.status
+                                == ProgramDeliveryStatus.FAILED.value,
+                                ProgramDeliveryRow.next_attempt_at.is_not(None),
+                                ProgramDeliveryRow.next_attempt_at <= moment,
+                                ProgramDeliveryRow.chat_id.is_not(None),
+                            )
+                            .order_by(ProgramDeliveryRow.next_attempt_at)
+                            .limit(limit)
+                            .with_for_update(skip_locked=True)
+                        )
+                    ).scalars().all()
+
+                    claimed: list[ProgramDeliveryRecord] = []
+                    for row in rows:
+                        row.status = ProgramDeliveryStatus.SENDING.value
+                        row.next_attempt_at = None
+                        row.lease_owner = owner
+                        row.lease_expires_at = expires
+                        claimed.append(_to_record(row))
+                    return claimed
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Не удалось захватить доставки: {exc.__class__.__name__}"
+            ) from exc
+
+    async def release_stale(
+        self,
+        *,
+        message: str,
+        next_attempt_at: datetime | None = None,
+        limit: int = 50,
+        now: datetime | None = None,
+    ) -> list[ProgramDeliveryRecord]:
+        """Возвращает в failed доставки, чей исполнитель исчез.
+
+        `SENDING` с просроченной арендой означает, что процесс умер между
+        началом отправки и записью результата. Такая запись без вмешательства
+        осталась бы в `SENDING` навсегда, и `list_failed`/`claim_due` её больше
+        не увидели бы.
+
+        `SENDING` без аренды не трогаем: она принадлежит синхронной отправке из
+        другого процесса (Telegram-пайплайн), которая воркеру не подотчётна.
+        """
+        moment = now or _utcnow()
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    rows = (
+                        await session.execute(
+                            select(ProgramDeliveryRow)
+                            .where(
+                                ProgramDeliveryRow.status
+                                == ProgramDeliveryStatus.SENDING.value,
+                                ProgramDeliveryRow.lease_expires_at.is_not(None),
+                                ProgramDeliveryRow.lease_expires_at <= moment,
+                            )
+                            .order_by(ProgramDeliveryRow.lease_expires_at)
+                            .limit(limit)
+                            .with_for_update(skip_locked=True)
+                        )
+                    ).scalars().all()
+
+                    released: list[ProgramDeliveryRecord] = []
+                    for row in rows:
+                        row.status = ProgramDeliveryStatus.FAILED.value
+                        row.last_error = message[:500]
+                        row.next_attempt_at = next_attempt_at
+                        row.lease_owner = None
+                        row.lease_expires_at = None
+                        released.append(_to_record(row))
+                    return released
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Не удалось восстановить зависшие доставки: {exc.__class__.__name__}"
+            ) from exc
+
+    async def schedule_retry(
+        self, record: ProgramDeliveryRecord, *, next_attempt_at: datetime
+    ) -> bool:
+        """Назначает повтор доставке, которую закрыл не worker.
+
+        Возвращает False, если запись больше не в failed или повтор уже
+        назначен: одна неудача не должна давать две очереди.
+        """
+        if record.id is None:
+            raise ProgramDeliveryError("delivery record id is empty")
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    updated = (
+                        await session.execute(
+                            update(ProgramDeliveryRow)
+                            .where(
+                                ProgramDeliveryRow.id == record.id,
+                                ProgramDeliveryRow.status
+                                == ProgramDeliveryStatus.FAILED.value,
+                                ProgramDeliveryRow.next_attempt_at.is_(None),
+                            )
+                            .values(next_attempt_at=next_attempt_at)
+                            .returning(ProgramDeliveryRow.id)
+                        )
+                    ).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Не удалось назначить повтор доставки: {exc.__class__.__name__}"
+            ) from exc
+        return updated is not None
+
     async def delete_for_program(self, program_id: str) -> int:
         """Удаляет записи доставок программы. Возвращает число удалённых строк.
 
@@ -230,4 +385,7 @@ def _to_record(row: ProgramDeliveryRow) -> ProgramDeliveryRecord:
         last_error=row.last_error,
         sent_message_id=row.sent_message_id,
         source_media_mode=row.source_media_mode,
+        next_attempt_at=row.next_attempt_at,
+        lease_owner=row.lease_owner,
+        lease_expires_at=row.lease_expires_at,
     )

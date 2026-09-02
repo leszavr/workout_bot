@@ -28,12 +28,17 @@ from src.application.programs.service import ProgramService
 from src.application.programs.validator import ProgramValidator
 from src.application.profiles.admin_service import ProfileAdminService
 from src.domain.ai.enums import AITaskType
+from src.domain.retry import RetryPolicy
 from src.infrastructure.config import (
     EXERCISE_MEDIA_MAX_PER_EXERCISE,
     MEDIA_PUBLIC_BASE_URL,
     PROGRAM_FALLBACK_GENERATOR,
     PROGRAM_HTML_MEDIA_MODE,
     PROGRAM_PRIMARY_GENERATOR,
+    WORKER_MAX_ATTEMPTS,
+    WORKER_RETRY_INITIAL_DELAY_SECONDS,
+    WORKER_RETRY_MAX_DELAY_SECONDS,
+    WORKER_RETRY_MULTIPLIER,
 )
 from src.infrastructure.media.object_storage import create_object_storage
 from src.infrastructure.persistence.postgres.db import get_session_factory
@@ -57,17 +62,37 @@ from src.infrastructure.persistence.postgres.program_repository import (
 )
 
 
+def build_retry_policy() -> RetryPolicy:
+    """Единая политика повторов для генерации и доставки (Phase 1.2-D).
+
+    Собирается из конфигурации в одном месте: две независимые политики
+    разошлись бы при первом изменении, а объяснить администратору «почему
+    доставка повторяется иначе, чем генерация» было бы нечем.
+    """
+    return RetryPolicy(
+        max_attempts=WORKER_MAX_ATTEMPTS,
+        initial_delay_seconds=WORKER_RETRY_INITIAL_DELAY_SECONDS,
+        multiplier=WORKER_RETRY_MULTIPLIER,
+        max_delay_seconds=WORKER_RETRY_MAX_DELAY_SECONDS,
+    )
+
+
 def build_generation_job_service() -> GenerationJobService:
     """Persistent состояние генерации (Phase 1.2-B).
 
     Идемпотентность и переходы состояния обеспечивает PostgreSQL, поэтому
     сервис получает те же session factory и репозиторий программ, что и
     остальной контур генерации.
+
+    Политика повторов передаётся здесь, а не в worker'е: `next_attempt_at`
+    выставляется в момент отказа, а отказать генерация может в любом процессе —
+    в Telegram-пайплайне, в Admin API и в самом worker'е.
     """
     session_factory = get_session_factory()
     return GenerationJobService(
         repository=GenerationJobRepository(session_factory),
         program_repository=PostgresProgramRepository(session_factory),
+        retry_policy=build_retry_policy(),
     )
 
 

@@ -85,3 +85,50 @@ DEFAULT_TIMEZONE = "UTC"
 MAX_TEXT_LENGTH = 2000
 MAX_PHOTOS = 10
 MAX_PHOTO_SIZE_MB = 20
+
+# --- Worker: retry и recovery фоновых операций (Phase 1.2-D) -------------------
+#
+# Значения подобраны под фактические характеристики контура, а не «круглые»:
+#
+# WORKER_POLL_INTERVAL_SECONDS=15 — цикл опроса. Меньше не нужно: повтор
+# transient-отказа не срочен, а холостой опрос — это запрос к PostgreSQL.
+#
+# WORKER_MAX_ATTEMPTS=3 — всего попыток на операцию, то есть исходная и два
+# повтора. Внутри одной попытки AI-контур уже перебирает все подключённые
+# модели (это его собственный механизм), поэтому третий внешний повтор лечил бы
+# только длительную недоступность провайдера — а её решают планово, а не
+# повторами.
+#
+# WORKER_RETRY_INITIAL_DELAY_SECONDS=60 при множителе 4 даёт паузы 60 с и 240 с.
+# Первая пауза больше, чем типичный сетевой сбой и rate limit окно провайдера;
+# верхняя граница 900 с не даёт повтору уехать за пределы разумного ожидания
+# пользователя, который уже видел «формируем программу».
+#
+# WORKER_LEASE_SECONDS=1860 — аренда чуть больше максимального бюджета
+# генерации (MAX_TOTAL_BUDGET_SECONDS = 1800 с в AI-контуре). Короткая аренда
+# отобрала бы job у живого исполнителя и запустила бы вторую генерацию; аренда
+# продлевается не автоматически, поэтому её длина должна покрывать легальную
+# длительность работы.
+WORKER_POLL_INTERVAL_SECONDS = float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "15"))
+WORKER_MAX_ATTEMPTS = int(os.getenv("WORKER_MAX_ATTEMPTS", "3"))
+WORKER_RETRY_INITIAL_DELAY_SECONDS = float(
+    os.getenv("WORKER_RETRY_INITIAL_DELAY_SECONDS", "60")
+)
+WORKER_RETRY_MULTIPLIER = float(os.getenv("WORKER_RETRY_MULTIPLIER", "4"))
+WORKER_RETRY_MAX_DELAY_SECONDS = float(
+    os.getenv("WORKER_RETRY_MAX_DELAY_SECONDS", "900")
+)
+WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "1860"))
+WORKER_BATCH_SIZE = int(os.getenv("WORKER_BATCH_SIZE", "5"))
+# Идентификатор экземпляра worker'а: попадает в `lease_owner` и в Component
+# Registry. Разные экземпляры обязаны иметь разные значения, иначе аренда одного
+# будет продлеваться от имени другого.
+WORKER_COMPONENT_ID = os.getenv("WORKER_COMPONENT_ID", "worker-local-1")
+WORKER_COMPONENT_NAME = os.getenv("WORKER_COMPONENT_NAME", "Background Worker")
+# Доставка требует Telegram-транспорта. Пусто — worker повторяет только
+# генерацию: отправлять файл без токена бота нечем.
+WORKER_DELIVERY_ENABLED = os.getenv("WORKER_DELIVERY_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)

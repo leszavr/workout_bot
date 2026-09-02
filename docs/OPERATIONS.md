@@ -52,6 +52,9 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 - MinIO — бинарные изображения упражнений;
 - FastAPI — backend/API;
 - Telegram gateway — пользовательский транспорт;
+- Worker — повтор transient-отказов генерации и доставки, восстановление
+  операций после падения процесса (`python -m apps.worker.main`). Redis ему не
+  нужен: очередь повторов и аренда живут в PostgreSQL;
 - Next.js — внутренняя админка.
 
 ## Обязательные проверки после развёртывания
@@ -66,7 +69,12 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 - при искусственной ошибке AI deterministic fallback работает;
 - HTML delivery приходит в Telegram;
 - анкета продолжается после перезапуска процесса бота (`restart bot` посреди
-  анкеты не сбрасывает вопросы).
+  анкеты не сбрасывает вопросы);
+- worker запущен и в логах виден `event=worker_started`; после его перезапуска
+  обработка возобновляется сама (состояния в процессе он не держит);
+- в `generation_jobs` нет записей в статусе `running` с истёкшим
+  `lease_expires_at`: такие job worker обязан вернуть в очередь в течение одного
+  цикла (`WORKER_POLL_INTERVAL_SECONDS`).
 
 ## Переменные
 
@@ -77,7 +85,14 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 - admin/JWT;
 - MinIO/media;
 - `PROGRAM_PRIMARY_GENERATOR`, `PROGRAM_FALLBACK_GENERATOR`;
-- `AUTO_GENERATE_PROGRAM_AFTER_FINALIZE`.
+- `AUTO_GENERATE_PROGRAM_AFTER_FINALIZE`;
+- worker: `WORKER_COMPONENT_ID` (обязан различаться у экземпляров: значение
+  попадает в `lease_owner`), `WORKER_POLL_INTERVAL_SECONDS`,
+  `WORKER_MAX_ATTEMPTS`, `WORKER_RETRY_INITIAL_DELAY_SECONDS`,
+  `WORKER_RETRY_MULTIPLIER`, `WORKER_RETRY_MAX_DELAY_SECONDS`,
+  `WORKER_LEASE_SECONDS`, `WORKER_BATCH_SIZE`, `WORKER_DELIVERY_ENABLED`.
+  `WORKER_LEASE_SECONDS` должен превышать максимальный бюджет генерации
+  (1800 с), иначе job отберут у живого исполнителя и генерация пойдёт дважды.
 
 Секреты не коммитить. Для production требуется отдельная процедура backup/restore и регулярная проверка восстановления.
 

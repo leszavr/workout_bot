@@ -1,13 +1,18 @@
-"""Архитектурный acceptance-тест Phase 1.2-C.
+"""Архитектурный acceptance-тест Phase 1.2-C/1.2-D.
 
 Проверяется не поведение отдельного сервиса, а свойство архитектуры: у
 генерации программы существует ровно одна application-level точка. Тест
-статически анализирует исходники Telegram gateway и Admin API и падает, если
-какой-то слой снова начинает собирать собственный generation pipeline.
+статически анализирует исходники Telegram gateway, Admin API и worker'а и
+падает, если какой-то слой снова начинает собирать собственный generation
+pipeline.
 
 Почему статический анализ, а не мок: обойти оркестратор можно новым кодом,
 который просто не покрыт behavioural-тестами. Здесь фиксируется граница, и
 регрессия видна сразу, без специально написанного сценария.
+
+Worker включён в проверку намеренно: он выполняет генерацию повторно, и именно
+у него был бы соблазн вызвать генератор напрямую «чтобы не тащить весь
+оркестратор».
 """
 from __future__ import annotations
 
@@ -45,7 +50,9 @@ def _python_files(*relative_dirs: str) -> list[Path]:
 def _layer_files() -> list[Path]:
     return [
         path
-        for path in _python_files("apps/backend", "apps/telegram_gateway")
+        for path in _python_files(
+            "apps/backend", "apps/telegram_gateway", "apps/worker"
+        )
         if path.relative_to(PROJECT_ROOT) not in ALLOWED_FILES
     ]
 
