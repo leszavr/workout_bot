@@ -140,18 +140,45 @@ class TestSingleGenerationBoundary:
         assert "build_generation_orchestrator" in body
         assert "build_program_service" not in body
 
-    def test_telegram_pipeline_uses_orchestrator(self):
-        """Telegram finalization идёт через оркестратор и ничего не выбирает сам."""
-        pipeline = (PROJECT_ROOT / "apps/telegram_gateway/pipeline.py").read_text(
-            encoding="utf-8"
-        )
-        assert "build_generation_orchestrator" in pipeline
+    def test_telegram_finalization_uses_orchestrator(self):
+        """Автогенерация после анкеты идёт через оркестратор.
 
-        handler = (
-            PROJECT_ROOT / "apps/telegram_gateway/handlers/review.py"
+        После выноса Gateway за сетевую границу генерацию запускает Backend, а не
+        Telegram-процесс. Проверяется место запуска: оно обязано брать
+        оркестратор из единственной фабрики.
+        """
+        source = (
+            PROJECT_ROOT / "apps/backend/api/v1/telegram_dependencies.py"
         ).read_text(encoding="utf-8")
-        # Handler отвечает только за Telegram-взаимодействие: pipeline и есть
-        # его единственная точка входа в генерацию.
-        assert "build_program_pipeline" in handler
-        assert "ProgramService" not in handler
-        assert "GenerationJob" not in handler
+        assert "build_generation_orchestrator" in source
+        # Своего pipeline у Telegram-контура нет: генератор не выбирается,
+        # программа не сохраняется, состояние job не меняется.
+        assert "ProgramPipelineService" not in source
+
+    def test_gateway_has_no_generation_and_no_database(self):
+        """Gateway транспортирует и отображает: доменных данных у него нет.
+
+        Косметическая граница не считается: даже без импортов оркестрации Gateway
+        с доступом к PostgreSQL остаётся связанным с Backend напрямую. Поэтому
+        проверяются оба признака сразу.
+        """
+        offenders: list[str] = []
+        for path in _python_files("apps/telegram_gateway"):
+            source = path.read_text(encoding="utf-8")
+            for marker in (
+                "get_session_factory",
+                "DATABASE_URL",
+                "src.application.programs",
+                "src.application.questionnaire",
+                "src.application.profiles",
+                "apps.backend",
+                "QUESTIONS",
+            ):
+                if marker in source:
+                    offenders.append(
+                        f"{path.relative_to(PROJECT_ROOT)}: {marker}"
+                    )
+        assert offenders == [], (
+            "Gateway обращается к внутренней инфраструктуре Backend или к "
+            f"структуре анкеты: {offenders}"
+        )

@@ -224,12 +224,16 @@ BLOCKED = "BLOCKED"
 BACKEND_CONTRACT_VERSION = 1
 BACKEND_SUPPORTED_CONTRACTS: tuple[int, ...] = (1,)
 
+# Минимальные версии компонентов не связаны с версией Backend: после выноса
+# Gateway за сетевую границу они меняются по разным причинам, а совместимость
+# определяет `contract_version`. Требование по версии остаётся как защита от
+# заведомо устаревшей сборки, а не как критерий совместимости.
 COMPONENT_REQUIREMENTS: dict[ComponentType, ComponentRequirement] = {
     ComponentType.TELEGRAM_GATEWAY: ComponentRequirement(
         component_type=ComponentType.TELEGRAM_GATEWAY,
         supported_contracts=BACKEND_SUPPORTED_CONTRACTS,
-        min_version="2.2.0",
-        recommended_version="2.2.0",
+        min_version="1.0.0",
+        recommended_version="1.0.0",
     ),
     # Worker (Phase 1.2-D) собирается из того же пакета, что и Backend, и
     # общается с ним только через реестр, поэтому требования к нему совпадают
@@ -239,8 +243,8 @@ COMPONENT_REQUIREMENTS: dict[ComponentType, ComponentRequirement] = {
     ComponentType.WORKER: ComponentRequirement(
         component_type=ComponentType.WORKER,
         supported_contracts=BACKEND_SUPPORTED_CONTRACTS,
-        min_version="2.2.0",
-        recommended_version="2.2.0",
+        min_version="1.0.0",
+        recommended_version="1.0.0",
     ),
 }
 

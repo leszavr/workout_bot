@@ -1,31 +1,38 @@
 services:
+  # Redis шлюза, отдельный от Redis Backend: шлюз не обращается к хранилищам
+  # Backend. Хранит только техническое состояние диалога с TTL.
+  gateway-redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   telegram-bot:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     command: ["python", "-m", "apps.telegram_gateway.main"]
-    env_file:
-      - ../.env
+    # Переменные перечислены поимённо, а не через env_file: общий `.env` содержит
+    # DATABASE_URL и ключи MinIO, а у шлюза доступа к хранилищам быть не должно.
+    # Независимость проверяется фактически, а не по коду.
     environment:
-      WORKOUT_DATA_DIR: /app/data
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-workout_bot}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:-workout_bot}
-      REDIS_URL: redis://redis:6379/0
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set in .env}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set in .env}
-      MEDIA_BUCKET: ${MEDIA_BUCKET:-workout-media}
-      # Внутри compose backend доступен по имени сервиса, а не по localhost из
-      # .env, поэтому адрес регистрации переопределяется здесь.
+      BOT_TOKEN: ${BOT_TOKEN:?set in .env}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+      REDIS_URL: redis://gateway-redis:6379/0
+      # Единственный канал к данным.
       BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://backend:8000}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set in .env}
+      TELEGRAM_COMPONENT_ID: ${TELEGRAM_COMPONENT_ID:-telegram-gateway-local-1}
+      COMPONENT_REGION: ${TELEGRAM_REGION:-EU}
       BUILD_SHA: ${BUILD_SHA:-}
-    volumes:
-      - bot-data:/app/data
     depends_on:
-      postgres:
+      gateway-redis:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio:
+      backend:
         condition: service_started
     restart: unless-stopped
 

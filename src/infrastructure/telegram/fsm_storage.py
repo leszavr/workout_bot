@@ -83,13 +83,29 @@ class _GuardedIsolation(BaseEventIsolation):
 
 
 class FSMStorage:
-    """Ресурсы FSM одного процесса: storage, isolation и их закрытие."""
+    """Ресурсы FSM одного процесса: storage, isolation и их закрытие.
 
-    def __init__(self, client: Redis) -> None:
+    После выноса Gateway за сетевую границу состояние анкеты здесь не хранится:
+    позиция диалога и ответы живут в PostgreSQL (RU). Redis остаётся для
+    служебных нужд aiogram — изоляции параллельных обновлений одного
+    пользователя и технических ключей middleware.
+
+    TTL обязателен: EU-сегмент не является системой хранения, и ключ без срока
+    жизни превратил бы техническое состояние в постоянное. Срок задаётся
+    конфигурацией (`GATEWAY_STATE_TTL_SECONDS`, по умолчанию сутки) — с запасом
+    на прохождение анкеты в несколько заходов.
+    """
+
+    def __init__(self, client: Redis, *, ttl_seconds: int) -> None:
         self._client = client
         self._closed = False
         self.storage: BaseStorage = _GuardedStorage(
-            RedisStorage(redis=client, key_builder=KEY_BUILDER)
+            RedisStorage(
+                redis=client,
+                key_builder=KEY_BUILDER,
+                state_ttl=ttl_seconds,
+                data_ttl=ttl_seconds,
+            )
         )
         self.events_isolation: BaseEventIsolation = _GuardedIsolation(
             RedisEventIsolation(redis=client, key_builder=KEY_BUILDER)
@@ -109,9 +125,14 @@ class FSMStorage:
             await self._client.aclose(close_connection_pool=True)
 
 
-def create_fsm_storage(url: str) -> FSMStorage:
+def create_fsm_storage(url: str, *, ttl_seconds: int | None = None) -> FSMStorage:
     """Storage по строке подключения. Соединение открывается лениво."""
-    return FSMStorage(Redis.from_url(url))
+    from src.infrastructure.config import GATEWAY_STATE_TTL_SECONDS
+
+    return FSMStorage(
+        Redis.from_url(url),
+        ttl_seconds=ttl_seconds or GATEWAY_STATE_TTL_SECONDS,
+    )
 
 
 class _as_storage_error:

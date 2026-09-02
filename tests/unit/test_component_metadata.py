@@ -21,7 +21,7 @@ from src.infrastructure.components.heartbeat_client import (
     SERVICE_TOKEN_HEADER,
     ComponentHeartbeatClient,
 )
-from src.version import APP_VERSION
+from src.version import APP_VERSION, GATEWAY_VERSION
 
 SECRET_TOKEN = "test-service-token"
 
@@ -57,10 +57,20 @@ def _ok(payload: dict | None = None):
 def test_gateway_metadata_reports_version_build_and_contract():
     metadata = gateway_metadata()
     assert metadata.component_type is ComponentType.TELEGRAM_GATEWAY
-    assert metadata.version == APP_VERSION
+    assert metadata.version == GATEWAY_VERSION
     assert metadata.contract_version == GATEWAY_CONTRACT_VERSION
     assert metadata.capabilities == GATEWAY_CAPABILITIES
     assert Capability.TELEGRAM_DELIVERY in metadata.capabilities
+
+
+def test_gateway_version_is_independent_from_backend():
+    """Версии не связаны: обновление Backend не требует развёртывания EU.
+
+    Совместимость определяет `contract_version`. Совпадение версий было бы
+    ложным критерием — тогда любая правка предметной логики требовала бы
+    переразвёртывания шлюза.
+    """
+    assert GATEWAY_VERSION != APP_VERSION
 
 
 def test_metadata_payload_contains_no_secrets():

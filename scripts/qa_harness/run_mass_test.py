@@ -20,6 +20,12 @@
 
 Данные остаются в базе: анкеты и программы должны быть видны в админке как
 созданные обычными пользователями. Очистка — отдельной командой `--cleanup`.
+
+После выноса Gateway за сетевую границу прогон проходит анкеты через настоящий
+HTTP-контракт: Dispatcher вызывает `/internal/v1/telegram/*` на `--base-url`.
+Поэтому нужен `INTERNAL_SERVICE_TOKEN` — тот же, что у развёрнутого Backend.
+Проверка стала строже: раньше гарнесс работал с логикой анкеты в одном процессе,
+теперь путь совпадает с продакшеном вплоть до сериализации запросов.
 """
 from __future__ import annotations
 
@@ -159,7 +165,7 @@ async def main() -> int:
     # модульные singletons: повторный `build_dispatcher` для следующего сценария
     # падает с «Router is already attached». Независимость сценариев обеспечивает
     # смещение telegram_user_id, а не отдельный диспетчер.
-    simulator = _build_simulator()
+    simulator = _build_simulator(args.base_url)
 
     outcomes: list[ProgramOutcome] = []
     for scenario in args.scenarios:
@@ -172,6 +178,7 @@ async def main() -> int:
             outcomes.extend(await _run_scenario(scenario, users, simulator))
 
     await _drain_background_tasks()
+    await _close_backend_client()
 
     report = _build_report(outcomes)
     _print_summary(report, outcomes)
@@ -186,15 +193,44 @@ async def main() -> int:
     return 0 if report["failed"] == 0 else 1
 
 
-def _build_simulator() -> TelegramUserSimulator:
-    """Собирает диспетчер и имитатор один раз на прогон.
+def _build_simulator(base_url: str) -> TelegramUserSimulator:
+    """Собирает диспетчер, HTTP-клиент Backend и имитатор один раз на прогон.
 
-    Хранилище — in-memory: состояние анкеты нужно только на время прохождения, и
-    Redis staging не должен получать мусор от прогона.
+    Хранилище — in-memory: техническое состояние диалога нужно только на время
+    прохождения, а ответы анкеты живут в PostgreSQL Backend, поэтому Redis
+    staging мусора от прогона не получает.
+
+    Клиент Backend настоящий: прогон обязан идти тем же путём, что продакшен, —
+    иначе он проверял бы конфигурацию, которой нет ни у одного развёрнутого
+    компонента.
     """
     from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 
+    from apps.telegram_gateway.backend_client import BackendClient
     from apps.telegram_gateway.main import build_dispatcher
+    from apps.telegram_gateway.runtime import set_backend_client
+    from src.infrastructure.config import (
+        BACKEND_REQUEST_RETRIES,
+        BACKEND_REQUEST_TIMEOUT_SECONDS,
+        BACKEND_RETRY_DELAY_SECONDS,
+        INTERNAL_SERVICE_TOKEN,
+    )
+
+    if not INTERNAL_SERVICE_TOKEN:
+        raise SystemExit(
+            "Нужен INTERNAL_SERVICE_TOKEN: анкета проходит через internal API "
+            "Backend, и без токена он отвечает 401."
+        )
+
+    set_backend_client(
+        BackendClient(
+            base_url=base_url,
+            service_token=INTERNAL_SERVICE_TOKEN,
+            timeout_seconds=BACKEND_REQUEST_TIMEOUT_SECONDS,
+            retries=BACKEND_REQUEST_RETRIES,
+            retry_delay_seconds=BACKEND_RETRY_DELAY_SECONDS,
+        )
+    )
 
     dispatcher: Dispatcher = build_dispatcher(
         storage=MemoryStorage(), events_isolation=SimpleEventIsolation()
@@ -203,13 +239,16 @@ def _build_simulator() -> TelegramUserSimulator:
 
 
 async def _drain_background_tasks() -> None:
-    """Даёт фоновым задачам pipeline завершиться до выхода из процесса.
+    """Даёт фоновым задачам генерации завершиться до выхода из процесса.
 
     Автогенерация выполняется фоновой задачей. Если процесс завершится раньше,
     задача получит CancelledError, и job закроется кодом `unexpected_error` с
     пустым сообщением — в журнале появится отказ, которого не было.
+
+    Задачи принадлежат Backend, а не Gateway: гарнесс поднимает оба контура в
+    одном процессе, поэтому доступ к множеству есть напрямую.
     """
-    from apps.telegram_gateway.handlers.review import _BACKGROUND_TASKS
+    from apps.backend.api.v1.telegram_dependencies import _BACKGROUND_TASKS
 
     pending = {task for task in _BACKGROUND_TASKS if not task.done()}
     if not pending:
@@ -223,6 +262,17 @@ async def _drain_background_tasks() -> None:
             "Не дождался %s фоновых задач: их job закроется как отменённый",
             len(still_pending),
         )
+
+
+async def _close_backend_client() -> None:
+    """Освобождает пул соединений: иначе httpx шумит в лог при выходе."""
+    from apps.telegram_gateway.runtime import get_backend_client, set_backend_client
+
+    try:
+        await get_backend_client().close()
+    except RuntimeError:
+        return
+    set_backend_client(None)
 
 
 async def _run_scenario(
@@ -454,6 +504,15 @@ async def cleanup_qa_data() -> None:
         "(select id from users where telegram_user_id between :lo and :hi)"
     )
     statements = [
+        # Серверные сессии диалога: с выносом Gateway за сетевую границу
+        # состояние анкеты живёт здесь, и без очистки следующий прогон
+        # продолжил бы прошлую анкету вместо новой.
+        # Диапазон сравнивается как строки — так же, как для `users`: границы
+        # шестизначные, поэтому лексикографический порядок совпадает с
+        # числовым. Через подзапрос к `users` идти нельзя: сессия существует до
+        # профиля, и брошенная на первом вопросе анкета не имеет строки в
+        # `users` — она бы осталась и продолжилась в следующем прогоне.
+        "delete from telegram_sessions where telegram_user_id between :lo and :hi",
         f"delete from generation_jobs where profile_id in ({profiles_of_qa})",
         f"delete from program_deliveries where profile_id in ({profiles_of_qa})",
         f"delete from workout_programs where profile_id in ({profiles_of_qa})",

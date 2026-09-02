@@ -21,6 +21,7 @@ from src.application.questionnaire.questions import (
 from src.domain.enums import CompletionStatus, ConsentScope, Weekday
 from src.domain.profile import FitnessProfile
 from src.errors import QuestionnaireValidationError
+from src.infrastructure.config import MAX_PHOTOS
 from src.infrastructure.files.storage import FileStorage
 
 MAX_TEXT_LENGTH = 2000
@@ -156,8 +157,18 @@ class QuestionnaireService:
         return self._advance(profile, question, confirmation="✅ Выбраны удобные дни недели")
 
     def add_photo(self, profile: FitnessProfile, file_id: str, content: bytes, extension: str) -> AnswerResult:
-        """Сохраняет фото оборудования через FileStorage и продолжает анкету."""
+        """Сохраняет фото оборудования через FileStorage и продолжает анкету.
+
+        Лимит на количество проверяется по самому профилю, а не по хранилищу:
+        object storage (RU) не перечисляет ключи по префиксу, а список уже есть
+        в `equipment_photos`. Проверка здесь же означает, что она работает
+        одинаково для любой реализации хранилища.
+        """
         question = self.get_question("q19_equipment_photos")
+        if len(profile.training_location.equipment_photos) >= MAX_PHOTOS:
+            raise QuestionnaireValidationError(
+                f"Достигнут лимит фотографий: не более {MAX_PHOTOS}."
+            )
         key = self._file_storage.save_photo(
             profile_id=profile.profile_id or "draft",
             file_id=file_id,

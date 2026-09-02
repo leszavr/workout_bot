@@ -10,6 +10,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -596,6 +597,55 @@ class ComponentInstanceRow(Base):
         DateTime(timezone=True), server_default=func.now(), index=True
     )
     registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class TelegramSessionRow(Base):
+    """Серверное состояние диалога Telegram-анкеты.
+
+    Состояние анкеты хранится в RU, а не в Redis Gateway: Gateway размещается в
+    EU, и накопленные ответы (имя, возраст, ограничения движений, рекомендации
+    врача) там хранить нельзя.
+
+    Отдельная таблица, а не колонки в `profiles`: сессия существует до профиля.
+    Брошенный на первом вопросе диалог не должен появляться в списке анкет
+    администратора и в аналитике.
+    """
+
+    __tablename__ = "telegram_sessions"
+    __table_args__ = (
+        # У пользователя Telegram один активный диалог с ботом. Без ограничения
+        # параллельные обновления создали бы две сессии, и анкета раздвоилась бы.
+        UniqueConstraint("telegram_user_id", name="uq_telegram_session_user"),
+        Index(
+            "ix_telegram_sessions_profile",
+            "profile_id",
+            postgresql_where=text("profile_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[str] = mapped_column(String(64))
+    chat_id: Mapped[str | None] = mapped_column(String(64))
+    username: Mapped[str | None] = mapped_column(String(64))
+    # Идентификатор вопроса либо служебный экран (review/confirm). Значения
+    # приходят из декларации анкеты: дублировать её в схеме БД значит с ней
+    # разойтись.
+    position: Mapped[str | None] = mapped_column(String(64))
+    editing_question: Mapped[str | None] = mapped_column(String(64))
+    # Черновик профиля с первого ответа: иначе прерванная анкета теряется целиком.
+    draft: Mapped[dict | None] = mapped_column(JSONB)
+    profile_id: Mapped[str | None] = mapped_column(String(64))
+    # Идемпотентность: Telegram переотправляет неподтверждённое обновление, а
+    # Gateway повторяет запрос при таймауте. Хранится и отданный ответ — повтор
+    # обязан вернуть тот же вид, иначе Gateway нечего показать.
+    last_update_id: Mapped[int | None] = mapped_column(BigInteger)
+    last_view: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(

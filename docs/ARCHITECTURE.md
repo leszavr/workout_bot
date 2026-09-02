@@ -1,15 +1,26 @@
 # Архитектура Workout Bot
 
-Модульный монолит. Четыре слоя с зависимостью только «сверху вниз».
+Модульный монолит с одним компонентом за сетевой границей: Telegram Gateway
+развёртывается в EU (там доступен Telegram API), данные и предметная логика
+остаются в RU. Слои зависят только «сверху вниз».
 
 ```
-┌────────────────────────────────────────────────────────────┐
+┌──────────────────── EU ─────────────────────┐
+│ apps/telegram_gateway — транспорт Telegram  │
+│   BackendClient, view_renderer,             │
+│   delivery_poller. Данных нет: PostgreSQL и │
+│   MinIO недоступны, Redis только для        │
+│   служебного состояния aiogram (с TTL)      │
+└──────────────────────┬──────────────────────┘
+                       │ HTTP /internal/v1/telegram/*
+                       │ (X-Internal-Service-Token)
+┌──────────────────────┴─────── RU ──────────────────────────┐
 │ Transport Layer                                            │
-│   apps/telegram_gateway  — aiogram handlers/keyboards/FSM  │
 │   apps/backend           — FastAPI (/health, /ready,       │
 │                            /api/v1: auth, profiles, users, │
 │                            exercises, programs, media,     │
-│                            dashboard)                      │
+│                            dashboard; /internal/v1)        │
+│   apps/worker            — retry и recovery операций       │
 │   apps/web               — Next.js внутренний интерфейс    │
 └───────────────────────────┬────────────────────────────────┘
                             ↓
@@ -22,7 +33,9 @@
 │   src/application/programs      — pipeline генерации:      │
 │       filtering, safety, generator, validator, service,    │
 │       orchestrator (primary/fallback), html_renderer,      │
-│       html_service, telegram_delivery, pipeline            │
+│       html_service, telegram_delivery, retry_service       │
+│   src/application/telegram       — диалог анкеты (dialog),  │
+│       очередь доставки (delivery_queue)                     │
 │   src/application/media         — ExerciseMediaService     │
 │   src/application/ai            — AI Gateway, ModelSelector,│
 │       AIConfigurationService, AIReadinessService,           │
@@ -81,12 +94,18 @@
   а не конфигурация: без него нельзя отличить «не проверялось» от
   «проверка провалилась».
 
-### Runtime-состояние анкеты (Redis)
+### Состояние анкеты (PostgreSQL) и служебное состояние шлюза (Redis)
 
-Незавершённая анкета — это runtime-состояние, а не бизнес-данные: профиль
-попадает в PostgreSQL только при подтверждении. Черновик хранится в **Redis**
-(`REDIS_URL`), поэтому он переживает перезапуск процесса и одинаково доступен
-всем экземплярам бота.
+Незавершённая анкета — бизнес-данные, а не runtime-состояние: в ней уже есть
+имя, возраст, ограничения движений и рекомендации врача. Она хранится в
+PostgreSQL (`telegram_sessions`), в RU. Профиль попадает в `profiles` при
+подтверждении, но черновик пишется с первого ответа: иначе прерванная анкета
+теряется целиком.
+
+До выноса Gateway за сетевую границу черновик лежал в Redis шлюза — то есть
+персональные данные хранились в EU, и без TTL. Теперь Redis шлюза содержит
+только служебное состояние aiogram и имеет TTL
+(`GATEWAY_STATE_TTL_SECONDS`).
 
 - `src/infrastructure/telegram/fsm_storage.py` — `FSMStorage`: aiogram
   `RedisStorage` для состояния и `RedisEventIsolation` для блокировки
@@ -94,6 +113,8 @@
   может обслуживать несколько ботов.
 - Соединение проверяется до старта polling (`FSMStorage.verify`) и
   закрывается при остановке; повторный `close` безопасен.
+- TTL задаётся для `state` и `data`: EU не должен становиться системой
+  хранения. Потеря этих ключей анкету не теряет — позиция и ответы в RU.
 - Ошибки Redis нормализуются в `FSMStorageError`, а
   `apps/telegram_gateway/handlers/errors.py` отвечает пользователю безопасным
   текстом. Без этого сбой хранилища выглядел бы как «бот молчит».
@@ -347,16 +368,24 @@ operational-запись и журнал администратора не мо�
 происходит в `apps/backend/api/v1/dependencies.py`.
 
 Граница закреплена архитектурным тестом
-`tests/unit/test_generation_boundary.py`: Telegram gateway и Admin API не могут
-обращаться к генераторам, `ProgramValidator`, `SafetyEngine`, записи программы
-и переходам состояния job. Легитимное исключение — фабрика зависимостей, где
-pipeline собирается один раз для обоих слоёв.
+`tests/unit/test_generation_boundary.py`: Admin API, worker и Telegram-контур не
+могут обращаться к генераторам, `ProgramValidator`, `SafetyEngine`, записи
+программы и переходам состояния job. Легитимное исключение — фабрика
+зависимостей, где pipeline собирается один раз для всех вызывающих. Отдельная
+проверка запрещает Gateway доступ к PostgreSQL и к структуре анкеты: без неё
+граница была бы косметической — шлюз без импортов оркестрации, но с
+`DATABASE_URL`, остаётся связанным с Backend напрямую.
 
 ### Generation ≠ Delivery
 Ошибка Telegram-доставки не приводит к повторной генерации: программа уже
-сохранена в PostgreSQL, доставка повторяется только на уровне
-`ProgramDeliveryService`. Статусы доставки хранятся в `program_deliveries`
-(pending/sending/sent/failed + число попыток).
+сохранена в PostgreSQL, доставка повторяется отдельно. Статусы доставки хранятся
+в `program_deliveries` (pending/sending/sent/failed, число попыток, аренда,
+`next_attempt_at`).
+
+Эта же таблица служит очередью отправки: Backend ставит задание, Gateway
+забирает его (`FOR UPDATE SKIP LOCKED`), отправляет файл и отчитывается.
+Отдельной сущности для очереди нет — состояние доставки и есть её состояние, и
+второе хранилище пришлось бы синхронизировать с первым.
 
 ### Persistent generation state (Phase 1.2-B)
 
@@ -658,11 +687,15 @@ python -m scripts.import_exercises /path/to/workout --source-version <commit>
 # Импорт фото упражнений в MinIO (идемпотентный, можно повторять)
 python -m scripts.import_exercise_media /path/to/workout --source-version <commit>
 
-# Telegram-бот
+# Telegram-бот (нужны BACKEND_INTERNAL_URL и INTERNAL_SERVICE_TOKEN:
+# данных у шлюза нет, всё идёт через internal API)
 python -m apps.telegram_gateway.main
 
 # Backend
 uvicorn apps.backend.main:app --host 0.0.0.0 --port 8000
+
+# Worker: повторы и recovery операций
+python -m apps.worker.main
 
 # Frontend (http://localhost:3000)
 cd apps/web && npm install && npm run dev
@@ -673,8 +706,31 @@ pytest
 
 Если `DATABASE_URL` не задан — используется файловое хранилище (dev/test).
 
-## Будущее разделение контуров
-Telegram-специфичный код изолирован в `apps/telegram_gateway` и
-`src/infrastructure/telegram`. Application/domain слои не зависят от
-aiogram, что позволяет позже вынести Telegram Gateway на отдельный сервер,
-общающийся с backend по API.
+## Разделение контуров: EU-шлюз и RU-данные
+
+Telegram Gateway вынесен за сетевую границу и общается с Backend только по
+HTTP (`/internal/v1/telegram/*`, шесть операций, service-token). Что это даёт и
+чего стоило:
+
+- **шлюз не знает предметной логики.** Backend отдаёт готовое описание того, что
+  показать (`TelegramView`: текст, кнопки, тип операции), поэтому новый вопрос в
+  анкете не требует развёртывания EU. Обратная сторона: контракт описывает
+  отображение, а не данные, и добавление нового типа элемента интерфейса — это
+  изменение контракта;
+- **данных у шлюза нет.** Ни PostgreSQL, ни ключей MinIO; переменные в compose
+  перечислены поимённо, для staging заведён отдельный `staging-gateway.env`.
+  Проверка фактическая: общий env-файл дал бы доступ к хранилищам RU, даже если
+  код им не пользуется;
+- **инициатива всегда у шлюза.** EU за NAT, входящих подключений к нему нет,
+  поэтому отправку готовых программ он забирает опросом очереди Backend, а не
+  получает push. Цена — задержка опроса (5 с по умолчанию) между «программа
+  готова» и «файл ушёл»; на фоне минут генерации она незаметна;
+- **фотографии проходят через RU.** Скачать файл из Telegram может только шлюз,
+  записать его обязан Backend: байты уходят телом запроса и на диске EU не
+  появляются;
+- **версии независимы.** Совместимость решает `contract_version`, а не совпадение
+  версий или git SHA. Иначе любое обновление Backend требовало бы
+  переразвёртывания EU — то есть независимости не было бы.
+
+Application и domain слои по-прежнему не зависят от aiogram: он остался только в
+`apps/telegram_gateway` и `src/infrastructure/telegram`.

@@ -4,6 +4,11 @@
 требовать Redis, использовать его для FSM и изоляции обновлений, а сбой
 хранилища должен превращаться в понятное сообщение пользователю, а не в
 молчаливую потерю обновления.
+
+После выноса Gateway за сетевую границу ответы анкеты в Redis не хранятся, но
+сам Redis остался нужен: FSM-middleware aiogram читает состояние на каждом
+обновлении, а изоляция сериализует параллельные обновления одного пользователя.
+Поэтому требование «без Redis не стартовать» и обработчик его сбоя сохраняются.
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ from apps.telegram_gateway.handlers.errors import (
 )
 from apps.telegram_gateway.main import resolve_fsm_url
 from src.errors import FSMStorageError
+from src.infrastructure.config import GATEWAY_STATE_TTL_SECONDS
 from src.infrastructure.telegram.fsm_storage import create_fsm_storage
 
 
@@ -59,15 +65,25 @@ class TestDispatcherWiring:
         assert isinstance(dispatcher.fsm.storage, MemoryStorage)
         assert isinstance(dispatcher.fsm.events_isolation, SimpleEventIsolation)
 
-    def test_questionnaire_and_error_routers_are_registered(self, dispatcher):
+    def test_dialog_and_error_routers_are_registered(self, dispatcher):
         names = {router.name for router in dispatcher.sub_routers}
         assert "telegram_gateway.errors" in names
-        # Анкета не должна потеряться при добавлении error router.
-        assert any("questionnaire" in name for name in names)
+        # Диалог не должен потеряться при добавлении error router.
+        assert "telegram_gateway.dialog" in names
 
     def test_error_router_is_first_to_receive_storage_failures(self, dispatcher):
-        """Порядок важен: анкета отвечает на любой текст и перехватила бы событие."""
+        """Порядок важен: диалог отвечает на любой текст и перехватил бы событие."""
         assert dispatcher.sub_routers[0].name == "telegram_gateway.errors"
+
+    def test_state_keys_expire(self):
+        """TTL обязателен: EU не должен становиться постоянным хранилищем."""
+        storage = create_fsm_storage("redis://127.0.0.1:6399/0")
+        try:
+            inner = storage.storage._inner
+            assert inner.state_ttl == GATEWAY_STATE_TTL_SECONDS
+            assert inner.data_ttl == GATEWAY_STATE_TTL_SECONDS
+        finally:
+            pass
 
 
 class TestStorageFailureIsUserVisible:
