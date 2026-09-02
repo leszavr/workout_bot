@@ -51,7 +51,10 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 - Redis — состояние анкеты (FSM) между сообщениями и перезапусками;
 - MinIO — бинарные изображения упражнений;
 - FastAPI — backend/API;
-- Telegram gateway — пользовательский транспорт;
+- Telegram gateway — пользовательский транспорт. Данных не хранит: анкета,
+  профили и состояние диалога живут в RU, шлюз общается с Backend только через
+  `/internal/v1/telegram/*`. Свой Redis (EU) нужен только для служебного
+  состояния aiogram и имеет TTL;
 - Worker — повтор transient-отказов генерации и доставки, восстановление
   операций после падения процесса (`python -m apps.worker.main`). Redis ему не
   нужен: очередь повторов и аренда живут в PostgreSQL;
@@ -72,6 +75,11 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
   анкеты не сбрасывает вопросы);
 - worker запущен и в логах виден `event=worker_started`; после его перезапуска
   обработка возобновляется сама (состояния в процессе он не держит);
+- у контейнера шлюза нет `DATABASE_URL` и ключей MinIO:
+  `docker compose config` для `telegram-bot` не должен их содержать. Это
+  проверяется фактически, а не по коду;
+- в Redis шлюза у ключей есть TTL (`redis-cli ttl <key>` > 0) и нет ответов
+  анкеты: они лежат в `telegram_sessions` (RU);
 - в `generation_jobs` нет записей в статусе `running` с истёкшим
   `lease_expires_at`: такие job worker обязан вернуть в очередь в течение одного
   цикла (`WORKER_POLL_INTERVAL_SECONDS`).
@@ -86,6 +94,15 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 - MinIO/media;
 - `PROGRAM_PRIMARY_GENERATOR`, `PROGRAM_FALLBACK_GENERATOR`;
 - `AUTO_GENERATE_PROGRAM_AFTER_FINALIZE`;
+- шлюз (отдельный env-файл `staging-gateway.env`): `BACKEND_INTERNAL_URL`,
+  `INTERNAL_SERVICE_TOKEN`, `BACKEND_REQUEST_TIMEOUT_SECONDS`,
+  `BACKEND_REQUEST_RETRIES`, `BACKEND_RETRY_DELAY_SECONDS`,
+  `TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS`, `TELEGRAM_DELIVERY_BATCH_SIZE`,
+  `GATEWAY_STATE_TTL_SECONDS`. `DATABASE_URL` и `MINIO_*` в этом файле быть не
+  должно;
+- Backend: `TELEGRAM_DELIVERY_LEASE_SECONDS` — аренда задания на отправку;
+  должна покрывать рендер HTML и отправку документа, иначе задание отдадут
+  второму экземпляру шлюза и пользователь получит файл дважды;
 - worker: `WORKER_COMPONENT_ID` (обязан различаться у экземпляров: значение
   попадает в `lease_owner`), `WORKER_POLL_INTERVAL_SECONDS`,
   `WORKER_MAX_ATTEMPTS`, `WORKER_RETRY_INITIAL_DELAY_SECONDS`,

@@ -26,7 +26,7 @@ from src.infrastructure.config import (
     TELEGRAM_COMPONENT_ID,
     TELEGRAM_COMPONENT_NAME,
 )
-from src.version import APP_VERSION
+from src.version import GATEWAY_VERSION
 
 GATEWAY_CONTRACT_VERSION = 1
 
@@ -44,7 +44,7 @@ def gateway_metadata(
         component_type=ComponentType.TELEGRAM_GATEWAY,
         name=TELEGRAM_COMPONENT_NAME,
         region=COMPONENT_REGION,
-        version=APP_VERSION,
+        version=GATEWAY_VERSION,
         build_sha=BUILD_SHA or None,
         contract_version=GATEWAY_CONTRACT_VERSION,
         capabilities=GATEWAY_CAPABILITIES,

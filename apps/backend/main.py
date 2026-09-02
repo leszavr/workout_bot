@@ -19,6 +19,7 @@ from apps.backend.api.v1.admin_user_routes import router as admin_user_router
 from apps.backend.api.v1.ai_routes import router as ai_admin_router
 from apps.backend.api.v1.component_routes import router as component_router
 from apps.backend.api.v1.internal_routes import router as internal_router
+from apps.backend.api.v1.telegram_routes import router as telegram_internal_router
 from apps.backend.api.v1.media_routes import router as media_router
 from apps.backend.api.v1.routes import router as api_v1_router
 from src.domain.components import (
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_user_router)
     app.include_router(component_router)
     app.include_router(internal_router)
+    app.include_router(telegram_internal_router)
     return app
 
 

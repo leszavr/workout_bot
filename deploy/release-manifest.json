@@ -1,9 +1,9 @@
 {
-  "release": "2.2.0",
+  "release": "2.3.0",
   "generated_for": "deployment tooling and CI compatibility checks",
   "components": {
     "backend": {
-      "version": "2.2.0",
+      "version": "2.3.0",
       "contract": 1,
       "supported_contracts": [
         1
@@ -13,25 +13,26 @@
       "deploy_independently": true
     },
     "admin_web": {
-      "version": "2.2.0",
+      "version": "2.3.0",
       "contract": null,
       "image": "docker/Dockerfile.web",
       "region": "RU",
       "deploy_independently": true
     },
     "telegram_gateway": {
-      "version": "2.2.0",
+      "version": "1.0.0",
       "contract": 1,
       "image": "docker/Dockerfile",
       "region": "EU",
       "deploy_independently": true,
-      "requires_backend_contract": 1
+      "requires_backend_contract": 1,
+      "notes": "No database access: talks to Backend over /internal/v1/telegram only."
     },
     "worker": {
-      "version": "2.2.0",
+      "version": "1.0.0",
       "contract": 1,
       "image": "docker/Dockerfile",
-      "region": "EU",
+      "region": "RU",
       "deploy_independently": true,
       "requires_backend_contract": 1
     }
@@ -41,15 +42,15 @@
       "supported_contracts": [
         1
       ],
-      "min_version": "2.2.0",
-      "recommended_version": "2.2.0"
+      "min_version": "1.0.0",
+      "recommended_version": "1.0.0"
     },
     "worker": {
       "supported_contracts": [
         1
       ],
-      "min_version": "2.2.0",
-      "recommended_version": "2.2.0"
+      "min_version": "1.0.0",
+      "recommended_version": "1.0.0"
     }
   },
   "rules": [
@@ -57,6 +58,8 @@
     "Backend changed with a compatible contract -> Telegram Gateway is not redeployed.",
     "Telegram Gateway contract changed -> Gateway requires its own deployment.",
     "Equal git SHA or equal version across components is never required.",
-    "Worker restart does not affect Backend or Gateway: retry state lives in PostgreSQL."
+    "Worker restart does not affect Backend or Gateway: retry state lives in PostgreSQL.",
+    "Component versions are independent: compatibility is decided by contract_version, not by matching versions.",
+    "Telegram Gateway has no DATABASE_URL and no access to the Backend network segment."
   ]
 }

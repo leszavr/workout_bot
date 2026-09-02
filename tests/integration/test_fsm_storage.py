@@ -1,7 +1,13 @@
-"""Integration-тесты устойчивого FSM-хранилища анкеты (Phase 1.2-A).
+"""Integration-тесты FSM-хранилища Gateway (Phase 1.2-A + сетевая граница).
 
 Требуют `REDIS_URL` в окружении. Без этой переменной тесты пропускаются,
 а не «проходят»: проверять restart-safe поведение на MemoryStorage нельзя.
+
+После выноса Gateway за сетевую границу назначение Redis изменилось: ответы
+анкеты в нём не хранятся (они в PostgreSQL, RU), остаётся только служебное
+состояние aiogram — изоляция параллельных обновлений и технические ключи
+middleware. Поэтому здесь проверяется не сохранность профиля, а два свойства:
+состояние переживает перезапуск процесса и у ключей есть TTL.
 
 Тесты пишут только свои ключи (уникальные bot_id/chat_id/user_id) и удаляют
 их после себя, поэтому прогон безопасен и на общем Redis разработчика.
@@ -16,16 +22,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from redis.asyncio import Redis
 
-from apps.telegram_gateway.handlers.common import load_profile, store_profile
-from src.application.profiles.finalization import ProfileFinalizationService
-from src.application.questionnaire.service import QuestionnaireService
-from src.domain.enums import CompletionStatus
 from src.errors import FSMStorageError
-from src.infrastructure.config import REDIS_URL
-from src.infrastructure.files.storage import LocalFileStorage
-from src.infrastructure.persistence.profile_repository import FileProfileRepository
+from src.infrastructure.config import GATEWAY_STATE_TTL_SECONDS, REDIS_URL
 from src.infrastructure.telegram.fsm_storage import KEY_BUILDER, create_fsm_storage
-from tests.integration.test_full_scenario import run_questionnaire
 
 pytestmark = pytest.mark.skipif(not REDIS_URL, reason="REDIS_URL is not set")
 
@@ -175,30 +174,45 @@ class TestMultipleInstances:
             pass
 
 
-class TestQuestionnaireStillWorks:
-    """D. Завершение анкеты продолжает работать через persistent storage."""
+class TestNoPersonalDataAndTTL:
+    """D. EU не является системой хранения: только служебное состояние, с TTL."""
 
-    async def test_full_questionnaire_round_trip_and_finalize(self, redis_fsm, tmp_path):
+    async def test_state_keys_expire(self, redis_fsm):
+        """Без TTL техническое состояние стало бы постоянным хранилищем."""
         factory, track = redis_fsm
         key = track(unique_key())
         bundle = factory()
         context = FSMContext(storage=bundle.storage, key=key)
 
-        service = QuestionnaireService(
-            LocalFileStorage(tmp_path / "photos", max_files=10, max_size_mb=20)
-        )
-        profile = run_questionnaire(service)
-        await store_profile(context, profile)
+        await context.set_state("QuestionnaireStates:q01_name")
+        await context.update_data(last_message_id=42)
 
-        # Профиль пережил сериализацию в Redis без потерь.
-        restored = await load_profile(context)
-        assert restored is not None
-        assert restored.model_dump(mode="json") == profile.model_dump(mode="json")
+        client = Redis.from_url(REDIS_URL)
+        try:
+            state_ttl = await client.ttl(KEY_BUILDER.build(key, "state"))
+            data_ttl = await client.ttl(KEY_BUILDER.build(key, "data"))
+        finally:
+            await client.aclose(close_connection_pool=True)
 
-        repository = FileProfileRepository(tmp_path / "profiles", tmp_path / "counter.json")
-        result = await ProfileFinalizationService(repository).finalize(restored)
-        assert result.profile.questionnaire.completion_status is CompletionStatus.CONFIRMED
-        assert await repository.exists(result.profile.profile_id)
+        # -1 означает «без срока жизни», -2 — «ключа нет». Оба недопустимы.
+        assert 0 < state_ttl <= GATEWAY_STATE_TTL_SECONDS
+        assert 0 < data_ttl <= GATEWAY_STATE_TTL_SECONDS
+
+    async def test_questionnaire_answers_are_not_stored(self, redis_fsm):
+        """Ответы анкеты в Redis Gateway не попадают.
+
+        Проверяется фактом: диалог ведёт Backend, и у Gateway нет кода, который
+        писал бы профиль в состояние. Тест фиксирует это на уровне хранилища —
+        после установки состояния в данных лежит только то, что положил вызов.
+        """
+        factory, track = redis_fsm
+        key = track(unique_key())
+        context = FSMContext(storage=factory().storage, key=key)
+
+        await context.set_state("QuestionnaireStates:q05_weight")
+        data = await context.get_data()
+
+        assert "profile" not in data
 
 
 class TestRedisFailure:
@@ -212,31 +226,44 @@ class TestRedisFailure:
         finally:
             await bundle.close()
 
-    async def test_runtime_failure_is_not_silent_empty_state(self, tmp_path):
-        """Сбой Redis не должен выглядеть как «анкеты нет»."""
+    async def test_runtime_failure_is_not_silent_empty_state(self):
+        """Сбой Redis не должен выглядеть как «состояния нет».
+
+        Пустой словарь вместо ошибки означал бы для диалога «начни сначала»:
+        Gateway переспросил бы у Backend текущий вопрос, но потерял бы
+        идентификатор сообщения, которое правит, и в чате остался бы висеть
+        экран с активными кнопками.
+        """
         bundle = create_fsm_storage(UNREACHABLE_REDIS_URL)
         context = FSMContext(storage=bundle.storage, key=unique_key())
         try:
             with pytest.raises(FSMStorageError):
-                await load_profile(context)
+                await context.get_data()
         finally:
             await bundle.close()
 
-    async def test_business_data_is_untouched_when_fsm_is_broken(self, tmp_path):
-        """PostgreSQL/бизнес-хранилище не задето сбоем runtime state."""
-        repository = FileProfileRepository(tmp_path / "profiles", tmp_path / "counter.json")
+    async def test_questionnaire_survives_redis_loss(self):
+        """Потеря Redis не теряет анкету: она в RU.
+
+        Проверяется свойство размещения данных, а не поведение хранилища:
+        состояние диалога живёт в PostgreSQL, поэтому недоступность Redis EU
+        отменяет только текущий шаг, а не собранные ответы.
+        """
         bundle = create_fsm_storage(UNREACHABLE_REDIS_URL)
-        context = FSMContext(storage=bundle.storage, key=unique_key())
-        service = QuestionnaireService(
-            LocalFileStorage(tmp_path / "photos", max_files=10, max_size_mb=20)
-        )
-        profile = service.start_profile("999", "broken-fsm")
         try:
             with pytest.raises(FSMStorageError):
-                await store_profile(context, profile)
+                await bundle.verify()
         finally:
             await bundle.close()
-        assert not await repository.exists(profile.profile_id)
+
+        # Ответы и позиция диалога недоступному Redis не принадлежат: они
+        # читаются из PostgreSQL через TelegramSessionRepository, который к
+        # Redis не обращается вовсе.
+        from src.infrastructure.persistence.postgres.telegram_session_repository import (
+            TelegramSessionRepository,
+        )
+
+        assert "redis" not in TelegramSessionRepository.__module__
 
 
 class TestStorageLifecycle:

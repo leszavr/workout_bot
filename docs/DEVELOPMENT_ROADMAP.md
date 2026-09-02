@@ -180,17 +180,45 @@ Bot API не сообщает об открытии присланного до�
       `test_worker_process.py`) и integration на реальной PostgreSQL
       (`tests/integration/test_worker_retry.py`).
 
-**Осознанное ограничение:** `RUNNING` без аренды не восстанавливается. Такой job
-создан синхронным путём в другом процессе (Telegram-пайплайн, Admin API), и
-воркер не может отличить «процесс умер» от «запрос ещё выполняется». Ограничение
-снимается вместе с переносом генерации в worker.
+**Осознанное ограничение (снято сетевой границей Gateway):** `RUNNING` без аренды
+не восстанавливался, потому что такой job создавал синхронный путь в другом
+процессе. Теперь генерацию запускает Backend фоновой задачей, и job принадлежит
+процессу, который его создал.
+
+#### Сетевая граница Telegram Gateway: DONE
+
+- [x] контракт `/internal/v1/telegram/*` — шесть операций, service-token,
+      идемпотентность по `update_id` Telegram;
+- [x] server-driven view: Backend отдаёт текст, кнопки и тип операции, шлюз не
+      знает структуры анкеты — новый вопрос не требует обновления EU;
+- [x] серверная сессия диалога `telegram_sessions` (миграция `0013`): ответы и
+      позиция в RU, черновик профиля с первого ответа;
+- [x] у шлюза нет PostgreSQL, ключей MinIO и импортов предметной логики; Redis
+      остался только для служебного состояния aiogram и получил TTL;
+- [x] фотографии оборудования передаются байтами в RU и пишутся в MinIO; диск EU
+      не участвует;
+- [x] доставка: шлюз опрашивает очередь Backend (EU за NAT, входящих нет);
+      `FOR UPDATE SKIP LOCKED` исключает двойную отправку. Worker больше не
+      обращается к `api.telegram.org`;
+- [x] независимые версии компонентов, `scripts/check_contracts.py` и job
+      `contracts` в CI; совместимость решает `contract_version`;
+- [x] отдельный `staging-gateway.env` и Redis шлюза: изоляция фактическая, а не
+      по коду;
+- [x] тесты: контракт (27), диалог (25), сценарии отказа (10), сценарии
+      развёртывания (13), integration через HTTP (16); qa_harness переведён на
+      контракт.
 
 #### 1.2-E — Delivery
-- [ ] отдельное persistent delivery state/job;
-- [ ] generation и delivery не повторяют друг друга;
-- [ ] Telegram retry;
-- [ ] delivery idempotency;
-- [ ] acceptance Telegram temporary failure.
+- [x] отдельное persistent delivery state/job (очередь `program_deliveries` с
+      арендой, `claim_for_send` и приёмом результата);
+- [x] generation и delivery не повторяют друг друга: повтор доставки идёт через
+      `redeliver()` и не имеет доступа к записи программ;
+- [x] Telegram retry: попытка расходуется по отчёту шлюза, повтор назначается
+      политикой;
+- [x] delivery idempotency: повторная постановка того же файла в тот же чат
+      возвращает существующую запись;
+- [ ] acceptance Telegram temporary failure на staging (проверено тестами,
+      не проверено вживую).
 
 #### 1.2-F — Admin visibility
 - [ ] generation status;
@@ -245,7 +273,8 @@ Bot API не сообщает об открытии присланного до�
 - [x] несколько экземпляров одного типа (`telegram-eu-1`, `telegram-eu-2`);
 - [x] staging deployment и проверка heartbeat/реестра/EU routing;
 - [ ] включить `/internal/v1/deployment-safety` в CI как обязательный шаг перед деплоем backend;
-- [ ] вынести Gateway → Backend взаимодействие за HTTP-границу (остаётся deployment blocker целевой topology).
+- [x] вынести Gateway → Backend взаимодействие за HTTP-границу (deployment blocker
+      целевой topology снят: у шлюза нет доступа к данным).
 
 **Важно:** MAX Gateway, CRUD коннекторов и универсальное управление PostgreSQL/Redis/MinIO/SMTP через админку по-прежнему не реализуются.
 

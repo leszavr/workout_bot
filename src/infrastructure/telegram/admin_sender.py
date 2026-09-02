@@ -10,36 +10,9 @@ import json
 from aiogram import Bot
 from aiogram.types import BufferedInputFile
 
-from src.application.questionnaire.labels import label
 from src.domain.profile import FitnessProfile
 from src.errors import NotificationError
-
-
-def build_admin_summary(profile: FitnessProfile) -> str:
-    client = profile.client
-    goals = profile.goals
-    background = profile.training_background
-    location = profile.training_location
-    health = profile.health_and_limitations
-    return (
-        "📩 Новая анкета клиента\n\n"
-        f"ID: {profile.display_number or profile.profile_id or '—'}\n"
-        f"Имя: {label(client.name)}\n"
-        f"Возраст: {label(client.age_years)}\n"
-        f"Пол: {label(client.sex)}\n"
-        f"Рост: {label(client.height_cm)} см\n"
-        f"Вес: {label(client.weight_kg)} кг\n"
-        f"Талия: {label(client.waist_cm)} см\n"
-        f"Основная цель: {label(goals.primary)}\n"
-        f"Желаемый результат: {label(goals.desired_result)}\n"
-        f"Срок: {label(goals.target_timeframe)}\n"
-        f"Опыт: {label(background.experience_level)}\n"
-        f"Частота: {background.current_frequency_per_week} раз/нед\n"
-        f"Место: {label(location.primary_location)}\n"
-        f"Зал: {label(location.gym_name)}\n"
-        f"Есть ограничения: {'Да' if health.has_limitations else 'Нет'}\n"
-        f"Медицинское подтверждение: {'Да' if health.medical_clearance_required else 'Нет'}\n"
-    )
+from src.infrastructure.telegram.admin_summary import build_admin_summary
 
 
 class TelegramAdminSender:

@@ -23,7 +23,7 @@ from src.infrastructure.config import (
     WORKER_COMPONENT_ID,
     WORKER_COMPONENT_NAME,
 )
-from src.version import APP_VERSION
+from src.version import WORKER_VERSION
 
 WORKER_CONTRACT_VERSION = 1
 
@@ -43,7 +43,7 @@ def worker_metadata(
         component_type=ComponentType.WORKER,
         name=WORKER_COMPONENT_NAME,
         region=COMPONENT_REGION,
-        version=APP_VERSION,
+        version=WORKER_VERSION,
         build_sha=BUILD_SHA or None,
         contract_version=WORKER_CONTRACT_VERSION,
         capabilities=[],

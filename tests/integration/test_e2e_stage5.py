@@ -19,7 +19,6 @@ from src.application.programs.orchestrator import (
     GenerationRequest,
     ProgramGenerationOrchestrator,
 )
-from src.application.programs.pipeline import PipelineOutcome, ProgramPipelineService
 from src.application.programs.safety import SafetyEngine
 from src.application.programs.telegram_delivery import ProgramDeliveryService
 from src.application.programs.validator import ProgramValidator
@@ -33,7 +32,11 @@ from src.domain.enums import (
 )
 from src.domain.generation import GenerationTrigger
 from src.domain.profile import FitnessProfile
+from src.errors import ProgramDeliveryError
 from src.infrastructure.config import DATABASE_URL
+from src.infrastructure.persistence.postgres.program_repository import (
+    PostgresProgramRepository,
+)
 
 pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="DATABASE_URL is not set")
 
@@ -163,7 +166,14 @@ def _profile(profile_id: str) -> FitnessProfile:
     return profile
 
 
-def _build_pipeline(session_factory, primary_generator, fallback_generator, sender):
+def _build_contour(session_factory, primary_generator, fallback_generator, sender):
+    """Оркестратор и доставка по отдельности.
+
+    Общего pipeline-сервиса больше нет: после выноса Gateway за сетевую границу
+    генерацию запускает Backend, а отправку выполняет Gateway по заданию из
+    очереди. Сквозной путь проверяется здесь теми же двумя шагами, что и в
+    продакшене, — генерация, затем доставка.
+    """
     from src.infrastructure.persistence.postgres.delivery_repository import (
         ProgramDeliveryRepository,
     )
@@ -207,11 +217,22 @@ def _build_pipeline(session_factory, primary_generator, fallback_generator, send
         sender=sender,
         max_attempts=2,
     )
-    pipeline = ProgramPipelineService(orchestrator=orchestrator, delivery_service=delivery)
-    return pipeline
+    return orchestrator, delivery
 
 
 class TestEndToEndStage5:
+    async def _generate_and_deliver(self, orchestrator, delivery, profile_id, *, reuse=False):
+        """Тот же порядок, что в продакшене: сначала генерация, потом отправка."""
+        result = await orchestrator.generate(
+            GenerationRequest(
+                profile_id=profile_id,
+                trigger=GenerationTrigger.AUTO_FINALIZATION,
+                reuse_existing=reuse,
+            )
+        )
+        await delivery.deliver(program=result.program, chat_id=CHAT_ID)
+        return result
+
     async def test_e2e_ai_success_flow(self, session_factory, monkeypatch):
         import src.application.programs.telegram_delivery as dm
 
@@ -228,10 +249,13 @@ class TestEndToEndStage5:
         assert result.profile.profile_id == profile.profile_id
 
         sender = FakeDeliverySender()
-        pipeline = _build_pipeline(session_factory, "ai", "deterministic", sender)
-        outcome = await pipeline.run_for_user(profile_id=profile.profile_id, chat_id=CHAT_ID)
+        orchestrator, delivery = _build_contour(
+            session_factory, "ai", "deterministic", sender
+        )
+        outcome = await self._generate_and_deliver(
+            orchestrator, delivery, profile.profile_id
+        )
 
-        assert outcome.outcome is PipelineOutcome.DELIVERED
         program = outcome.program
         assert program.status is ProgramStatus.VALIDATED
         assert program.generation.source is GenerationSource.AI
@@ -290,24 +314,33 @@ class TestEndToEndStage5:
         await PostgresProfileRepository(session_factory).save(profile)
 
         broken_sender = FakeDeliverySender(fail=True)
-        pipeline = _build_pipeline(
+        orchestrator, broken_delivery = _build_contour(
             session_factory, "deterministic", "ai", broken_sender
         )
 
-        first = await pipeline.run_for_user(profile_id=profile.profile_id, chat_id=CHAT_ID)
-        assert first.outcome is PipelineOutcome.DELIVERY_FAILED
-        assert first.program is not None
+        with pytest.raises(ProgramDeliveryError):
+            await self._generate_and_deliver(
+                orchestrator, broken_delivery, profile.profile_id
+            )
 
-        # Повторный запуск с reuse_existing: программа переиспользуется,
-        # генератор не вызывается заново.
+        first_versions = await PostgresProgramRepository(
+            session_factory
+        ).list_for_profile(profile.profile_id)
+        assert len(first_versions) == 1
+
+        # Повторная отправка с reuse_existing: программа переиспользуется,
+        # генератор не вызывается заново. Это и есть требование «delivery retry
+        # не запускает generation retry».
         ok_sender = FakeDeliverySender()
-        pipeline_ok = _build_pipeline(session_factory, "deterministic", "ai", ok_sender)
-        second = await pipeline_ok.run_for_user(
-            profile_id=profile.profile_id, chat_id=CHAT_ID, reuse_existing=True
+        orchestrator_ok, delivery_ok = _build_contour(
+            session_factory, "deterministic", "ai", ok_sender
         )
-        assert second.outcome is PipelineOutcome.DELIVERED
+        second = await self._generate_and_deliver(
+            orchestrator_ok, delivery_ok, profile.profile_id, reuse=True
+        )
         assert second.reused_existing is True
-        assert second.program.program_id == first.program.program_id
+        assert second.program.program_id == first_versions[0].program_id
+        assert len(ok_sender.sent) == 1
 
     async def test_e2e_html_and_delivery_records(self, session_factory, monkeypatch):
         import src.application.programs.telegram_delivery as dm
@@ -325,10 +358,10 @@ class TestEndToEndStage5:
         await PostgresProfileRepository(session_factory).save(profile)
 
         sender = FakeDeliverySender()
-        pipeline = _build_pipeline(session_factory, "deterministic", "ai", sender)
-        outcome = await pipeline.run_for_user(profile_id=profile.profile_id, chat_id=CHAT_ID)
-
-        assert outcome.outcome is PipelineOutcome.DELIVERED
+        orchestrator, delivery = _build_contour(
+            session_factory, "deterministic", "ai", sender
+        )
+        await self._generate_and_deliver(orchestrator, delivery, profile.profile_id)
 
         chat_id, filename, size = sender.sent[0]
         assert chat_id == CHAT_ID
@@ -354,14 +387,16 @@ class TestEndToEndStage5:
         await PostgresProfileRepository(session_factory).save(profile)
 
         sender = FakeDeliverySender()
-        pipeline = _build_pipeline(session_factory, "deterministic", "ai", sender)
-        await pipeline.run_for_user(profile_id=profile.profile_id, chat_id=CHAT_ID)
+        orchestrator, delivery = _build_contour(
+            session_factory, "deterministic", "ai", sender
+        )
+        await self._generate_and_deliver(orchestrator, delivery, profile.profile_id)
 
         program_repo = PostgresProgramRepository(session_factory)
         count_before = len(await program_repo.list_for_profile(profile.profile_id))
 
-        outcome = await pipeline.run_for_user(
-            profile_id=profile.profile_id, chat_id=CHAT_ID, reuse_existing=True
+        outcome = await self._generate_and_deliver(
+            orchestrator, delivery, profile.profile_id, reuse=True
         )
         count_after = len(await program_repo.list_for_profile(profile.profile_id))
 

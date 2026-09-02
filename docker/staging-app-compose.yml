@@ -56,23 +56,46 @@ services:
     restart: unless-stopped
     networks: [workout_net]
 
+  # Redis шлюза. Отдельный от Redis Backend намеренно: шлюз работает в
+  # EU-сегменте и не должен обращаться к хранилищам RU. Хранит только
+  # техническое состояние текущего диалога с TTL — ответы анкеты лежат в
+  # PostgreSQL (RU). Персистентность не включена: потеря этих ключей не теряет
+  # анкету, диалог продолжается после переспроса текущего вопроса.
+  gateway-redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    cpus: 0.25
+    mem_limit: 192m
+    pids_limit: 64
+    restart: unless-stopped
+    networks: [workout_net]
+
   telegram-bot:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    # Отдельный env-файл: у шлюза нет DATABASE_URL, ключей MinIO и адреса Redis
+    # Backend. Общий файл дал бы ему доступ к хранилищам RU, даже если код им не
+    # пользуется — а проверка независимости фактическая, не по коду.
     env_file:
-      - ${STAGING_APP_ENV_FILE:-/opt/workout_bot/compose/staging-app.env}
+      - ${STAGING_GATEWAY_ENV_FILE:-/opt/workout_bot/compose/staging-gateway.env}
     environment:
       WORKOUT_DATA_DIR: /app/data
       # Шлюз размещается в EU-сегменте: это видно администратору в разделе
       # «Инфраструктура» и не влияет на маршрутизацию.
       COMPONENT_REGION: ${TELEGRAM_REGION:-EU}
       BUILD_SHA: ${BUILD_SHA:-}
+      REDIS_URL: redis://gateway-redis:6379/0
     command: ["python", "-m", "apps.telegram_gateway.main"]
-    volumes:
-      - staging-bot-data:/app/data
     depends_on:
       backend:
+        condition: service_healthy
+      gateway-redis:
         condition: service_healthy
     cpus: 0.5
     mem_limit: 768m
@@ -94,7 +117,7 @@ services:
       - ${STAGING_APP_ENV_FILE:-/opt/workout_bot/compose/staging-app.env}
     environment:
       WORKOUT_DATA_DIR: /app/data
-      COMPONENT_REGION: ${WORKER_REGION:-EU}
+      COMPONENT_REGION: ${WORKER_REGION:-RU}
       BUILD_SHA: ${BUILD_SHA:-}
     command: ["python", "-m", "apps.worker.main"]
     volumes:
@@ -110,14 +133,10 @@ services:
     mem_reservation: 256m
     pids_limit: 256
     restart: unless-stopped
-    networks:
-      # Worker повторяет доставку в Telegram, значит его egress тоже обязан
-      # уходить в EU-туннель. Второй фиксированный адрес и второе правило
-      # `ip rule` на хосте — цена того, что policy routing работает по
-      # source-адресу: без них повтор доставки уходил бы через локального
-      # провайдера и блокировался.
-      workout_net:
-        ipv4_address: ${WORKER_IP:-172.18.0.21}
+    # Фиксированный адрес и правило `ip rule` worker'у больше не нужны: в
+    # Telegram он не обращается вовсе. Отправку выполняет Gateway, забирая
+    # задания из очереди, — поэтому egress worker'а остаётся локальным.
+    networks: [workout_net]
 
 networks:
   workout_net:

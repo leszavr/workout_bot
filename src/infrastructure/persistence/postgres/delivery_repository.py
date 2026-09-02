@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -371,6 +371,100 @@ class ProgramDeliveryRepository:
             raise ProgramDeliveryError(
                 f"Не удалось удалить доставки анкеты {profile_id}: {exc}"
             ) from exc
+
+
+    async def get_active_for_program(
+        self, program_id: str, chat_id: str
+    ) -> ProgramDeliveryRecord | None:
+        """Существующая доставка этой программы в этот чат.
+
+        Нужна идемпотентности постановки в очередь: повторная финализация или
+        повторный запрос генерации не должны порождать вторую отправку того же
+        файла. Отменённых доставок в модели нет, поэтому любой найденный статус
+        означает «уже поставлено в очередь либо уже отправлено».
+        """
+        try:
+            async with self._sessions() as session:
+                row = (
+                    await session.execute(
+                        select(ProgramDeliveryRow)
+                        .where(
+                            ProgramDeliveryRow.program_id == program_id,
+                            ProgramDeliveryRow.chat_id == chat_id,
+                        )
+                        .order_by(ProgramDeliveryRow.id.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Ошибка чтения доставки программы: {exc.__class__.__name__}"
+            ) from exc
+        return _to_record(row) if row else None
+
+    async def claim_for_send(
+        self,
+        *,
+        owner: str,
+        lease_seconds: float,
+        limit: int = 5,
+        now: datetime | None = None,
+    ) -> list[ProgramDeliveryRecord]:
+        """Забирает доставки, готовые к отправке в Telegram.
+
+        Берутся два случая: `pending` (файл ещё не отправляли) и `failed` с
+        наступившим `next_attempt_at` (назначен повтор). Разделять их на два
+        запроса незачем — для отправляющей стороны это одно и то же задание.
+
+        Взаимное исключение — ``FOR UPDATE SKIP LOCKED`` в одной транзакции с
+        переводом в `sending`: два экземпляра Gateway не возьмут одну доставку и
+        пользователь не получит файл дважды.
+        """
+        moment = now or _utcnow()
+        expires = moment + timedelta(seconds=lease_seconds)
+        ready = or_(
+            ProgramDeliveryRow.status == ProgramDeliveryStatus.PENDING.value,
+            and_(
+                ProgramDeliveryRow.status == ProgramDeliveryStatus.FAILED.value,
+                ProgramDeliveryRow.next_attempt_at.is_not(None),
+                ProgramDeliveryRow.next_attempt_at <= moment,
+            ),
+        )
+        try:
+            async with self._sessions() as session:
+                async with session.begin():
+                    rows = (
+                        await session.execute(
+                            select(ProgramDeliveryRow)
+                            .where(ready, ProgramDeliveryRow.chat_id.is_not(None))
+                            .order_by(ProgramDeliveryRow.id)
+                            .limit(limit)
+                            .with_for_update(skip_locked=True)
+                        )
+                    ).scalars().all()
+
+                    claimed: list[ProgramDeliveryRecord] = []
+                    for row in rows:
+                        row.status = ProgramDeliveryStatus.SENDING.value
+                        row.next_attempt_at = None
+                        row.lease_owner = owner
+                        row.lease_expires_at = expires
+                        claimed.append(_to_record(row))
+                    return claimed
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Не удалось захватить доставки для отправки: {exc.__class__.__name__}"
+            ) from exc
+
+    async def get(self, delivery_id: int) -> ProgramDeliveryRecord | None:
+        try:
+            async with self._sessions() as session:
+                row = await session.get(ProgramDeliveryRow, delivery_id)
+        except SQLAlchemyError as exc:
+            raise ProgramDeliveryError(
+                f"Ошибка чтения доставки: {exc.__class__.__name__}"
+            ) from exc
+        return _to_record(row) if row else None
 
 
 def _to_record(row: ProgramDeliveryRow) -> ProgramDeliveryRecord:

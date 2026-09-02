@@ -132,3 +132,42 @@ WORKER_DELIVERY_ENABLED = os.getenv("WORKER_DELIVERY_ENABLED", "true").lower() i
     "true",
     "yes",
 )
+
+# --- Telegram Gateway за сетевой границей ---------------------------------------
+#
+# Gateway размещается в EU (там доступен Telegram API), Backend с данными — в RU.
+# Прямого доступа к PostgreSQL у Gateway нет; всё идёт через internal API.
+#
+# TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS=5 — интервал опроса очереди отправки.
+# Инициатором может быть только Gateway: он за NAT, входящих подключений к нему
+# нет. Пять секунд — это задержка между «программа готова» и «файл ушёл»;
+# пользователь к этому моменту уже ждёт минуты, поэтому меньше не нужно, а
+# холостой опрос — это запрос в RU через туннель.
+#
+# TELEGRAM_DELIVERY_LEASE_SECONDS=300 — аренда захваченного задания. Покрывает
+# рендер HTML с изображениями и отправку документа в Telegram с повторами.
+# Короткая аренда отдала бы задание второму экземпляру, и пользователь получил
+# бы файл дважды.
+TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS = float(
+    os.getenv("TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS", "5")
+)
+TELEGRAM_DELIVERY_LEASE_SECONDS = float(
+    os.getenv("TELEGRAM_DELIVERY_LEASE_SECONDS", "300")
+)
+TELEGRAM_DELIVERY_BATCH_SIZE = int(os.getenv("TELEGRAM_DELIVERY_BATCH_SIZE", "5"))
+# Таймаут запроса к Backend. Больше него ждать нет смысла: Telegram всё равно
+# переотправит обновление, а идемпотентность по update_id не даст обработать его
+# дважды.
+BACKEND_REQUEST_TIMEOUT_SECONDS = float(
+    os.getenv("BACKEND_REQUEST_TIMEOUT_SECONDS", "15")
+)
+# Повторы запроса к Backend внутри обработки одного события. Три попытки с
+# короткой паузой лечат мгновенную заминку туннеля RU↔EU, пока пользователь ещё
+# ждёт ответа. Дольше держать его в тишине нельзя.
+BACKEND_REQUEST_RETRIES = int(os.getenv("BACKEND_REQUEST_RETRIES", "3"))
+BACKEND_RETRY_DELAY_SECONDS = float(os.getenv("BACKEND_RETRY_DELAY_SECONDS", "1"))
+# TTL технического состояния диалога в Redis Gateway. Хранятся только
+# идентификаторы сообщений, которые бот правит; ответы пользователя лежат в RU.
+# Без TTL техническое состояние превратилось бы в постоянное хранилище, а EU им
+# быть не должен. Сутки — с запасом на прохождение анкеты в несколько заходов.
+GATEWAY_STATE_TTL_SECONDS = int(os.getenv("GATEWAY_STATE_TTL_SECONDS", "86400"))

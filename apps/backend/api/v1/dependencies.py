@@ -103,6 +103,17 @@ def build_program_service() -> ProgramService:
     )
 
 
+def build_profile_repository() -> PostgresProfileRepository:
+    """Анкеты. Единственная реализация: файлового fallback у Backend нет.
+
+    До выноса Gateway за сетевую границу выбор между PostgreSQL и файловым
+    хранилищем делал сам Gateway. Здесь его нет и не нужно: Backend без
+    PostgreSQL не работает вовсе, и «тихий» файловый режим означал бы анкеты,
+    записанные в том контейнера вместо базы.
+    """
+    return PostgresProfileRepository(get_session_factory())
+
+
 def build_delivery_repository() -> ProgramDeliveryRepository:
     """Записи доставки программ пользователю.
 

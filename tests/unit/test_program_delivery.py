@@ -1,11 +1,14 @@
-"""Unit-тесты delivery и e2e pipeline сервисов (Stage 5).
+"""Unit-тесты доставки программы (Stage 5).
 
 Доставка через фейковый sender; проверяются:
 - успешная отправка с записью статуса;
 - retry при ошибках Telegram (ограниченное число попыток);
-- отправка после повторного вызова для уже сохранённой программы
-  НЕ запускает новую генерацию;
-- pipeline-сервис корректно обрабатывает все стадии ошибок.
+- повторная отправка сохранённой программы НЕ запускает новую генерацию.
+
+Тесты `ProgramPipelineService` удалены вместе с самим сервисом: после выноса
+Gateway за сетевую границу генерацию запускает Backend, а отправку выполняет
+Gateway по заданию из очереди. Их путь проверяется в `test_telegram_dialog.py`,
+`test_gateway_contract.py` и `test_gateway_boundary.py`.
 """
 from __future__ import annotations
 
@@ -15,10 +18,6 @@ from src.application.notifications.program_alerts import ProgramAlert, ProgramAl
 from src.application.programs.html_renderer import render_program_html
 from src.application.programs.html_service import ProgramHtmlService
 from src.application.programs import telegram_delivery as delivery_module
-from src.application.programs.pipeline import (
-    PipelineOutcome,
-    ProgramPipelineService,
-)
 from src.application.programs.telegram_delivery import (
     ProgramDeliveryService,
     ProgramDocument,
@@ -235,94 +234,3 @@ class FakeOrchestrator:
             candidate_pool=ExerciseCandidatePool(profile_id=profile_id, total_exercises=10),
             safe_pool=SafeExercisePool(profile_id=profile_id),
         )
-
-
-class TestPipelineService:
-    def _pipeline(self, *, generation_fail=False, delivery=None, already_running=False):
-        program = _program()
-        alerts: list[ProgramAlert] = []
-
-        async def alert_sender(alert: ProgramAlert) -> None:
-            alerts.append(alert)
-
-        pipeline = ProgramPipelineService(
-            orchestrator=FakeOrchestrator(
-                program, fail=generation_fail, already_running=already_running
-            ),
-            delivery_service=delivery,
-            alert_service=ProgramAlertService(alert_sender),
-        )
-        return pipeline, program, alerts
-
-    async def test_delivered_on_success(self):
-        service, _, _, _, _ = _delivery_service()
-        pipeline, program, _ = self._pipeline(delivery=service)
-
-        result = await pipeline.run_for_user(profile_id="p1", chat_id="1")
-
-        assert result.outcome is PipelineOutcome.DELIVERED
-        assert result.program is not None
-        assert result.user_message
-
-    async def test_generation_failure_user_message(self):
-        pipeline, _, alerts = self._pipeline(generation_fail=True)
-
-        result = await pipeline.run_for_user(profile_id="p1", chat_id="1")
-
-        assert result.outcome is PipelineOutcome.GENERATION_FAILED
-        assert "Не удалось автоматически сформировать" in result.user_message
-        assert alerts and alerts[-1].stage == "generation"
-
-    async def test_generation_failure_is_not_raised(self):
-        pipeline, _, _ = self._pipeline(generation_fail=True)
-        result = await pipeline.run_for_user(profile_id="p1", chat_id="1")
-        assert result.program is None
-
-    async def test_render_failure_keeps_program(self):
-        service, _, _, _, _ = _delivery_service(html_fail=True)
-        pipeline, program, _ = self._pipeline(delivery=service)
-
-        result = await pipeline.run_for_user(profile_id="p1", chat_id="1")
-
-        assert result.outcome is PipelineOutcome.RENDER_FAILED
-        assert result.program is program
-
-    async def test_no_delivery_service_returns_program(self):
-        pipeline, program, _ = self._pipeline(delivery=None)
-        result = await pipeline.run_for_user(profile_id="p1", chat_id=None)
-        assert result.outcome is PipelineOutcome.DELIVERED
-        assert result.program is program
-
-    async def test_duplicate_run_does_not_alert_admin(self):
-        """Дубликат запуска — не сбой: администратора не будим."""
-        pipeline, _, alerts = self._pipeline(already_running=True)
-
-        result = await pipeline.run_for_user(profile_id="p1", chat_id="1")
-
-        assert result.outcome is PipelineOutcome.GENERATION_IN_PROGRESS
-        assert result.program is None
-        assert "уже формируется" in result.user_message
-        assert alerts == []
-
-    async def test_telegram_path_delegates_generation_request(self):
-        """Phase 1.2-C: pipeline только формирует запрос к оркестратору.
-
-        Стратегию он не выбирает: генератор берётся из конфигурации, fallback
-        разрешён, чтобы неработоспособный AI не ломал пользовательский
-        сценарий.
-        """
-        from src.domain.generation import GenerationTrigger
-
-        service, _, _, _, _ = _delivery_service()
-        pipeline, _, _ = self._pipeline(delivery=service)
-        orchestrator = pipeline._orchestrator  # noqa: SLF001 — проверка контракта
-
-        await pipeline.run_for_user(profile_id="p1", chat_id="1")
-
-        assert orchestrator.calls == 1
-        request = orchestrator.requests[0]
-        assert request.profile_id == "p1"
-        assert request.trigger is GenerationTrigger.AUTO_FINALIZATION
-        assert request.requested_generator is None
-        assert request.allow_fallback is True
-        assert request.reuse_existing is True

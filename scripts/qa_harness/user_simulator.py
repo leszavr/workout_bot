@@ -58,6 +58,10 @@ class QuestionnaireRun:
     answered: list[str]
     skipped: list[str]
     finalized: bool
+    # Файл программы. Отправку выполняет поллер доставки Gateway, а не
+    # обработка анкеты: он забирает задание из очереди Backend уже после
+    # генерации. В прогоне поллер не запускается, поэтому здесь всегда False —
+    # факт доставки проверяется по записи в `program_deliveries`.
     program_delivered: bool
     messages: list[str]
 
@@ -93,8 +97,7 @@ class TelegramUserSimulator:
                     break
                 await self._answer(bot, user, question_id, answered, skipped)
 
-            state = await self._state_name(bot, user)
-            if state and state.endswith("review"):
+            if await self._state_name(bot, user) == "review":
                 await self._press(bot, user, "review_confirm")
                 await self._press(bot, user, "final_confirm")
 
@@ -212,34 +215,37 @@ class TelegramUserSimulator:
         cls._counter += 1
         return cls._counter
 
-    # --- Состояние FSM ------------------------------------------------------------
+    # --- Состояние диалога --------------------------------------------------------
+    #
+    # После выноса Gateway за сетевую границу состояние живёт в PostgreSQL (RU), а
+    # не в FSM Gateway. Гарнесс читает его оттуда: позиция диалога и черновик
+    # профиля — часть серверной сессии.
 
-    async def _fsm_context(self, bot: Bot, user: ScriptedUser):
-        from aiogram.fsm.context import FSMContext
-        from aiogram.fsm.storage.base import StorageKey
-
-        key = StorageKey(
-            bot_id=bot.id, chat_id=user.telegram_user_id, user_id=user.telegram_user_id
+    async def _server_session(self, user: ScriptedUser):
+        from src.infrastructure.persistence.postgres.db import get_session_factory
+        from src.infrastructure.persistence.postgres.telegram_session_repository import (
+            TelegramSessionRepository,
         )
-        return FSMContext(storage=self._dispatcher.fsm.storage, key=key)
+
+        repository = TelegramSessionRepository(get_session_factory())
+        return await repository.get(str(user.telegram_user_id))
 
     async def _state_name(self, bot: Bot, user: ScriptedUser) -> str | None:
-        context = await self._fsm_context(bot, user)
-        state = await context.get_state()
-        return str(state) if state else None
+        session = await self._server_session(user)
+        return session.position if session else None
 
     async def _current_question(self, bot: Bot, user: ScriptedUser) -> str | None:
         """Какой вопрос сейчас ждёт ответа. None — анкета дошла до review.
 
-        Состояние читается из FSM, а не угадывается по тексту сообщения: текст
-        вопроса может измениться, а идентификатор состояния — часть контракта.
+        Позиция читается из серверной сессии, а не угадывается по тексту
+        сообщения: текст вопроса может измениться, а идентификатор — часть
+        контракта.
         """
-        from apps.telegram_gateway.handlers.common import state_to_question_id
+        from src.application.questionnaire.questions import QUESTIONS_BY_ID as _by_id
 
-        return state_to_question_id(await self._state_name(bot, user))
+        position = await self._state_name(bot, user)
+        return position if position in _by_id else None
 
     async def _profile(self, bot: Bot, user: ScriptedUser) -> dict | None:
-        context = await self._fsm_context(bot, user)
-        data = await context.get_data()
-        raw = data.get("profile")
-        return raw if isinstance(raw, dict) else None
+        session = await self._server_session(user)
+        return session.draft if session and isinstance(session.draft, dict) else None
