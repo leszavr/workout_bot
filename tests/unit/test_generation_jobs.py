@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -167,11 +168,86 @@ class FakeJobRepository:
         return self._apply(updated, GenerationJobStatus.RUNNING)
 
     async def mark_failed(
-        self, job: GenerationJob, *, error_code, message: str
+        self, job: GenerationJob, *, error_code, message: str, next_attempt_at=None
     ) -> GenerationJob:
         updated = job.model_copy(deep=True)
-        updated.fail(error_code=error_code, message=message)
+        updated.fail(
+            error_code=error_code, message=message, next_attempt_at=next_attempt_at
+        )
         return self._apply(updated, GenerationJobStatus.RUNNING)
+
+    async def claim_due(self, *, owner, lease_seconds, limit=1, now=None):
+        """Аналог FOR UPDATE SKIP LOCKED: берём готовые к повтору job'ы."""
+        moment = now or datetime.now(timezone.utc)
+        due = [
+            job
+            for job in self.rows.values()
+            if job.status is GenerationJobStatus.FAILED
+            and job.next_attempt_at is not None
+            and job.next_attempt_at <= moment
+        ]
+        due.sort(key=lambda j: j.next_attempt_at)
+        claimed: list[GenerationJob] = []
+        for job in due[:limit]:
+            started = job.model_copy(deep=True)
+            started.start()
+            started.lease_owner = owner
+            started.lease_expires_at = moment + timedelta(seconds=lease_seconds)
+            self.rows[started.idempotency_key] = started
+            claimed.append(started.model_copy(deep=True))
+        return claimed
+
+    async def release_stale(
+        self, *, error_code, message, next_attempt_at=None, limit=50, now=None
+    ):
+        moment = now or datetime.now(timezone.utc)
+        stale = [
+            job
+            for job in self.rows.values()
+            if job.status is GenerationJobStatus.RUNNING
+            and job.lease_expires_at is not None
+            and job.lease_expires_at <= moment
+        ]
+        released: list[GenerationJob] = []
+        for job in stale[:limit]:
+            updated = job.model_copy(deep=True)
+            updated.fail(
+                error_code=error_code,
+                message=message,
+                next_attempt_at=next_attempt_at if updated.is_retryable() else None,
+            )
+            self.rows[updated.idempotency_key] = updated
+            released.append(updated.model_copy(deep=True))
+        return released
+
+    async def schedule_retry(self, job: GenerationJob, *, next_attempt_at) -> bool:
+        stored = self.rows.get(job.idempotency_key)
+        if (
+            stored is None
+            or stored.status is not GenerationJobStatus.FAILED
+            or stored.next_attempt_at is not None
+        ):
+            return False
+        stored.next_attempt_at = next_attempt_at
+        return True
+
+    async def clear_retry(self, job: GenerationJob) -> None:
+        stored = self.rows.get(job.idempotency_key)
+        if stored is not None:
+            stored.next_attempt_at = None
+
+    async def renew_lease(self, job: GenerationJob, *, lease_seconds, now=None):
+        stored = self.rows.get(job.idempotency_key)
+        if (
+            stored is None
+            or stored.status is not GenerationJobStatus.RUNNING
+            or stored.lease_owner != job.lease_owner
+        ):
+            return None
+        stored.lease_expires_at = (now or datetime.now(timezone.utc)) + timedelta(
+            seconds=lease_seconds
+        )
+        return stored.lease_expires_at
 
 
 class FakeProgramRepository:
@@ -205,7 +281,10 @@ class TestStateMachine:
             {GenerationJobStatus.SUCCEEDED, GenerationJobStatus.FAILED}
         )
         assert ALLOWED_TRANSITIONS[GenerationJobStatus.SUCCEEDED] == frozenset()
-        assert ALLOWED_TRANSITIONS[GenerationJobStatus.FAILED] == frozenset()
+        # Phase 1.2-D: у провалившейся попытки появился обработчик.
+        assert ALLOWED_TRANSITIONS[GenerationJobStatus.FAILED] == frozenset(
+            {GenerationJobStatus.RUNNING}
+        )
 
     def test_pending_to_running(self):
         job = _job()
@@ -240,7 +319,6 @@ class TestStateMachine:
             (GenerationJobStatus.RUNNING, "start"),
             (GenerationJobStatus.SUCCEEDED, "start"),
             (GenerationJobStatus.SUCCEEDED, "fail"),
-            (GenerationJobStatus.FAILED, "start"),
             (GenerationJobStatus.FAILED, "succeed"),
         ],
     )
@@ -254,14 +332,70 @@ class TestStateMachine:
             else:
                 job.fail(error_code=GenerationErrorCode.GENERATION_FAILED, message="x")
 
-    def test_retry_transition_reserved_for_later_phase(self):
-        """FAILED → PENDING/RUNNING появится вместе с retry-контуром (1.2-D)."""
+    def test_retry_transition_opened_for_worker(self):
+        """FAILED → RUNNING открыт (Phase 1.2-D), FAILED → PENDING — нет.
+
+        Возврата в PENDING нет намеренно: повтор всегда выполняет тот, кто
+        захватил job, поэтому «повтор назначен, но никем не взят» выражается
+        полем `next_attempt_at`, а не отдельным статусом.
+        """
+        assert can_transition(GenerationJobStatus.FAILED, GenerationJobStatus.RUNNING)
         assert not can_transition(
             GenerationJobStatus.FAILED, GenerationJobStatus.PENDING
         )
-        assert not can_transition(
-            GenerationJobStatus.FAILED, GenerationJobStatus.RUNNING
+
+    def test_retry_start_increments_attempts_and_clears_schedule(self):
+        job = _job(GenerationJobStatus.FAILED)
+        job.attempts = 1
+        job.next_attempt_at = datetime.now(timezone.utc)
+        job.completed_at = datetime.now(timezone.utc)
+
+        job.start()
+
+        assert job.status is GenerationJobStatus.RUNNING
+        assert job.attempts == 2
+        # Повтор начат: держать назначенное время и старую отметку завершения
+        # нельзя, иначе job виден и как «выполняется», и как «ждёт повтора».
+        assert job.next_attempt_at is None
+        assert job.completed_at is None
+
+    def test_fail_without_schedule_is_final(self):
+        job = _job(GenerationJobStatus.RUNNING)
+        job.fail(error_code=GenerationErrorCode.AI_TIMEOUT, message="timeout")
+        assert job.next_attempt_at is None
+        assert job.lease_owner is None
+        assert job.lease_expires_at is None
+
+    def test_fail_with_schedule_keeps_retry_time(self):
+        job = _job(GenerationJobStatus.RUNNING)
+        job.lease_owner = "worker-1"
+        moment = datetime.now(timezone.utc) + timedelta(seconds=30)
+        job.fail(
+            error_code=GenerationErrorCode.AI_TIMEOUT,
+            message="timeout",
+            next_attempt_at=moment,
         )
+        assert job.next_attempt_at == moment
+        # Аренда снимается всегда: попытка закончилась.
+        assert job.lease_owner is None
+
+    def test_is_retryable_follows_error_class(self):
+        transient = _job(GenerationJobStatus.RUNNING)
+        transient.fail(error_code=GenerationErrorCode.AI_TIMEOUT, message="x")
+        assert transient.is_retryable() is True
+
+        permanent = _job(GenerationJobStatus.RUNNING)
+        permanent.fail(error_code=GenerationErrorCode.VALIDATION_FAILED, message="x")
+        assert permanent.is_retryable() is False
+
+    def test_lease_expiry(self):
+        job = _job(GenerationJobStatus.RUNNING)
+        now = datetime.now(timezone.utc)
+        assert job.lease_expired(now=now) is False  # аренды нет
+        job.lease_expires_at = now - timedelta(seconds=1)
+        assert job.lease_expired(now=now) is True
+        job.lease_expires_at = now + timedelta(seconds=1)
+        assert job.lease_expired(now=now) is False
 
 
 # --- Классификация ошибок ------------------------------------------------------

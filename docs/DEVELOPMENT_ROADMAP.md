@@ -67,10 +67,10 @@
 - [x] в job не попадают промпт, ответ провайдера, ключи и PII — только стабильный
       код ошибки и безопасное краткое описание.
 
-**Осознанное ограничение:** retry не реализован. `RETRY_WAIT` и переход
-`FAILED → PENDING/RUNNING` зарезервированы для 1.2-D: статус без обработчика
-оставлял бы job в состоянии, из которого его никто не выводит. Recovery stale
-`RUNNING` после падения процесса тоже относится к 1.2-D.
+**Осознанное ограничение (снято в 1.2-D):** на момент 1.2-B retry не был
+реализован. `FAILED → RUNNING` открыт в 1.2-D вместе с обработчиком; `RETRY_WAIT`
+не введён и там — ожидание повтора выражается полем `next_attempt_at`, а не
+отдельным статусом.
 
 #### 1.2-C — Generation Orchestrator: DONE
 - [x] единый `ProgramGenerationOrchestrator`: единственный вход в генерацию —
@@ -152,14 +152,38 @@ Bot API не сообщает об открытии присланного до�
 только факт отправки. Архивация вместо удаления тоже не вводится: она не решает
 роста базы, а добавляет состояние и фильтр во все выборки.
 
-#### 1.2-D — Worker / retry / recovery
-- [ ] фоновые jobs;
-- [ ] централизованный retry/backoff;
-- [ ] retryable vs non-retryable errors (классификация уже есть в
-      `GenerationErrorCode`/`GenerationErrorKind`, не хватает исполнителя);
-- [ ] статус `RETRY_WAIT` и переход `FAILED → PENDING/RUNNING`;
-- [ ] stale `RUNNING` recovery после restart/crash;
-- [ ] acceptance worker/process crash.
+#### 1.2-D — Worker / retry / recovery: DONE
+- [x] фоновые jobs: отдельный контейнер-worker (`apps/worker`), состояние
+      процесса нулевое — очередь повторов и аренда живут в PostgreSQL;
+- [x] централизованный retry/backoff: единая `RetryPolicy`
+      (`src/domain/retry.py`) на генерацию и доставку, значения из конфигурации
+      (3 попытки, 60 с → 240 с, максимум 900 с), бесконечных повторов нет;
+- [x] retryable vs non-retryable errors: повторяются только `transient`-коды;
+      триггер `admin_request` система не повторяет (это отменило бы явный выбор
+      администратора);
+- [x] переход `FAILED → RUNNING` открыт; `RETRY_WAIT` не введён — ожидание
+      повтора это `FAILED` с заполненным `next_attempt_at`, а не второй статус
+      с тем же смыслом;
+- [x] stale `RUNNING` recovery: признак «застрял» — истёкшая аренда
+      (`lease_owner`/`lease_expires_at`), а не время в статусе: легальная
+      генерация идёт до 30 минут;
+- [x] взаимное исключение воркеров: `SELECT … FOR UPDATE SKIP LOCKED` в той же
+      транзакции, что и перевод в `RUNNING`; Redis не используется;
+- [x] идемпотентность повтора: повтор — та же логическая генерация, ключ не
+      меняется, второй job и вторая программа не создаются;
+- [x] повтор идёт через `ProgramGenerationOrchestrator.retry`, доставка — через
+      существующий `redeliver()`; архитектурный тест границы расширен на
+      `apps/worker`;
+- [x] worker зарегистрирован в Component Registry и в
+      `deploy/release-manifest.json`;
+- [x] миграция `0012` (аддитивная), тесты: unit (`test_worker_retry.py`,
+      `test_worker_process.py`) и integration на реальной PostgreSQL
+      (`tests/integration/test_worker_retry.py`).
+
+**Осознанное ограничение:** `RUNNING` без аренды не восстанавливается. Такой job
+создан синхронным путём в другом процессе (Telegram-пайплайн, Admin API), и
+воркер не может отличить «процесс умер» от «запрос ещё выполняется». Ограничение
+снимается вместе с переносом генерации в worker.
 
 #### 1.2-E — Delivery
 - [ ] отдельное persistent delivery state/job;

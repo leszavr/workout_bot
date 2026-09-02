@@ -5,7 +5,9 @@
     "backend": {
       "version": "2.2.0",
       "contract": 1,
-      "supported_contracts": [1],
+      "supported_contracts": [
+        1
+      ],
       "image": "docker/Dockerfile",
       "region": "RU",
       "deploy_independently": true
@@ -24,11 +26,28 @@
       "region": "EU",
       "deploy_independently": true,
       "requires_backend_contract": 1
+    },
+    "worker": {
+      "version": "2.2.0",
+      "contract": 1,
+      "image": "docker/Dockerfile",
+      "region": "EU",
+      "deploy_independently": true,
+      "requires_backend_contract": 1
     }
   },
   "requirements": {
     "telegram_gateway": {
-      "supported_contracts": [1],
+      "supported_contracts": [
+        1
+      ],
+      "min_version": "2.2.0",
+      "recommended_version": "2.2.0"
+    },
+    "worker": {
+      "supported_contracts": [
+        1
+      ],
       "min_version": "2.2.0",
       "recommended_version": "2.2.0"
     }
@@ -37,6 +56,7 @@
     "Frontend changed -> Telegram Gateway is not redeployed.",
     "Backend changed with a compatible contract -> Telegram Gateway is not redeployed.",
     "Telegram Gateway contract changed -> Gateway requires its own deployment.",
-    "Equal git SHA or equal version across components is never required."
+    "Equal git SHA or equal version across components is never required.",
+    "Worker restart does not affect Backend or Gateway: retry state lives in PostgreSQL."
   ]
 }

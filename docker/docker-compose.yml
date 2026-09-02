@@ -29,6 +29,32 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "apps.worker.main"]
+    env_file:
+      - ../.env
+    environment:
+      WORKOUT_DATA_DIR: /app/data
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-workout_bot}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:-workout_bot}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set in .env}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set in .env}
+      MEDIA_BUCKET: ${MEDIA_BUCKET:-workout-media}
+      BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://backend:8000}
+      BUILD_SHA: ${BUILD_SHA:-}
+    volumes:
+      - bot-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    # Redis не нужен: очередь повторов и аренда живут в PostgreSQL.
+    restart: unless-stopped
+
   backend:
     build:
       context: ..

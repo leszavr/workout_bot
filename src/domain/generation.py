@@ -7,11 +7,14 @@
 Состояния:
 
     PENDING → RUNNING → SUCCEEDED
-                     └→ FAILED
+       ▲             └→ FAILED ──┐
+       └────────────────────────-┘ (retry, Phase 1.2-D)
 
-`RETRY_WAIT` здесь сознательно нет: планировщика повторов ещё не существует
-(Phase 1.2-D), а статус без обработчика оставлял бы job в состоянии, из
-которого его никто не выводит.
+Отдельного `RETRY_WAIT` нет и в 1.2-D: ожидание повтора — это `FAILED` с
+заполненным `next_attempt_at`, а не отдельный статус. Причина в том, что
+`FAILED` уже означает «попытка закончилась неудачей», и второй статус с тем же
+смыслом заставил бы каждого читателя (админка, аналитика, `next_attempt`)
+проверять два значения вместо одного.
 
 Что в job НЕ хранится: prompt, ответ провайдера, ключи, заголовки авторизации
 и персональные данные. Только стабильный код ошибки и короткое безопасное
@@ -91,11 +94,11 @@ class GenerationErrorCode(StrEnum):
 
 
 class GenerationErrorKind(StrEnum):
-    """Класс ошибки. Retry на этом этапе НЕ реализуется.
+    """Класс ошибки: можно ли лечить повтором.
 
-    Класс нужен, чтобы будущий retry-контур (Phase 1.2-D) не переклассифицировал
-    исторические записи: решение «повторяемо ли это» принимается по коду,
-    сохранённому в момент отказа.
+    Решение «повторяемо ли это» принимается по коду, сохранённому в момент
+    отказа, а не по типу исключения в момент повтора: retry-контур (Phase
+    1.2-D) не должен переклассифицировать исторические записи.
     """
 
     NON_RETRYABLE = "non_retryable"
@@ -116,17 +119,21 @@ _NON_RETRYABLE_CODES = frozenset(
 )
 
 # Разрешённые переходы. Всё, чего здесь нет, запрещено, включая
-# SUCCEEDED → RUNNING, SUCCEEDED → FAILED и FAILED → RUNNING.
-# FAILED → PENDING/RUNNING зарезервировано для retry-контура Phase 1.2-D и
-# сейчас не разрешается: у неуспешной попытки нет обработчика, который довёл
-# бы её до конца.
+# SUCCEEDED → RUNNING и SUCCEEDED → FAILED: успешная генерация терминальна,
+# её результат уже отдан вызывающей стороне.
+#
+# FAILED → RUNNING открыт в Phase 1.2-D: у неуспешной попытки появился
+# обработчик (worker), который доводит её до конца. Промежуточного возврата в
+# PENDING нет — повтор всегда выполняется тем, кто захватил job, поэтому
+# состояние «повтор назначен, но никем не взят» выражается не статусом, а
+# полем `next_attempt_at` у FAILED.
 ALLOWED_TRANSITIONS: dict[GenerationJobStatus, frozenset[GenerationJobStatus]] = {
     GenerationJobStatus.PENDING: frozenset({GenerationJobStatus.RUNNING}),
     GenerationJobStatus.RUNNING: frozenset(
         {GenerationJobStatus.SUCCEEDED, GenerationJobStatus.FAILED}
     ),
     GenerationJobStatus.SUCCEEDED: frozenset(),
-    GenerationJobStatus.FAILED: frozenset(),
+    GenerationJobStatus.FAILED: frozenset({GenerationJobStatus.RUNNING}),
 }
 
 TERMINAL_STATUSES = frozenset(
@@ -331,6 +338,13 @@ class GenerationJob(BaseModel):
     last_error_message: str | None = Field(
         default=None, max_length=MAX_ERROR_MESSAGE_LENGTH
     )
+    # Phase 1.2-D. `next_attempt_at` — момент, с которого повтор допустим;
+    # None означает «повтор не назначен» (успех либо окончательный отказ).
+    # Аренда отвечает на другой вопрос: кто выполняет job прямо сейчас. Без
+    # неё «застрявший в RUNNING» неотличим от легальной длинной генерации.
+    next_attempt_at: datetime | None = None
+    lease_owner: str | None = Field(default=None, max_length=64)
+    lease_expires_at: datetime | None = None
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -348,15 +362,40 @@ class GenerationJob(BaseModel):
             return None
         return error_kind(self.last_error_code)
 
+    def is_retryable(self) -> bool:
+        """Стоит ли вообще повторять этот job.
+
+        Смотрим на класс ошибки, а не на статус: `FAILED` с
+        `non_retryable`-кодом повтором не лечится, и планировать его повтор
+        значило бы бесполезно тратить попытки и вводить администратора в
+        заблуждение.
+        """
+        return self.error_kind() is GenerationErrorKind.TRANSIENT
+
+    def lease_expired(self, *, now: datetime | None = None) -> bool:
+        """Просрочена ли аренда. Job без аренды просроченным не считается."""
+        if self.lease_expires_at is None:
+            return False
+        return self.lease_expires_at <= (now or _utcnow())
+
     # --- переходы -------------------------------------------------------------
     # Методы меняют только in-memory состояние; персистентность и проверку
     # перехода в БД выполняет репозиторий в одной транзакции.
 
     def start(self) -> None:
+        """PENDING → RUNNING либо повтор FAILED → RUNNING (Phase 1.2-D).
+
+        Повтор — это не новая логическая генерация, а следующая попытка той же:
+        `attempts` растёт, ключ идемпотентности и ссылка на профиль остаются
+        прежними, поэтому вторая программа появиться не может. `next_attempt_at`
+        снимается: повтор уже начат, и второй раз назначать его нельзя.
+        """
         ensure_transition(self.status, GenerationJobStatus.RUNNING)
         self.status = GenerationJobStatus.RUNNING
         self.attempts += 1
         self.started_at = _utcnow()
+        self.completed_at = None
+        self.next_attempt_at = None
 
     def succeed(self, *, program_id: str, program_version: int) -> None:
         ensure_transition(self.status, GenerationJobStatus.SUCCEEDED)
@@ -366,8 +405,25 @@ class GenerationJob(BaseModel):
         self.last_error_code = None
         self.last_error_message = None
         self.completed_at = _utcnow()
+        self.next_attempt_at = None
+        self.lease_owner = None
+        self.lease_expires_at = None
 
-    def fail(self, *, error_code: GenerationErrorCode | str, message: str) -> None:
+    def fail(
+        self,
+        *,
+        error_code: GenerationErrorCode | str,
+        message: str,
+        next_attempt_at: datetime | None = None,
+    ) -> None:
+        """RUNNING → FAILED.
+
+        `next_attempt_at` заполняется только тогда, когда повтор действительно
+        назначен: пустое значение означает окончательный отказ. Аренда
+        снимается всегда — попытка закончилась, и держать job за исполнителем
+        больше нельзя, иначе следующий повтор пришлось бы ждать до истечения
+        аренды.
+        """
         ensure_transition(self.status, GenerationJobStatus.FAILED)
         self.status = GenerationJobStatus.FAILED
         code = (
@@ -378,3 +434,6 @@ class GenerationJob(BaseModel):
         self.last_error_code = code[:64]
         self.last_error_message = safe_error_message(message)
         self.completed_at = _utcnow()
+        self.next_attempt_at = next_attempt_at
+        self.lease_owner = None
+        self.lease_expires_at = None

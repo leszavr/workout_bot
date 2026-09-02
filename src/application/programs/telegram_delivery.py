@@ -6,18 +6,31 @@
 
 Сервис не зависит от Telegram: sender — callable, возвращающий message_id.
 Ограниченное число попыток (не бесконечно) с backoff.
+
+Два уровня повторов (Phase 1.2-D):
+
+- внутри одного вызова — короткие попытки с секундным backoff. Лечат мгновенную
+  сетевую заминку, пока пользователь ещё ждёт файл;
+- между вызовами — `next_attempt_at`, который заполняется при окончательной
+  неудаче вызова, если бюджет попыток по политике ещё не исчерпан. Такую запись
+  подхватывает worker.
+
+`record.attempts` не сбрасывается между вызовами: это общий счётчик, по нему
+политика и решает, что пора остановиться.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Protocol
 
 from src.application.notifications.program_alerts import ProgramAlert, ProgramAlertService
 from src.application.programs.html_service import ProgramHtmlService
 from src.domain.enums import ProgramDeliveryStatus
 from src.domain.program import WorkoutProgram
+from src.domain.retry import RetryPolicy
 from src.errors import HtmlRenderError, ProgramDeliveryError
 from src.infrastructure.persistence.postgres.delivery_repository import (
     ProgramDeliveryRecord,
@@ -56,12 +69,16 @@ class ProgramDeliveryService:
         sender: DeliverySender,
         alert_service: ProgramAlertService | None = None,
         max_attempts: int = MAX_DELIVERY_ATTEMPTS,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self._html = html_service
         self._deliveries = delivery_repository
         self._sender = sender
         self._alerts = alert_service
         self._max_attempts = max_attempts
+        # Политика межпроцессных повторов. None — повтор воркером не
+        # планируется: так работает конфигурация без worker'а.
+        self._retry = retry_policy
 
     async def deliver(self, *, program: WorkoutProgram, chat_id: str) -> ProgramDeliveryRecord:
         """Рендерит HTML и отправляет документ пользователю."""
@@ -96,8 +113,11 @@ class ProgramDeliveryService:
         try:
             html_bytes = await self._html.render(program)
         except HtmlRenderError as exc:
+            # Рендер — не сетевая операция: повтор его не лечит, поэтому
+            # `next_attempt_at` не назначается.
             record.status = ProgramDeliveryStatus.FAILED
             record.last_error = f"html_render: {exc}"
+            self._close_lease(record, next_attempt_at=None)
             await self._deliveries.update(record)
             await self._notify_alert(
                 stage="html_render",
@@ -140,6 +160,7 @@ class ProgramDeliveryService:
             record.sent_message_id = message_id
             record.status = ProgramDeliveryStatus.SENT
             record.last_error = None
+            self._close_lease(record, next_attempt_at=None)
             await self._deliveries.update(record)
             logger.info(
                 "event=delivery_success",
@@ -153,18 +174,48 @@ class ProgramDeliveryService:
 
         record.status = ProgramDeliveryStatus.FAILED
         record.last_error = last_error
+        next_attempt_at = self._plan_retry(record)
+        self._close_lease(record, next_attempt_at=next_attempt_at)
         await self._deliveries.update(record)
         logger.error(
             "event=delivery_failed",
-            extra={"profile_id": program.profile_id, "attempts": record.attempts},
+            extra={
+                "profile_id": program.profile_id,
+                "attempts": record.attempts,
+                "retry_scheduled": next_attempt_at is not None,
+            },
         )
-        await self._notify_alert(
-            stage="delivery",
-            program=program,
-            exception_type="DeliveryError",
-            message=last_error or "",
-        )
+        # Администратора будим только тогда, когда система сдалась: пока
+        # назначен повтор, вмешательство человека не требуется.
+        if next_attempt_at is None:
+            await self._notify_alert(
+                stage="delivery",
+                program=program,
+                exception_type="DeliveryError",
+                message=last_error or "",
+            )
         raise ProgramDeliveryError(f"Доставка не удалась после {self._max_attempts} попыток")
+
+    def _plan_retry(self, record: ProgramDeliveryRecord) -> datetime | None:
+        """Момент следующей попытки либо None, если бюджет исчерпан.
+
+        Повтор невозможен без `chat_id`: отправлять некуда, и запись только
+        занимала бы очередь.
+        """
+        if self._retry is None or not record.chat_id:
+            return None
+        return self._retry.next_attempt_at(
+            now=datetime.now(timezone.utc), attempts_made=record.attempts
+        )
+
+    @staticmethod
+    def _close_lease(
+        record: ProgramDeliveryRecord, *, next_attempt_at: datetime | None
+    ) -> None:
+        """Снимает аренду: попытка закончилась, держать запись за собой нельзя."""
+        record.next_attempt_at = next_attempt_at
+        record.lease_owner = None
+        record.lease_expires_at = None
 
     async def _notify_alert(
         self,

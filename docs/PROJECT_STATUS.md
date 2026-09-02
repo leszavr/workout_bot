@@ -104,7 +104,7 @@ Workout Bot — модульный монолит для Telegram: пользо�
 - веб-кнопка Generate Program должна использовать тот же orchestration path;
 - Phase 1.2 разбита на 1.2-A…1.2-G: FSM, generation state, orchestrator, worker/retry/recovery, delivery, admin visibility, E2E acceptance.
 
-**Следующий рабочий этап:** Phase 1.2-D — Worker / retry / recovery.
+**Следующий рабочий этап:** Phase 1.2-E — Delivery (отдельное persistent delivery state/job).
 
 ### Phase 1.2-A — Persistent FSM: ГОТОВО
 
@@ -203,9 +203,54 @@ Workout Bot — модульный монолит для Telegram: пользо�
   он статически запрещает Telegram gateway и Admin API обращаться к
   генераторам, validator, safety, записи программы и переходам job.
 
-**Осознанное ограничение:** retry, worker и stale-recovery не реализованы —
-это Phase 1.2-D. Delivery остаётся отдельной операцией и в оркестратор не
-входит (Phase 1.2-E).
+**Осознанное ограничение:** delivery остаётся отдельной операцией и в
+оркестратор не входит (Phase 1.2-E). Retry, worker и stale-recovery закрыты в
+Phase 1.2-D.
+
+### Phase 1.2-D — Worker / retry / recovery: ГОТОВО
+
+Подробности — `docs/reports/PHASE_1_2_D_WORKER_RETRY_RECOVERY_REPORT.md`.
+
+- **отдельный контейнер-worker** (`apps/worker`, `python -m apps.worker.main`).
+  Выбран вместо фоновой задачи внутри Backend и внешнего cron: перезапуск
+  админского Backend не должен останавливать обработку повторов, а cron не
+  отвечает на вопрос «работает ли обработка сейчас». Worker виден в compose и в
+  Component Registry как самостоятельный компонент;
+- **состояние процесса нулевое**: очередь повторов (`next_attempt_at`), номер
+  попытки (`attempts`) и аренда (`lease_owner`/`lease_expires_at`) живут в
+  PostgreSQL (миграция `0012`, аддитивная). Redis не используется вовсе — после
+  его потери обработка продолжается;
+- **единая политика повторов** `RetryPolicy` (`src/domain/retry.py`) на
+  генерацию и доставку: 3 попытки всего, паузы 60 с → 240 с, потолок 900 с,
+  аренда 1860 с. Значения из конфигурации, бесконечных повторов нет. Три попытки
+  выбраны потому, что внутри одной попытки AI-контур уже перебирает все
+  подключённые модели; внешние повторы лечат только недоступность провайдера;
+- **повторяются только `transient`-коды** и только автогенерация. `admin_request`
+  система сама не повторяет: администратор выбрал генератор и запретил fallback,
+  ответ с причиной уже отдан, и молчаливая пересборка отменила бы его решение;
+- **переход `FAILED → RUNNING` открыт**; `RETRY_WAIT` не введён — ожидание
+  повтора это `FAILED` с заполненным `next_attempt_at`. Возврата в `PENDING` нет:
+  повтор всегда выполняет тот, кто захватил job;
+- **признак «застрял» — истёкшая аренда**, а не время в статусе: легальная
+  AI-генерация занимает до 30 минут, и порог по `started_at` либо отбирал бы job
+  у живого исполнителя, либо не отличал бы зависший job от работающего;
+- **двойной захват исключён** `SELECT … FOR UPDATE SKIP LOCKED` в той же
+  транзакции, что и перевод в `RUNNING`. Проверено на двух независимых engine;
+- **идемпотентность**: повтор — это та же логическая генерация,
+  `idempotency_key` не пересчитывается, второй job и вторая программа не
+  создаются. Повтор доставки генерацию не запускает;
+- **границы не обойдены**: повтор генерации идёт через
+  `ProgramGenerationOrchestrator.retry`, повтор доставки — через существующий
+  `ProgramDeliveryService.redeliver`. Архитектурный тест
+  `tests/unit/test_generation_boundary.py` расширен на `apps/worker`;
+- worker объявлен в `COMPONENT_REQUIREMENTS` и `deploy/release-manifest.json`,
+  поэтому deployment safety gate судит о его совместимости, а не отвечает
+  `UNKNOWN`.
+
+**Осознанное ограничение:** `RUNNING` без аренды не восстанавливается. Такой job
+создан синхронным путём в другом процессе (Telegram-пайплайн, Admin API), и
+воркер не может отличить «процесс умер» от «запрос ещё выполняется». Ограничение
+снимается вместе с переносом генерации в worker.
 
 ### AI reliability + prompt management: ГОТОВО
 
@@ -395,7 +440,7 @@ EU routing, WireGuard/wstunnel и бизнес-логика шлюза не ме
 4. Проверка безопасности production-конфигурации и секретов.
 5. Часть интеграционных тестов требует каталога упражнений; CI засеивает его автоматически.
 6. `alembic check` сообщает о косметическом расхождении ORM-моделей и миграций (`unique=True` против UniqueConstraint); это существовало до текущего этапа.
-7. Job, оставшийся в `RUNNING` после падения процесса, никто не восстанавливает: retry, worker и stale-recovery — Phase 1.2-D. До этого повторный запрос такой генерации будет отклоняться как «уже выполняется».
+7. Job, оставшийся в `RUNNING` **без аренды**, никто не восстанавливает: такие job создаёт синхронный путь (Telegram-пайплайн, Admin API) в другом процессе, и worker не может отличить «процесс умер» от «запрос ещё выполняется». Job'ы, захваченные worker'ом, восстанавливаются по просроченной аренде (Phase 1.2-D). Ограничение снимается вместе с переносом генерации в worker.
 8. `GenerateProgramRequest.prompt_version` не используется: поле принимается API, но никуда не передаётся. Версия инструкции берётся из настроек задачи (`ai_task_configs.prompt_version`), и этого достаточно для промпт-инжиниринга: администратор выбирает версию в задаче и запускает генерацию. Поле осталось со времён до Phase 1.2-C; удаление меняет публичный контракт, поэтому вынесено отдельно.
 9. **Telegram Gateway всё ещё импортирует backend-код и работает с той же PostgreSQL напрямую.** Component Registry дал версионирование и контроль совместимости, но не сетевую границу: целевая topology (`DEPLOYMENT_AND_INTEGRATION_BASELINE.md`, раздел 4) требует, чтобы шлюз обращался к Backend только через API. Это остаётся deployment blocker для реального разделения RU/EU.
 10. Deployment safety gate реализован и доступен по `/internal/v1/deployment-safety`, но **в CI ещё не подключён**: пока это ручная проверка перед деплоем backend.
@@ -424,4 +469,4 @@ EU routing, WireGuard/wstunnel и бизнес-логика шлюза не ме
 
 ## Следующий приоритет
 
-Phase 1.2-D: Worker / retry / recovery — фоновая обработка, централизованный retry и восстановление stale `RUNNING` job после падения процесса. Подробный design baseline — `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`; порядок дальнейших работ — `DEVELOPMENT_ROADMAP.md`.
+Phase 1.2-E: Delivery — отдельное persistent delivery state/job и delivery idempotency. Phase 1.2-D (worker, retry, recovery) закрыта: повторы transient-отказов и восстановление захваченных job работают, состояние живёт в PostgreSQL. Подробный design baseline — `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`; порядок дальнейших работ — `DEVELOPMENT_ROADMAP.md`.

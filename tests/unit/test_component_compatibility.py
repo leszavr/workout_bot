@@ -123,10 +123,31 @@ def test_degraded_component_is_not_reported_as_compatible_only():
 
 
 def test_unknown_component_type_is_not_silently_compatible():
+    """Тип без объявленных требований получает UNKNOWN, а не «всё в порядке».
+
+    Взят `MAX_GATEWAY`: он заведён в enum заранее и реализации не имеет,
+    поэтому требований к нему в коде нет. `WORKER` для этой проверки больше не
+    подходит — с Phase 1.2-D у него есть собственное требование.
+    """
     verdict = evaluate(
-        instance(component_type=ComponentType.WORKER), requirement=None, now=NOW
+        instance(component_type=ComponentType.MAX_GATEWAY), requirement=None, now=NOW
     )
     assert verdict.state is CompatibilityState.UNKNOWN
+
+
+def test_worker_requirement_is_declared():
+    """Worker — полноценный компонент реестра, а не безымянный процесс.
+
+    Без объявленного требования его вердикт был бы `UNKNOWN`, и deployment gate
+    не смог бы сказать, совместим ли развёрнутый worker с Backend.
+    """
+    verdict = evaluate(
+        instance(component_type=ComponentType.WORKER, contract=1, version="2.2.0"),
+        requirement=None,
+        now=NOW,
+    )
+    assert verdict.state is not CompatibilityState.UNKNOWN
+    assert not verdict.blocks_deployment
 
 
 # --- Offline detection -----------------------------------------------------
@@ -251,7 +272,22 @@ def test_release_manifest_matches_code_contracts():
     assert backend["contract"] == BACKEND_CONTRACT_VERSION
     assert tuple(backend["supported_contracts"]) == BACKEND_SUPPORTED_CONTRACTS
 
-    requirement = COMPONENT_REQUIREMENTS[ComponentType.TELEGRAM_GATEWAY]
-    declared = manifest["requirements"]["telegram_gateway"]
-    assert tuple(declared["supported_contracts"]) == requirement.supported_contracts
-    assert declared["min_version"] == requirement.min_version
+    for component_type in (ComponentType.TELEGRAM_GATEWAY, ComponentType.WORKER):
+        requirement = COMPONENT_REQUIREMENTS[component_type]
+        declared = manifest["requirements"][component_type.value]
+        assert tuple(declared["supported_contracts"]) == requirement.supported_contracts
+        assert declared["min_version"] == requirement.min_version
+
+
+def test_every_declared_requirement_is_in_manifest():
+    """Новый компонент нельзя завести в коде, не объявив его для деплоя.
+
+    Без этой проверки требование, добавленное только в код, оставляло бы
+    deployment tooling с устаревшим манифестом — то есть с молчаливо неверным
+    вердиктом совместимости.
+    """
+    root = Path(__file__).resolve().parents[2]
+    manifest = json.loads((root / "deploy" / "release-manifest.json").read_text())
+    declared = set(manifest["requirements"])
+    in_code = {t.value for t in COMPONENT_REQUIREMENTS}
+    assert in_code == declared
