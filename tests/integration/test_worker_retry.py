@@ -31,16 +31,11 @@ from src.application.programs.orchestrator import (
     ProgramGenerationOrchestrator,
 )
 from src.application.programs.retry_service import (
-    DeliveryRetryService,
+    DeliveryRecoveryService,
     GenerationRetryService,
     RetryCoordinator,
 )
 from src.application.programs.safety import SafetyEngine
-from src.application.programs.service import ProgramService
-from src.application.programs.telegram_delivery import (
-    ProgramDeliveryService,
-    ProgramDocument,
-)
 from src.application.programs.validator import ProgramValidator
 from src.domain.ai.errors import AITimeoutError
 from src.domain.enums import (
@@ -60,6 +55,7 @@ from src.errors import (
 )
 from src.infrastructure.config import DATABASE_URL
 from src.infrastructure.persistence.postgres.delivery_repository import (
+    ProgramDeliveryRecord,
     ProgramDeliveryRepository,
 )
 from src.infrastructure.persistence.postgres.generation_job_repository import (
@@ -650,35 +646,18 @@ class TestCrashRecovery:
         assert await repo.renew_lease(stranger, lease_seconds=LEASE) is None
 
 
-# --- Повтор доставки -----------------------------------------------------------
+# --- Восстановление доставки ---------------------------------------------------
 
 
-class _FailingSender:
-    def __init__(self) -> None:
-        self.calls = 0
+class TestDeliveryRecovery:
+    """Восстановление доставок на реальной базе.
 
-    async def __call__(self, chat_id: str, document: ProgramDocument) -> int:
-        self.calls += 1
-        raise RuntimeError("Telegram недоступен в тесте")
+    Отправку выполняет Gateway, поэтому здесь проверяется только возврат
+    застрявших записей в очередь: `sending` с просроченной арендой без
+    вмешательства осталась бы недостижимой навсегда — Gateway забирает лишь
+    `pending` и созревшие `failed`.
+    """
 
-
-class _WorkingSender:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def __call__(self, chat_id: str, document: ProgramDocument) -> int:
-        self.calls += 1
-        return 4242
-
-
-class _StubHtmlService:
-    media_mode = "html"
-
-    async def render(self, program) -> bytes:
-        return b"<html>program</html>"
-
-
-class TestDeliveryRetry:
     async def _program(self, sessions, profile_id: str):
         orchestrator = _orchestrator(sessions, primary="deterministic")
         result = await orchestrator.generate(
@@ -691,121 +670,57 @@ class TestDeliveryRetry:
         )
         return result.program
 
-    def _delivery(self, sessions, sender):
-        return ProgramDeliveryService(
-            html_service=_StubHtmlService(),
-            delivery_repository=ProgramDeliveryRepository(sessions),
-            sender=sender,
-            max_attempts=1,
-            retry_policy=POLICY,
-        )
-
-    async def test_failed_delivery_schedules_retry_and_worker_completes_it(
-        self, sessions
-    ):
-        """Ошибка доставки лечится повтором и не запускает генерацию заново."""
-        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}delivery")
-        program = await self._program(sessions, profile.profile_id)
+    async def _stuck_delivery(self, sessions, profile_id: str, program):
+        """Запись в `sending` с истёкшей арендой: шлюз умер во время отправки."""
         deliveries = ProgramDeliveryRepository(sessions)
-
-        from src.errors import ProgramDeliveryError
-
-        with pytest.raises(ProgramDeliveryError):
-            await self._delivery(sessions, _FailingSender()).deliver(
-                program=program, chat_id="777"
+        record = await deliveries.create(
+            ProgramDeliveryRecord(
+                program_id=program.program_id,
+                profile_id=profile_id,
+                chat_id="777",
+                filename="program.html",
+                status=ProgramDeliveryStatus.SENDING,
             )
-
-        record = await deliveries.get_for_profile(profile.profile_id)
-        assert record.status is ProgramDeliveryStatus.FAILED
-        assert record.next_attempt_at is not None
-
-        async with sessions() as session:
-            async with session.begin():
-                await session.execute(
-                    ProgramDeliveryRow.__table__.update()
-                    .where(ProgramDeliveryRow.id == record.id)
-                    .values(next_attempt_at=_utcnow() - timedelta(seconds=1))
-                )
-
-        working = _WorkingSender()
-        service = DeliveryRetryService(
-            deliveries=deliveries,
-            programs=ProgramService(
-                program_repository=PostgresProgramRepository(sessions)
-            ),
-            delivery_service=self._delivery(sessions, working),
-            policy=POLICY,
-            owner=OWNER_A,
-            lease_seconds=LEASE,
         )
-        succeeded, failed = await service.process_due()
-
-        assert (succeeded, failed) == (1, 0)
-        assert working.calls == 1
-        record = await deliveries.get_for_profile(profile.profile_id)
-        assert record.status is ProgramDeliveryStatus.SENT
-        assert record.sent_message_id == 4242
-        # Delivery retry ≠ generation retry: вторая программа не появилась.
-        assert await _count(sessions, WorkoutProgramRow, profile.profile_id) == 1
-        assert await _count(sessions, GenerationJobRow, profile.profile_id) == 1
-
-    async def test_stale_sending_delivery_is_recovered(self, sessions):
-        """SENDING с просроченной арендой возвращается в очередь."""
-        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}delivery-stale")
-        program = await self._program(sessions, profile.profile_id)
-        deliveries = ProgramDeliveryRepository(sessions)
-
-        from src.errors import ProgramDeliveryError
-
-        with pytest.raises(ProgramDeliveryError):
-            await self._delivery(sessions, _FailingSender()).deliver(
-                program=program, chat_id="777"
-            )
-        record = await deliveries.get_for_profile(profile.profile_id)
         async with sessions() as session:
             async with session.begin():
                 await session.execute(
                     ProgramDeliveryRow.__table__.update()
                     .where(ProgramDeliveryRow.id == record.id)
                     .values(
-                        status=ProgramDeliveryStatus.SENDING.value,
-                        lease_owner=OWNER_A,
+                        lease_owner="gateway-dead",
                         lease_expires_at=_utcnow() - timedelta(seconds=1),
-                        next_attempt_at=None,
                     )
                 )
+        return deliveries, record
 
-        service = DeliveryRetryService(
-            deliveries=deliveries,
-            programs=ProgramService(
-                program_repository=PostgresProgramRepository(sessions)
-            ),
-            delivery_service=self._delivery(sessions, _WorkingSender()),
-            policy=POLICY,
-            owner=OWNER_A,
-            lease_seconds=LEASE,
+    def _service(self, deliveries) -> DeliveryRecoveryService:
+        return DeliveryRecoveryService(deliveries=deliveries, policy=POLICY)
+
+    async def test_stale_sending_delivery_returns_to_queue(self, sessions):
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}delivery-stale")
+        program = await self._program(sessions, profile.profile_id)
+        deliveries, _ = await self._stuck_delivery(
+            sessions, profile.profile_id, program
         )
-        released = await service.recover_stale()
+
+        released = await self._service(deliveries).recover_stale()
 
         assert len(released) == 1
         record = await deliveries.get_for_profile(profile.profile_id)
         assert record.status is ProgramDeliveryStatus.FAILED
         assert record.next_attempt_at is not None
+        assert record.lease_owner is None
 
-    async def test_two_workers_do_not_claim_the_same_delivery(
-        self, sessions, second_sessions
-    ):
-        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}delivery-race")
+    async def test_recovered_delivery_is_claimable_by_gateway(self, sessions):
+        """Итог восстановления проверяется тем, что задание снова выдаётся."""
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}delivery-claim")
         program = await self._program(sessions, profile.profile_id)
-        deliveries = ProgramDeliveryRepository(sessions)
+        deliveries, record = await self._stuck_delivery(
+            sessions, profile.profile_id, program
+        )
 
-        from src.errors import ProgramDeliveryError
-
-        with pytest.raises(ProgramDeliveryError):
-            await self._delivery(sessions, _FailingSender()).deliver(
-                program=program, chat_id="777"
-            )
-        record = await deliveries.get_for_profile(profile.profile_id)
+        await self._service(deliveries).recover_stale()
         async with sessions() as session:
             async with session.begin():
                 await session.execute(
@@ -814,15 +729,42 @@ class TestDeliveryRetry:
                     .values(next_attempt_at=_utcnow() - timedelta(seconds=1))
                 )
 
-        first, second = await asyncio.gather(
-            deliveries.claim_due(owner=OWNER_A, lease_seconds=LEASE, limit=5),
-            ProgramDeliveryRepository(second_sessions).claim_due(
-                owner=OWNER_B, lease_seconds=LEASE, limit=5
-            ),
+        claimed = await deliveries.claim_for_send(
+            owner="gateway-1", lease_seconds=LEASE, limit=5
+        )
+        assert [r.id for r in claimed] == [record.id]
+
+    async def test_live_lease_is_not_stolen(self, sessions):
+        """Живая аренда означает, что шлюз ещё отправляет файл."""
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}delivery-live")
+        program = await self._program(sessions, profile.profile_id)
+        deliveries, record = await self._stuck_delivery(
+            sessions, profile.profile_id, program
+        )
+        async with sessions() as session:
+            async with session.begin():
+                await session.execute(
+                    ProgramDeliveryRow.__table__.update()
+                    .where(ProgramDeliveryRow.id == record.id)
+                    .values(lease_expires_at=_utcnow() + timedelta(minutes=5))
+                )
+
+        assert await self._service(deliveries).recover_stale() == []
+        record = await deliveries.get_for_profile(profile.profile_id)
+        assert record.status is ProgramDeliveryStatus.SENDING
+
+    async def test_recovery_does_not_create_second_program(self, sessions):
+        """Доставка и генерация независимы: восстановление не трогает программы."""
+        profile = await _save_profile(sessions, f"{PROFILE_PREFIX}delivery-nogen")
+        program = await self._program(sessions, profile.profile_id)
+        deliveries, _ = await self._stuck_delivery(
+            sessions, profile.profile_id, program
         )
 
-        claimed = [r for batch in (first, second) for r in batch]
-        assert len(claimed) == 1
+        await self._service(deliveries).recover_stale()
+
+        assert await _count(sessions, WorkoutProgramRow, profile.profile_id) == 1
+        assert await _count(sessions, GenerationJobRow, profile.profile_id) == 1
 
 
 # --- Координатор на реальной базе ---------------------------------------------

@@ -75,6 +75,13 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
   анкеты не сбрасывает вопросы);
 - worker запущен и в логах виден `event=worker_started`; после его перезапуска
   обработка возобновляется сама (состояния в процессе он не держит);
+- шлюз запущен и в логах виден `event=telegram_gateway_started`, а затем
+  регулярные вызовы `/internal/v1/telegram/deliveries/claim` — это опрос очереди
+  отправки; их отсутствие означает, что готовые программы не уйдут;
+- в `program_deliveries` нет записей в статусе `sending` с истёкшим
+  `lease_expires_at`: такие worker обязан вернуть в очередь за один цикл. Запись,
+  застрявшая в `sending`, недостижима для шлюза — он забирает только `pending` и
+  созревшие `failed`;
 - у контейнера шлюза нет `DATABASE_URL` и ключей MinIO:
   `docker compose config` для `telegram-bot` не должен их содержать. Это
   проверяется фактически, а не по коду;
@@ -94,7 +101,8 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 - MinIO/media;
 - `PROGRAM_PRIMARY_GENERATOR`, `PROGRAM_FALLBACK_GENERATOR`;
 - `AUTO_GENERATE_PROGRAM_AFTER_FINALIZE`;
-- шлюз (отдельный env-файл `staging-gateway.env`): `BACKEND_INTERNAL_URL`,
+- шлюз (отдельный env-файл `staging-gateway.env`; на staging он создан из
+  `staging-app.env` и содержит только нужные шлюзу значения): `BACKEND_INTERNAL_URL`,
   `INTERNAL_SERVICE_TOKEN`, `BACKEND_REQUEST_TIMEOUT_SECONDS`,
   `BACKEND_REQUEST_RETRIES`, `BACKEND_RETRY_DELAY_SECONDS`,
   `TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS`, `TELEGRAM_DELIVERY_BATCH_SIZE`,
@@ -107,7 +115,8 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
   попадает в `lease_owner`), `WORKER_POLL_INTERVAL_SECONDS`,
   `WORKER_MAX_ATTEMPTS`, `WORKER_RETRY_INITIAL_DELAY_SECONDS`,
   `WORKER_RETRY_MULTIPLIER`, `WORKER_RETRY_MAX_DELAY_SECONDS`,
-  `WORKER_LEASE_SECONDS`, `WORKER_BATCH_SIZE`, `WORKER_DELIVERY_ENABLED`.
+  `WORKER_LEASE_SECONDS`, `WORKER_BATCH_SIZE`. Отправкой файлов worker не
+  занимается: её выполняет шлюз, забирая задания из очереди.
   `WORKER_LEASE_SECONDS` должен превышать максимальный бюджет генерации
   (1800 с), иначе job отберут у живого исполнителя и генерация пойдёт дважды.
 
