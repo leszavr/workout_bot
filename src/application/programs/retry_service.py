@@ -9,8 +9,9 @@
 
 - генерация — повтор идёт через `ProgramGenerationOrchestrator.retry`, то есть
   через ту же единственную точку генерации;
-- доставка — повтор идёт через существующий `ProgramDeliveryService.redeliver`,
-  генерацию не трогает.
+- доставка — здесь только восстановление застрявших записей. Саму отправку
+  выполняет Telegram Gateway: после выноса его за сетевую границу доступа к
+  `api.telegram.org` из RU нет, и повторять отправку отсюда некуда.
 
 Что сервис сознательно НЕ делает:
 
@@ -29,9 +30,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from src.application.programs.orchestrator import ProgramGenerationOrchestrator
-from src.application.programs.service import ProgramService
-from src.application.programs.telegram_delivery import ProgramDeliveryService
-from src.domain.enums import ProgramDeliveryStatus
 from src.domain.generation import (
     GenerationErrorCode,
     GenerationJob,
@@ -69,8 +67,6 @@ class RetryCycleResult:
     retried_jobs: int = 0
     failed_jobs: int = 0
     recovered_deliveries: int = 0
-    retried_deliveries: int = 0
-    failed_deliveries: int = 0
 
     @property
     def did_work(self) -> bool:
@@ -80,8 +76,6 @@ class RetryCycleResult:
                 self.retried_jobs,
                 self.failed_jobs,
                 self.recovered_deliveries,
-                self.retried_deliveries,
-                self.failed_deliveries,
             )
         )
 
@@ -179,32 +173,32 @@ class GenerationRetryService:
         return succeeded, failed
 
 
-class DeliveryRetryService:
-    """Повтор доставки. Генерацию не запускает ни при каких условиях.
+class DeliveryRecoveryService:
+    """Возврат в очередь доставок, чей отправитель исчез.
 
-    Программы читаются через `ProgramService` — read-only фасад. Это не
-    формальность: повтор доставки не имеет права создать версию программы, и
-    отсутствие у него пишущего репозитория делает это невозможным по
-    конструкции, а не по договорённости.
+    Отправку выполняет Telegram Gateway: он забирает задание из очереди и
+    отчитывается о результате. Поэтому здесь нет ни Bot API, ни рендера — только
+    восстановление записей, застрявших в `sending` после падения шлюза.
+
+    Без этого сервиса такая запись осталась бы в `sending` навсегда: Gateway
+    забирает только `pending` и созревшие `failed`, а сам себя не восстанавливает
+    — он не знает, умер ли другой его экземпляр или тот ещё отправляет.
+
+    Повторную *отправку* сервис не выполняет намеренно. Раньше он это делал через
+    `redeliver()`, но после выноса Gateway за сетевую границу у RU нет доступа к
+    `api.telegram.org`: каждая такая попытка гарантированно провалилась бы и
+    сожгла бюджет попыток, конкурируя с очередью Gateway.
     """
 
     def __init__(
         self,
         *,
         deliveries: ProgramDeliveryRepository,
-        programs: ProgramService,
-        delivery_service: ProgramDeliveryService,
         policy: RetryPolicy,
-        owner: str,
-        lease_seconds: float,
         batch_size: int = 5,
     ) -> None:
         self._deliveries = deliveries
-        self._programs = programs
-        self._delivery = delivery_service
         self._policy = policy
-        self._owner = owner
-        self._lease_seconds = lease_seconds
         self._batch = batch_size
 
     async def recover_stale(self) -> list[ProgramDeliveryRecord]:
@@ -217,6 +211,9 @@ class DeliveryRetryService:
         )
         for record in released:
             if not self._policy.has_attempts_left(record.attempts):
+                # Попытки исчерпаны: план повтора, выставленный репозиторием
+                # оптимистично, надо снять — иначе Gateway брал бы задание,
+                # которое система больше не должна пробовать.
                 record.next_attempt_at = None
                 await self._deliveries.update(record)
             logger.warning(
@@ -229,49 +226,6 @@ class DeliveryRetryService:
                 },
             )
         return released
-
-    async def process_due(self) -> tuple[int, int]:
-        """Повторяет доставки. Возвращает (успехи, отказы)."""
-        claimed = await self._deliveries.claim_due(
-            owner=self._owner,
-            lease_seconds=self._lease_seconds,
-            limit=self._batch,
-        )
-        succeeded = 0
-        failed = 0
-        for record in claimed:
-            program = await self._programs.get(record.program_id)
-            if program is None:
-                # Программу удалили: повторять нечего, и держать запись в
-                # SENDING нельзя.
-                record.status = ProgramDeliveryStatus.FAILED
-                record.last_error = "Программа удалена: доставка невозможна"
-                record.next_attempt_at = None
-                record.lease_owner = None
-                record.lease_expires_at = None
-                await self._deliveries.update(record)
-                failed += 1
-                continue
-            try:
-                await self._delivery.redeliver(record, program)
-                succeeded += 1
-                logger.info(
-                    "event=delivery_retry_succeeded",
-                    extra={
-                        "profile_id": record.profile_id,
-                        "attempts": record.attempts,
-                    },
-                )
-            except Exception:  # noqa: BLE001 — статус уже записан сервисом доставки
-                failed += 1
-                logger.warning(
-                    "event=delivery_retry_failed",
-                    extra={
-                        "profile_id": record.profile_id,
-                        "attempts": record.attempts,
-                    },
-                )
-        return succeeded, failed
 
 
 class RetryCoordinator:
@@ -289,7 +243,7 @@ class RetryCoordinator:
         self,
         *,
         generation: GenerationRetryService,
-        delivery: DeliveryRetryService | None,
+        delivery: DeliveryRecoveryService,
     ) -> None:
         self._generation = generation
         self._delivery = delivery
@@ -309,20 +263,10 @@ class RetryCoordinator:
         except Exception:  # noqa: BLE001
             logger.exception("event=generation_retry_error")
 
-        if self._delivery is not None:
-            try:
-                result.recovered_deliveries = len(
-                    await self._delivery.recover_stale()
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("event=delivery_recovery_error")
-
-            try:
-                result.retried_deliveries, result.failed_deliveries = (
-                    await self._delivery.process_due()
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("event=delivery_retry_error")
+        try:
+            result.recovered_deliveries = len(await self._delivery.recover_stale())
+        except Exception:  # noqa: BLE001
+            logger.exception("event=delivery_recovery_error")
 
         if result.did_work:
             logger.info(
@@ -332,8 +276,6 @@ class RetryCoordinator:
                     "retried_jobs": result.retried_jobs,
                     "failed_jobs": result.failed_jobs,
                     "recovered_deliveries": result.recovered_deliveries,
-                    "retried_deliveries": result.retried_deliveries,
-                    "failed_deliveries": result.failed_deliveries,
                 },
             )
         return result

@@ -125,13 +125,10 @@ WORKER_BATCH_SIZE = int(os.getenv("WORKER_BATCH_SIZE", "5"))
 # будет продлеваться от имени другого.
 WORKER_COMPONENT_ID = os.getenv("WORKER_COMPONENT_ID", "worker-local-1")
 WORKER_COMPONENT_NAME = os.getenv("WORKER_COMPONENT_NAME", "Background Worker")
-# Доставка требует Telegram-транспорта. Пусто — worker повторяет только
-# генерацию: отправлять файл без токена бота нечем.
-WORKER_DELIVERY_ENABLED = os.getenv("WORKER_DELIVERY_ENABLED", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# WORKER_DELIVERY_ENABLED удалён вместе с выносом Gateway за сетевую границу:
+# отправку выполняет Gateway (только у него есть доступ к Bot API), а worker
+# восстанавливает застрявшие записи доставки — это нужно всегда и выключателя не
+# требует.
 
 # --- Telegram Gateway за сетевой границей ---------------------------------------
 #

@@ -16,7 +16,7 @@ import pytest
 
 from src.application.programs.retry_service import (
     RETRYABLE_TRIGGERS,
-    DeliveryRetryService,
+    DeliveryRecoveryService,
     GenerationRetryService,
     RetryCoordinator,
 )
@@ -290,28 +290,6 @@ class FakeDeliveryRepo:
         self.updated.append(record)
 
 
-class FakePrograms:
-    def __init__(self, program: WorkoutProgram | None) -> None:
-        self.program = program
-
-    async def get(self, program_id: str, version: int | None = None):
-        return self.program
-
-
-class FakeDeliveryService:
-    def __init__(self, *, fail: bool = False) -> None:
-        self.fail = fail
-        self.calls: list[str] = []
-
-    async def redeliver(self, record: ProgramDeliveryRecord, program: WorkoutProgram):
-        self.calls.append(record.program_id)
-        if self.fail:
-            record.status = ProgramDeliveryStatus.FAILED
-            raise ProgramDeliveryError("доставка не удалась")
-        record.status = ProgramDeliveryStatus.SENT
-        return record
-
-
 def _generation_service(repo: FakeJobRepo, orchestrator: FakeOrchestrator):
     return GenerationRetryService(
         jobs=repo,
@@ -322,19 +300,8 @@ def _generation_service(repo: FakeJobRepo, orchestrator: FakeOrchestrator):
     )
 
 
-def _delivery_service(
-    repo: FakeDeliveryRepo,
-    programs: FakePrograms,
-    delivery: FakeDeliveryService,
-):
-    return DeliveryRetryService(
-        deliveries=repo,
-        programs=programs,
-        delivery_service=delivery,
-        policy=POLICY,
-        owner=OWNER,
-        lease_seconds=LEASE,
-    )
+def _delivery_service(repo: FakeDeliveryRepo) -> DeliveryRecoveryService:
+    return DeliveryRecoveryService(deliveries=repo, policy=POLICY)
 
 
 def _record(
@@ -512,49 +479,14 @@ class TestGenerationRecovery:
         assert job.next_attempt_at is None
 
 
-# --- Повтор доставки -----------------------------------------------------------
+# --- Восстановление доставки -----------------------------------------------------
+#
+# Отправку выполняет Gateway (только у него есть доступ к Bot API). Worker
+# возвращает в очередь записи, чей отправитель исчез, — без этого они остались бы
+# в `sending` навсегда: Gateway забирает только `pending` и созревшие `failed`.
 
 
-class TestDeliveryRetry:
-    async def test_due_delivery_is_redelivered_without_generation(self):
-        repo = FakeDeliveryRepo([_record(next_attempt_at=_now() - timedelta(seconds=1))])
-        delivery = FakeDeliveryService()
-        programs = FakePrograms(_program())
-
-        succeeded, failed = await _delivery_service(
-            repo, programs, delivery
-        ).process_due()
-
-        assert (succeeded, failed) == (1, 0)
-        assert delivery.calls == ["prog-retry-1"]
-
-    async def test_delivery_without_chat_is_not_taken(self):
-        """Повторить отправку некуда: запись только занимала бы очередь."""
-        repo = FakeDeliveryRepo(
-            [_record(chat_id=None, next_attempt_at=_now() - timedelta(seconds=1))]
-        )
-        delivery = FakeDeliveryService()
-
-        assert await _delivery_service(
-            repo, FakePrograms(_program()), delivery
-        ).process_due() == (0, 0)
-        assert delivery.calls == []
-
-    async def test_deleted_program_closes_delivery(self):
-        """Программы нет: доставка закрывается, а не остаётся в SENDING."""
-        record = _record(next_attempt_at=_now() - timedelta(seconds=1))
-        repo = FakeDeliveryRepo([record])
-        delivery = FakeDeliveryService()
-
-        succeeded, failed = await _delivery_service(
-            repo, FakePrograms(None), delivery
-        ).process_due()
-
-        assert (succeeded, failed) == (0, 1)
-        assert record.status is ProgramDeliveryStatus.FAILED
-        assert record.next_attempt_at is None
-        assert delivery.calls == []
-
+class TestDeliveryRecovery:
     async def test_stale_sending_delivery_is_recovered(self):
         record = _record(
             status=ProgramDeliveryStatus.SENDING,
@@ -562,15 +494,14 @@ class TestDeliveryRetry:
         )
         repo = FakeDeliveryRepo([record])
 
-        released = await _delivery_service(
-            repo, FakePrograms(_program()), FakeDeliveryService()
-        ).recover_stale()
+        released = await _delivery_service(repo).recover_stale()
 
         assert len(released) == 1
         assert record.status is ProgramDeliveryStatus.FAILED
         assert record.next_attempt_at is not None
 
     async def test_exhausted_delivery_is_not_rescheduled(self):
+        """Исчерпавшую попытки запись Gateway брать не должен."""
         record = _record(
             status=ProgramDeliveryStatus.SENDING,
             attempts=POLICY.max_attempts,
@@ -578,11 +509,31 @@ class TestDeliveryRetry:
         )
         repo = FakeDeliveryRepo([record])
 
-        await _delivery_service(
-            repo, FakePrograms(_program()), FakeDeliveryService()
-        ).recover_stale()
+        await _delivery_service(repo).recover_stale()
 
         assert record.next_attempt_at is None
+
+    async def test_live_lease_is_not_touched(self):
+        """Живая аренда означает, что шлюз ещё отправляет."""
+        record = _record(
+            status=ProgramDeliveryStatus.SENDING,
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        repo = FakeDeliveryRepo([record])
+
+        assert await _delivery_service(repo).recover_stale() == []
+        assert record.status is ProgramDeliveryStatus.SENDING
+
+    async def test_worker_does_not_send_anything(self):
+        """У сервиса нет ни Bot API, ни рендера: отправить он не может.
+
+        Проверяется составом зависимостей, а не поведением: доступа к
+        `api.telegram.org` из RU нет, и попытка отправки гарантированно сожгла бы
+        бюджет попыток, конкурируя с очередью Gateway.
+        """
+        service = _delivery_service(FakeDeliveryRepo())
+        assert not hasattr(service, "process_due")
+        assert not any("delivery_service" in name for name in vars(service))
 
 
 # --- Координатор ---------------------------------------------------------------
@@ -600,20 +551,24 @@ class TestRetryCoordinator:
         jobs = FakeJobRepo([stale, due])
         orchestrator = FakeOrchestrator()
         deliveries = FakeDeliveryRepo(
-            [_record(next_attempt_at=_now() - timedelta(seconds=1))]
+            [
+                _record(
+                    status=ProgramDeliveryStatus.SENDING,
+                    lease_expires_at=_now() - timedelta(seconds=1),
+                )
+            ]
         )
-        delivery = FakeDeliveryService()
 
         result = await RetryCoordinator(
             generation=_generation_service(jobs, orchestrator),
-            delivery=_delivery_service(deliveries, FakePrograms(_program()), delivery),
+            delivery=_delivery_service(deliveries),
         ).run_once()
 
         assert result.recovered_jobs == 1
         # Восстановленный job получает повтор в будущем, поэтому в этом же
         # проходе берётся только тот, чьё время пришло.
         assert result.retried_jobs == 1
-        assert result.retried_deliveries == 1
+        assert result.recovered_deliveries == 1
         assert orchestrator.calls == ["job-due"]
 
     async def test_generation_failure_does_not_stop_delivery(self):
@@ -627,24 +582,26 @@ class TestRetryCoordinator:
                 raise RuntimeError("БД недоступна")
 
         deliveries = FakeDeliveryRepo(
-            [_record(next_attempt_at=_now() - timedelta(seconds=1))]
+            [
+                _record(
+                    status=ProgramDeliveryStatus.SENDING,
+                    lease_expires_at=_now() - timedelta(seconds=1),
+                )
+            ]
         )
-        delivery = FakeDeliveryService()
 
         result = await RetryCoordinator(
             generation=_generation_service(BrokenJobs(), FakeOrchestrator()),
-            delivery=_delivery_service(deliveries, FakePrograms(_program()), delivery),
+            delivery=_delivery_service(deliveries),
         ).run_once()
 
         assert result.retried_jobs == 0
-        assert result.retried_deliveries == 1
+        assert result.recovered_deliveries == 1
 
-    async def test_cycle_without_delivery_contour_works(self):
-        """Без BOT_TOKEN worker повторяет только генерацию."""
-        jobs = FakeJobRepo([_job(next_attempt_at=_now() - timedelta(seconds=1))])
+    async def test_empty_cycle_reports_no_work(self):
         result = await RetryCoordinator(
-            generation=_generation_service(jobs, FakeOrchestrator()), delivery=None
+            generation=_generation_service(FakeJobRepo(), FakeOrchestrator()),
+            delivery=_delivery_service(FakeDeliveryRepo()),
         ).run_once()
 
-        assert result.retried_jobs == 1
-        assert result.retried_deliveries == 0
+        assert result.did_work is False

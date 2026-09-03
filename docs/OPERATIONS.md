@@ -107,7 +107,8 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
   попадает в `lease_owner`), `WORKER_POLL_INTERVAL_SECONDS`,
   `WORKER_MAX_ATTEMPTS`, `WORKER_RETRY_INITIAL_DELAY_SECONDS`,
   `WORKER_RETRY_MULTIPLIER`, `WORKER_RETRY_MAX_DELAY_SECONDS`,
-  `WORKER_LEASE_SECONDS`, `WORKER_BATCH_SIZE`, `WORKER_DELIVERY_ENABLED`.
+  `WORKER_LEASE_SECONDS`, `WORKER_BATCH_SIZE`. Отправкой файлов worker не
+  занимается: её выполняет шлюз, забирая задания из очереди.
   `WORKER_LEASE_SECONDS` должен превышать максимальный бюджет генерации
   (1800 с), иначе job отберут у живого исполнителя и генерация пойдёт дважды.
 
