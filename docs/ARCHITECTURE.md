@@ -8,9 +8,9 @@
 ┌──────────────────── EU ─────────────────────┐
 │ apps/telegram_gateway — транспорт Telegram  │
 │   BackendClient, view_renderer,             │
-│   delivery_poller. Данных нет: PostgreSQL и │
-│   MinIO недоступны, Redis только для        │
-│   служебного состояния aiogram (с TTL)      │
+│   delivery_poller. Данных нет: PostgreSQL,   │
+│   Redis и MinIO недоступны, служебное        │
+│   состояние aiogram — в памяти процесса      │
 └──────────────────────┬──────────────────────┘
                        │ HTTP /internal/v1/telegram/*
                        │ (X-Internal-Service-Token)
@@ -62,8 +62,7 @@
 │   src/infrastructure/files       — FileStorage (Local)     │
 │   src/infrastructure/media       — ObjectStorage (MinIO/S3)│
 │   src/infrastructure/telegram    — TelegramAdminSender,    │
-│       ProgramSender (документы), AlertSender,              │
-│       FSMStorage (Redis, состояние анкеты)                 │
+│       ProgramSender (документы), AlertSender               │
 │   src/infrastructure/config.py, logging_setup.py           │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -94,7 +93,7 @@
   а не конфигурация: без него нельзя отличить «не проверялось» от
   «проверка провалилась».
 
-### Состояние анкеты (PostgreSQL) и служебное состояние шлюза (Redis)
+### Состояние анкеты (PostgreSQL) и служебное состояние шлюза (память процесса)
 
 Незавершённая анкета — бизнес-данные, а не runtime-состояние: в ней уже есть
 имя, возраст, ограничения движений и рекомендации врача. Она хранится в
@@ -103,23 +102,21 @@ PostgreSQL (`telegram_sessions`), в RU. Профиль попадает в `pro
 теряется целиком.
 
 До выноса Gateway за сетевую границу черновик лежал в Redis шлюза — то есть
-персональные данные хранились в EU, и без TTL. Теперь Redis шлюза содержит
-только служебное состояние aiogram и имеет TTL
-(`GATEWAY_STATE_TTL_SECONDS`).
+персональные данные хранились в EU. Затем в Redis остались только служебные
+ключи aiogram с TTL, а после изоляции EU-шлюза внешнего хранилища у него нет
+вовсе: Redis не использует ни один компонент системы.
 
-- `src/infrastructure/telegram/fsm_storage.py` — `FSMStorage`: aiogram
-  `RedisStorage` для состояния и `RedisEventIsolation` для блокировки
-  обновлений одного пользователя. Ключи включают `bot_id`, поэтому один Redis
-  может обслуживать несколько ботов.
-- Соединение проверяется до старта polling (`FSMStorage.verify`) и
-  закрывается при остановке; повторный `close` безопасен.
-- TTL задаётся для `state` и `data`: EU не должен становиться системой
-  хранения. Потеря этих ключей анкету не теряет — позиция и ответы в RU.
-- Ошибки Redis нормализуются в `FSMStorageError`, а
-  `apps/telegram_gateway/handlers/errors.py` отвечает пользователю безопасным
-  текстом. Без этого сбой хранилища выглядел бы как «бот молчит».
-- Redis не является source of truth: его потеря стоит незавершённых анкет, но
-  не сохранённых профилей и программ.
+- aiogram требует storage и event isolation: FSM-middleware читает состояние на
+  каждом обновлении, а isolation сериализует параллельные обновления одного
+  пользователя, иначе второй ответ мог бы обогнать первый. `build_isolation()` в
+  `apps/telegram_gateway/main.py` отдаёт `MemoryStorage` и `SimpleEventIsolation`.
+- Внешнее хранилище для этого не нужно. Хендлеры FSM не используют, поэтому при
+  рестарте терять нечего. Общая блокировка между процессами тоже не нужна:
+  `getUpdates` с одним токеном обслуживает ровно один процесс (второй получает
+  от Telegram 409 Conflict), а очередь доставки защищена арендой в PostgreSQL.
+- Отсутствие клиента хранилища — это и есть граница: в EU нечем сохранить
+  пользовательские данные и нечего случайно переподключить к хранилищам RU.
+  Регрессия ловится `tests/unit/test_gateway_storage_isolation.py`.
 
 ## Внутренний веб-интерфейс
 

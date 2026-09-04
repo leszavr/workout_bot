@@ -1,16 +1,4 @@
 services:
-  # Redis шлюза, отдельный от Redis Backend: шлюз не обращается к хранилищам
-  # Backend. Хранит только техническое состояние диалога с TTL.
-  gateway-redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-
   telegram-bot:
     build:
       context: ..
@@ -22,7 +10,6 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN:?set in .env}
       ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
-      REDIS_URL: redis://gateway-redis:6379/0
       # Единственный канал к данным.
       BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://backend:8000}
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set in .env}
@@ -30,8 +17,6 @@ services:
       COMPONENT_REGION: ${TELEGRAM_REGION:-EU}
       BUILD_SHA: ${BUILD_SHA:-}
     depends_on:
-      gateway-redis:
-        condition: service_healthy
       backend:
         condition: service_started
     restart: unless-stopped
@@ -119,8 +104,11 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # Redis — устойчивое runtime-состояние анкеты (FSM). Бизнес-данные остаются
-  # в PostgreSQL, поэтому потеря Redis не приводит к потере профилей и программ.
+  # Redis. Часть RU-инфраструктуры, оставленная на месте: после изоляции EU
+  # Gateway ни один компонент к ней не обращается — FSM Gateway теперь в памяти
+  # процесса, а очереди и аренда worker'а живут в PostgreSQL. Судьба контейнера
+  # решается отдельной задачей: удаление RU-инфраструктуры в изоляцию Gateway не
+  # входит. Подключать сюда шлюз нельзя — он в EU-сегменте.
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]

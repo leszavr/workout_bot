@@ -38,7 +38,7 @@
 
 **Design baseline:** `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`.
 
-#### 1.2-A — Persistent FSM: DONE
+#### 1.2-A — Persistent FSM: DONE (решение заменено серверной сессией)
 - [x] заменить `MemoryStorage` на устойчивое production storage (Redis-backed
       FSM: `RedisStorage` + `RedisEventIsolation`, ключи с `bot_id`);
 - [x] проверить restart/recovery questionnaire state;
@@ -48,6 +48,10 @@
 - [x] недоступность Redis приводит к понятному сообщению пользователю
       (`FSMStorageError` → error router), а не к молчаливой потере ответа;
 - [x] Redis добавлен в docker compose и CI, тесты FSM выполняются реально.
+
+**Актуальное состояние:** требование выполняется без Redis. Сетевая граница
+Gateway перенесла черновик анкеты в `telegram_sessions` (PostgreSQL, RU), а
+изоляция EU-шлюза убрала Redis у него полностью — см. 1.2-D-2.
 
 #### 1.2-B — Generation domain state: DONE
 - [x] формализована persistent generation status model: `generation_jobs`,
@@ -194,7 +198,8 @@ Bot API не сообщает об открытии присланного до�
 - [x] серверная сессия диалога `telegram_sessions` (миграция `0013`): ответы и
       позиция в RU, черновик профиля с первого ответа;
 - [x] у шлюза нет PostgreSQL, ключей MinIO и импортов предметной логики; Redis
-      остался только для служебного состояния aiogram и получил TTL;
+      остался только для служебного состояния aiogram и получил TTL (снят
+      полностью в 1.2-D-2);
 - [x] фотографии оборудования передаются байтами в RU и пишутся в MinIO; диск EU
       не участвует;
 - [x] доставка: шлюз опрашивает очередь Backend (EU за NAT, входящих нет);
@@ -217,6 +222,29 @@ Bot API не сообщает об открытии присланного до�
       возврат в очередь застрявших доставки и job;
 - [x] независимый деплой обоих компонентов подтверждён (перезапуск одного не
       затрагивает другой).
+
+#### 1.2-D-2 — Изоляция EU Gateway от хранилищ RU: DONE
+- [x] discovery: Redis шлюзу больше не нужен — FSM хендлеры не используют,
+      блокировка между процессами не требуется (`getUpdates` обслуживает один
+      процесс, очередь доставки защищена арендой в PostgreSQL);
+- [x] `REDIS_URL`, `GATEWAY_STATE_TTL_SECONDS`, `fsm_storage.py`, обработчик
+      сбоя хранилища и контейнер `gateway-redis` удалены; служебное состояние
+      aiogram — `MemoryStorage` + `SimpleEventIsolation`;
+- [x] `aiogram[redis]` → `aiogram`: клиента Redis в образе больше нет;
+- [x] у шлюза нет тома и `WORKOUT_DATA_DIR`: писать пользовательские файлы в EU
+      нечем;
+- [x] regression-тесты `tests/unit/test_gateway_storage_isolation.py` (41):
+      маркеры хранилищ в коде, граф импортов, compose, env-примеры, отсутствие
+      записи на диск, содержание сетевого правила; включены в job `contracts`;
+- [x] сетевой слой: точечное правило nftables в семействе `bridge` запрещает
+      адресу шлюза порты 5432/6379/9000/9001 (внутри одного docker-bridge
+      правила семейства `ip` этот трафик не видят); файл правила и systemd unit
+      в `deploy/`, глобальный ruleset не тронут;
+- [x] staging: шлюз работает без Redis (`RestartCount=0`, `bot.me()` PASS,
+      polling очереди), доступ к PostgreSQL/Redis/MinIO даёт `TimeoutError`,
+      клиента Redis в образе нет, `gateway-redis` удалён; Backend и worker к
+      хранилищам ходят как раньше; проверки повторно пройдены после reboot;
+      отчёт — `docs/infrastructure/EU_GATEWAY_REDIS_ISOLATION_REPORT.md`.
 
 #### 1.2-E — Delivery
 - [x] отдельное persistent delivery state/job (очередь `program_deliveries` с

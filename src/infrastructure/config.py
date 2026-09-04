@@ -24,11 +24,6 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 # PostgreSQL. Если DATABASE_URL не задан — используется файловое хранилище (dev/test).
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Redis — устойчивое runtime-состояние анкеты (FSM). Бизнес-данные остаются в
-# PostgreSQL. Обязателен для Telegram-бота: на MemoryStorage анкета теряется
-# при перезапуске и не работает при нескольких экземплярах приложения.
-REDIS_URL = os.getenv("REDIS_URL", "")
-
 # Внутренний веб-интерфейс: учётные данные администратора (только из env).
 ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
@@ -163,8 +158,3 @@ BACKEND_REQUEST_TIMEOUT_SECONDS = float(
 # ждёт ответа. Дольше держать его в тишине нельзя.
 BACKEND_REQUEST_RETRIES = int(os.getenv("BACKEND_REQUEST_RETRIES", "3"))
 BACKEND_RETRY_DELAY_SECONDS = float(os.getenv("BACKEND_RETRY_DELAY_SECONDS", "1"))
-# TTL технического состояния диалога в Redis Gateway. Хранятся только
-# идентификаторы сообщений, которые бот правит; ответы пользователя лежат в RU.
-# Без TTL техническое состояние превратилось бы в постоянное хранилище, а EU им
-# быть не должен. Сутки — с запасом на прохождение анкеты в несколько заходов.
-GATEWAY_STATE_TTL_SECONDS = int(os.getenv("GATEWAY_STATE_TTL_SECONDS", "86400"))

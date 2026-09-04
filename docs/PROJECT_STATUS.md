@@ -93,7 +93,7 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 23.08.2026 зафиксирован архитектурный design review в `docs/architecture/PHASE_1_2_RUNTIME_RELIABILITY.md`.
 
-Целевой runtime: Persistent FSM → Finalization → Generation Job → AI/Deterministic → Validation → persisted Program → Delivery Job → Telegram. PostgreSQL остаётся source of truth для бизнес-состояния, Redis используется для устойчивого runtime/transient state.
+Целевой runtime: Persistent FSM → Finalization → Generation Job → AI/Deterministic → Validation → persisted Program → Delivery Job → Telegram. PostgreSQL остаётся source of truth для бизнес-состояния. Redis в design baseline предполагался для устойчивого runtime/transient state; фактически он не понадобился — состояние диалога переехало в PostgreSQL, а служебное состояние шлюза живёт в памяти процесса.
 
 Ключевые решения:
 - generation и delivery — отдельные persistent операции;
@@ -106,24 +106,32 @@ Workout Bot — модульный монолит для Telegram: пользо�
 
 **Следующий рабочий этап:** Phase 1.2-E — Delivery (отдельное persistent delivery state/job); очередь отправки и приём результата уже введены сетевой границей Gateway.
 
-### Phase 1.2-A — Persistent FSM: ГОТОВО
+### Phase 1.2-A — Persistent FSM: ГОТОВО (заменено серверной сессией)
 
-- состояние анкеты хранится в Redis (`REDIS_URL`) вместо `MemoryStorage`:
-  перезапуск процесса бота не сбрасывает анкету, несколько экземпляров
-  приложения работают с общим состоянием;
+Решение этого подэтапа с тех пор заменено дважды: сетевая граница Gateway
+перенесла черновик анкеты в PostgreSQL (`telegram_sessions`), а изоляция
+EU-шлюза убрала у него Redis полностью. Ниже — исходный объём работ, ради
+истории; актуальное состояние см. «Изоляция EU Gateway от хранилищ RU».
+
+- состояние анкеты хранилось в Redis (`REDIS_URL`) вместо `MemoryStorage`:
+  перезапуск процесса бота не сбрасывал анкету, несколько экземпляров
+  приложения работали с общим состоянием;
 - `src/infrastructure/telegram/fsm_storage.py` — aiogram `RedisStorage` и
   `RedisEventIsolation` с ключами, включающими `bot_id`; изоляция обновлений
-  общая для всех процессов, поэтому один ответ не обрабатывается дважды;
-- бот не запускается без `REDIS_URL`, доступность проверяется до старта
-  polling, соединения закрываются при остановке (повторное закрытие безопасно);
-- сбой Redis нормализуется в `FSMStorageError` и превращается в понятное
-  сообщение пользователю; ответы анкеты и подключение не попадают в логи;
-- PostgreSQL остаётся source of truth: в Redis лежит только черновик анкеты,
-  профиль сохраняется при подтверждении, и сбой runtime state не портит
+  общая для всех процессов, поэтому один ответ не обрабатывался дважды;
+- бот не запускался без `REDIS_URL`, доступность проверялась до старта
+  polling, соединения закрывались при остановке (повторное закрытие безопасно);
+- сбой Redis нормализовался в `FSMStorageError` и превращался в понятное
+  сообщение пользователю; ответы анкеты и подключение не попадали в логи;
+- PostgreSQL оставался source of truth: в Redis лежал только черновик анкеты,
+  профиль сохранялся при подтверждении, и сбой runtime state не портил
   бизнес-данные;
-- Redis добавлен в `docker/docker-compose.yml`, `workout-manager.sh`
-  (start/stop/status/doctor/logs/test) и в CI, поэтому FSM-тесты выполняются
-  реально, а не пропускаются.
+- Redis был добавлен в `docker/docker-compose.yml`, `workout-manager.sh`
+  (start/stop/status/doctor/logs/test) и в CI.
+
+Что от этого осталось: требование «анкета переживает рестарт и не теряется при
+нескольких экземплярах» выполняется серверной сессией в PostgreSQL. Файлы
+`fsm_storage.py` и обработчик его сбоя удалены вместе с зависимостью от Redis.
 
 ### Phase 1.2-B — Persistent generation state + idempotency: ГОТОВО
 
@@ -295,10 +303,9 @@ Gateway стал независимой единицей развёртыван�
 - **уведомление администратора** тоже идёт через шлюз: сводка и JSON-профиль
   передаются как сообщения в другой чат. Отдельной очереди оно не требует — у
   него нет файла программы;
-- **Redis остался у шлюза**, но только для служебных нужд aiogram (изоляция
-  параллельных обновлений одного пользователя) и **с TTL**
-  (`GATEWAY_STATE_TTL_SECONDS`, сутки). Контейнер отдельный от Redis Backend:
-  обращаться к хранилищам RU шлюз не должен;
+- **Redis остался у шлюза** — только для служебных нужд aiogram и с TTL
+  (`GATEWAY_STATE_TTL_SECONDS`, сутки), в отдельном от Redis Backend контейнере.
+  Этот остаток снят следующей задачей: см. «Изоляция EU Gateway от хранилищ RU»;
 - **независимые версии**: `APP_VERSION` 2.3.0, `GATEWAY_VERSION` 1.0.0,
   `WORKER_VERSION` 1.0.0. Совместимость решает `contract_version`, а не
   совпадение версий — иначе любое обновление Backend требовало бы
@@ -352,11 +359,89 @@ Gateway стал независимой единицей развёртыван�
 3. `count_photos` и `delete_profile_files` у object-storage-реализации не
    поддерживаются: листинг бакета по префиксу удалил бы файлы, о которых профиль
    не знает. Лимит на число фото проверяется по `equipment_photos`.
-4. Скачивание фото из Telegram (`download_file`) вживую не проверено: Bot API не
-   позволяет прислать сообщение от имени пользователя. Всё, что после получения
-   байтов, проверено на staging.
+ 4. Скачивание фото из Telegram (`download_file`) вживую не проверено: Bot API не
+    позволяет прислать сообщение от имени пользователя. Всё, что после получения
+    байтов, проверено на staging.
+
+### Изоляция EU Gateway от хранилищ RU: ГОТОВО
+
+Подробности — `docs/infrastructure/EU_GATEWAY_REDIS_ISOLATION_REPORT.md`.
+
+Закрыт остаток технического долга сетевой границы: у шлюза больше нет ни одного
+хранилища. Redis был последним — он держал служебные ключи aiogram в EU.
+
+- **Redis шлюзу не нужен**: хендлеры FSM не используют (позиция диалога и ответы
+  в `telegram_sessions`), а межпроцессная блокировка не требуется — `getUpdates`
+  с одним токеном обслуживает ровно один процесс, второй получает от Telegram
+  409 Conflict; очередь доставки защищена арендой в PostgreSQL. Служебное
+  состояние aiogram теперь `MemoryStorage` + `SimpleEventIsolation`;
+- **удалено**: `REDIS_URL` и `GATEWAY_STATE_TTL_SECONDS` из конфигурации,
+  `src/infrastructure/telegram/fsm_storage.py`, обработчик сбоя хранилища
+  (`handlers/errors.py`), `FSMStorageError`, контейнер `gateway-redis` из обоих
+  compose-файлов, Redis-гейт из `workout-manager.sh` и сервис `redis` из CI;
+- **клиента Redis больше нет в образе**: зависимость `aiogram[redis]` заменена на
+  `aiogram`. Пока клиент установлен, вернуть подключение можно одной строкой, а
+  образ один на Backend, Gateway и worker;
+- **у шлюза нет тома и `WORKOUT_DATA_DIR`**: каталога данных в EU не существует,
+  корневая файловая система для `appuser` недоступна на запись. Фото и файлы
+  программ живут в памяти процесса между Telegram и Backend;
+- **regression-защита** — `tests/unit/test_gateway_storage_isolation.py` (41
+  проверка): маркеры хранилищ в исходниках, граф импортов процесса (клиент не
+  должен появиться и транзитивно), состав env в compose, отсутствие общего
+  env-файла, отсутствие `gateway-redis`, отсутствие записи на диск, наличие
+  разрешённых направлений, а также содержание сетевого правила и его unit.
+  Тест включён в job `contracts` CI;
+- **сетевой слой**: удалить шлюз из общей docker-сети нельзя (связность
+  Gateway → Backend идёт по ней, и от адреса контейнера зависит policy routing),
+  поэтому доступ закрыт точечным правилом nftables в семействе `bridge` —
+  единственном, которое видит трафик внутри одного bridge (`br_netfilter` на
+  хосте не загружен, счётчики `FORWARD`/`DOCKER-USER` на этот трафик не
+  реагируют). Правило запрещает адресу шлюза порты 5432, 6379, 9000 и 9001;
+  Backend (8000) и Telegram (443) не затронуты. Файл правила и systemd unit
+  лежат в `deploy/`, персистентность — через отдельный unit, а не через
+  `nftables.service` (тот применил бы `flush ruleset` и снёс правила ufw и
+  docker);
+- **Redis остаётся в RU-инфраструктуре** как контейнер, но к нему не подключается
+  ни один компонент. Удаление самого контейнера — отдельная задача.
+
+**Развёрнуто на staging 4 сентября** (`0013 (head)`, миграций не потребовалось):
+
+- шлюз работает без Redis: `event=telegram_gateway_started`, heartbeat
+  `state=compatible`, polling очереди каждые 5 с, `RestartCount=0`;
+- `bot.me()` PASS (Telegram API доступен), egress шлюза `31.58.181.202` (EU),
+  Backend и worker — `91.79.244.18`;
+- Backend `/health` и `/ready` PASS (`storage: true`), `deployment-safety` =
+  `SAFE`, оба компонента `compatible`;
+- у контейнера шлюза 11 переменных приложения: ни `REDIS_URL`, ни
+  `DATABASE_URL`, ни `MINIO_*`, ни `JWT_SECRET`, ни `AI_SECRETS_KEY`; том
+  отсутствует, корневая ФС для `appuser` недоступна на запись;
+- изоляция подтверждена тремя слоями: клиента Redis в образе нет (`ImportError`),
+  credentials нет, сетевой путь до PostgreSQL, Redis, MinIO API и MinIO Console
+  даёт `TimeoutError`; счётчик правила растёт при попытках;
+- Backend и worker → PostgreSQL/Redis/MinIO: без изменений; целостность данных
+  не изменилась (exercises 873, profiles 28, programs 29, jobs 28, users 27),
+  застрявших `sending`/`running` нет;
+- после полной перезагрузки хоста все проверки повторно пройдены: unit активен,
+  правило на месте, `ip rule` и handshake `wg-workout` не пострадали;
+- контейнер `gateway-redis` удалён.
+
+**Осознанные ограничения:**
+
+1. Redis RU остаётся запущенным контейнером, к которому никто не подключается
+   (`dbsize` = 0). Удаление контейнера и тома — отдельная задача по
+   RU-инфраструктуре.
+2. Правило адресует фиксированный IP шлюза (`TELEGRAM_BOT_IP`, `172.18.0.20`).
+   От того же адреса зависит существующий policy routing, поэтому связь
+   надёжная, но при смене адреса правило нужно обновлять синхронно с compose —
+   на это указывает тест, сверяющий адрес в правиле с compose.
+3. Осиротевший пустой том прежнего `gateway-redis` не удалён: удаление тома
+   необратимо и для изоляции не требуется.
+
+VPN, wstunnel, routing EU ↔ RU, policy routing, публичный firewall, SSH и
+S1-инфраструктура не менялись.
 
 ### AI reliability + prompt management: ГОТОВО
+
 
 Работа по FINDING-1 из `docs/infrastructure/STAGING_FULL_E2E_ACCEPTANCE_REPORT.md`
 (ИИ не собрал программу, сработал детерминированный fallback). Подробности —
@@ -536,9 +621,9 @@ EU routing, WireGuard/wstunnel и бизнес-логика шлюза не ме
 
 ### P0 — до реального production
 1. Production hardening: централизованные логи, error tracking/metrics,
-   backup/restore, rate limits и эксплуатационные процедуры. Устойчивое FSM
-   storage закрыто в Phase 1.2-A; backup/restore Redis не требуется — там
-   только незавершённые анкеты.
+   backup/restore, rate limits и эксплуатационные процедуры. Устойчивость
+   состояния анкеты закрыта серверной сессией в PostgreSQL; отдельный
+   backup/restore для Redis не нужен — Redis не использует ни один компонент.
 2. **Нет rate limiting на вход в админку** — перебор пароля остаётся задачей Phase 1.3.
 3. End-to-end verification на чистом окружении: миграции, импорт каталога/медиа, AI primary, deterministic fallback, delivery failure/retry.
 4. Проверка безопасности production-конфигурации и секретов.
