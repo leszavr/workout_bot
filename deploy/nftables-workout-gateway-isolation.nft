@@ -1,0 +1,36 @@
+#!/usr/sbin/nft -f
+#
+# Изоляция EU Telegram Gateway от хранилищ RU на уровне bridge.
+#
+# Зачем bridge family, а не ip filter. Все контейнеры находятся в одной
+# docker-сети `workout_net` (bridge br-<id>), потому что связность
+# Gateway -> Backend необходима. Трафик между контейнерами одного bridge
+# коммутируется на канальном уровне и в цепочку FORWARD семейства ip не
+# попадает: `br_netfilter` на хосте не загружен, счётчики FORWARD и
+# DOCKER-USER при обращении шлюза к PostgreSQL не растут. Поэтому deny
+# ставится в семейство bridge — единственное, которое этот трафик видит.
+#
+# Что именно запрещено: обращения с адреса шлюза (закреплён в
+# docker/staging-app-compose.yml как TELEGRAM_BOT_IP=172.18.0.20) к портам
+# хранилищ. Backend (8000) и Telegram API не затронуты: их портов в списке нет,
+# а исходящий в интернет трафик через bridge forward не проходит.
+#
+# Отдельная таблица с собственным именем: ufw и docker свои правила держат в
+# семействах ip/ip6, и эта таблица с ними не пересекается. `nftables.service`
+# остаётся выключенным, глобальный ruleset не трогается.
+#
+# Идемпотентность: пустое объявление + delete + создание. Повторный запуск
+# заменяет таблицу целиком, а не добавляет второе правило.
+
+table bridge workout_gateway_isolation {}
+delete table bridge workout_gateway_isolation
+
+table bridge workout_gateway_isolation {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+
+		# PostgreSQL, Redis, MinIO API, MinIO Console.
+		ip saddr 172.18.0.20 tcp dport { 5432, 6379, 9000, 9001 } \
+			counter drop comment "EU gateway must not reach RU storages"
+	}
+}

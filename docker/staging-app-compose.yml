@@ -56,46 +56,25 @@ services:
     restart: unless-stopped
     networks: [workout_net]
 
-  # Redis шлюза. Отдельный от Redis Backend намеренно: шлюз работает в
-  # EU-сегменте и не должен обращаться к хранилищам RU. Хранит только
-  # техническое состояние текущего диалога с TTL — ответы анкеты лежат в
-  # PostgreSQL (RU). Персистентность не включена: потеря этих ключей не теряет
-  # анкету, диалог продолжается после переспроса текущего вопроса.
-  gateway-redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    cpus: 0.25
-    mem_limit: 192m
-    pids_limit: 64
-    restart: unless-stopped
-    networks: [workout_net]
-
   telegram-bot:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    # Отдельный env-файл: у шлюза нет DATABASE_URL, ключей MinIO и адреса Redis
-    # Backend. Общий файл дал бы ему доступ к хранилищам RU, даже если код им не
+    # Отдельный env-файл: у шлюза нет DATABASE_URL, ключей MinIO и адреса Redis.
+    # Общий файл дал бы ему доступ к хранилищам RU, даже если код им не
     # пользуется — а проверка независимости фактическая, не по коду.
     env_file:
       - ${STAGING_GATEWAY_ENV_FILE:-/opt/workout_bot/compose/staging-gateway.env}
     environment:
-      WORKOUT_DATA_DIR: /app/data
+      # Тома у шлюза нет, и `WORKOUT_DATA_DIR` ему не задаётся: каталога данных
+      # в EU не существует. Пользовательские байты живут в памяти процесса.
       # Шлюз размещается в EU-сегменте: это видно администратору в разделе
       # «Инфраструктура» и не влияет на маршрутизацию.
       COMPONENT_REGION: ${TELEGRAM_REGION:-EU}
       BUILD_SHA: ${BUILD_SHA:-}
-      REDIS_URL: redis://gateway-redis:6379/0
     command: ["python", "-m", "apps.telegram_gateway.main"]
     depends_on:
       backend:
-        condition: service_healthy
-      gateway-redis:
         condition: service_healthy
     cpus: 0.5
     mem_limit: 768m

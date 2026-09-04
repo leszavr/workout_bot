@@ -4,8 +4,8 @@
 
 Gateway — независимая единица развёртывания в EU-сегменте (там доступен Telegram
 API). Данных у него нет: анкета, профили, программы и состояние диалога живут в
-RU и доступны только через internal API Backend. PostgreSQL и Redis Backend
-Gateway недоступны.
+RU и доступны только через internal API Backend. Хранилищ у Gateway нет вовсе —
+ни PostgreSQL, ни Redis, ни MinIO.
 
 Что делает процесс:
 
@@ -13,9 +13,6 @@ Gateway недоступны.
 - скачивает фотографии оборудования и передаёт байты в RU, не сохраняя их;
 - опрашивает очередь доставки и отправляет готовые файлы программ;
 - сообщает о себе в Component Registry.
-
-Redis остаётся, но только для служебных нужд aiogram (изоляция параллельных
-обновлений одного пользователя). Ответов анкеты в нём больше нет — они в RU.
 
 Регистрация в реестре не является условием запуска: при недоступном Backend бот
 продолжает работать, сообщая пользователю о временной недоступности, и heartbeat
@@ -31,52 +28,54 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.base import BaseEventIsolation, BaseStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 
 from apps.telegram_gateway import delivery_poller
 from apps.telegram_gateway.component import build_heartbeat_client, gateway_metadata
-from apps.telegram_gateway.handlers import dialog, errors
+from apps.telegram_gateway.handlers import dialog
 from apps.telegram_gateway.runtime import build_backend_client, set_backend_client
 from src.infrastructure.config import (
     BOT_TOKEN,
-    REDIS_URL,
     TELEGRAM_COMPONENT_ID,
     TELEGRAM_DELIVERY_BATCH_SIZE,
     TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS,
 )
 from src.infrastructure.logging_setup import setup_logging
-from src.infrastructure.telegram.fsm_storage import create_fsm_storage
 
 logger = logging.getLogger(__name__)
 
 
-def resolve_fsm_url(url: str) -> str:
-    """Redis нужен для изоляции параллельных обновлений одного пользователя.
+def build_isolation() -> tuple[BaseStorage, BaseEventIsolation]:
+    """Служебное состояние aiogram — только в памяти процесса.
 
-    Без изоляции два быстрых сообщения обрабатывались бы одновременно, и второй
-    ответ мог обогнать первый. Анкета при потере Redis не теряется: позиция и
-    ответы лежат в RU.
+    aiogram требует storage и isolation: FSM-middleware читает состояние на
+    каждом обновлении, а isolation сериализует параллельные обновления одного
+    пользователя, иначе второй ответ мог бы обогнать первый.
+
+    Внешнее хранилище для этого не нужно. Хендлеры FSM не используют — позиция
+    диалога и ответы лежат в RU, — поэтому терять при рестарте нечего. Общая
+    блокировка между процессами тоже не нужна: `getUpdates` с одним токеном
+    обслуживает ровно один процесс (второй получает от Telegram 409 Conflict),
+    а очередь доставки защищена арендой в PostgreSQL, а не блокировкой здесь.
+
+    Так у Gateway не остаётся ни адреса, ни клиента внешнего хранилища: в EU
+    нечему хранить пользовательские данные и нечего случайно переподключить к
+    хранилищам RU.
     """
-    if not url:
-        raise RuntimeError(
-            "REDIS_URL is empty. Set the environment variable REDIS_URL before "
-            "running the bot: concurrent updates from one user must be serialised."
-        )
-    return url
+    return MemoryStorage(), SimpleEventIsolation()
 
 
 def build_dispatcher(
     *, storage: BaseStorage, events_isolation: BaseEventIsolation
 ) -> Dispatcher:
-    """Два роутера: обработчик ошибок хранилища и диалог.
+    """Один роутер: любое обновление обрабатывается одинаково.
 
     Прежнее деление на start/questionnaire/review отражало структуру анкеты.
-    Этого знания здесь нет — любое обновление обрабатывается одинаково.
-
-    Error router идёт первым: диалог реагирует на любой текст и иначе перехватил
-    бы обновление до обработчика сбоя Redis.
+    Этого знания здесь нет. Отдельного обработчика сбоя хранилища тоже нет:
+    хранилище процесса локальное, а недоступность Backend обрабатывает диалог.
     """
     dispatcher = Dispatcher(storage=storage, events_isolation=events_isolation)
-    dispatcher.include_routers(errors.router, dialog.router)
+    dispatcher.include_router(dialog.router)
     return dispatcher
 
 
@@ -87,14 +86,13 @@ async def main() -> None:
             "BOT_TOKEN is empty. Set the environment variable BOT_TOKEN before running the bot."
         )
 
-    fsm = create_fsm_storage(resolve_fsm_url(REDIS_URL))
-    await fsm.verify()
+    fsm_storage, events_isolation = build_isolation()
 
     backend = build_backend_client()
     set_backend_client(backend)
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = build_dispatcher(storage=fsm.storage, events_isolation=fsm.events_isolation)
+    dp = build_dispatcher(storage=fsm_storage, events_isolation=events_isolation)
 
     heartbeat = build_heartbeat_client()
     heartbeat_task = asyncio.create_task(heartbeat.run()) if heartbeat else None
@@ -136,9 +134,6 @@ async def main() -> None:
             await _cancel(heartbeat_task)
             await heartbeat.close()
         await backend.close()
-        # aiogram закрывает storage сам; close идемпотентен и гарантирует
-        # освобождение пула соединений при любом пути остановки.
-        await fsm.close()
         set_backend_client(None)
         logger.info("event=telegram_gateway_stopped")
 

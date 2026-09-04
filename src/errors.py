@@ -30,10 +30,6 @@ class FileStorageError(WorkoutBotError):
     """Ошибка файлового хранилища (лимит размера, количества, запись)."""
 
 
-class FSMStorageError(WorkoutBotError):
-    """Хранилище runtime-состояния анкеты (FSM) недоступно."""
-
-
 class NotificationError(WorkoutBotError):
     """Не удалось доставить уведомление администратору."""
 

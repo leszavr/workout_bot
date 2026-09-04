@@ -1,0 +1,27 @@
+[Unit]
+# Изоляция EU Telegram Gateway от хранилищ RU (bridge-family nftables).
+#
+# Отдельный unit, а не `nftables.service`: тот выключен, а его включение
+# применило бы /etc/nftables.conf с `flush ruleset` — то есть снесло бы правила
+# ufw и docker. Здесь загружается только одна собственная таблица в семействе
+# bridge, ruleset целиком не трогается.
+#
+# After=docker.service: правило фильтрует по адресу контейнера в сети
+# `workout_net`, которую создаёт docker. Порядок не критичен (правило не зависит
+# от существования интерфейса), но так таблица появляется уже после того, как
+# сеть поднята, и в логе виден корректный порядок.
+Description=Workout: bridge-level isolation of EU Telegram Gateway from RU storages
+Documentation=file:/etc/nftables-workout-gateway-isolation.nft
+After=docker.service network-pre.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables-workout-gateway-isolation.nft
+# Откат: таблица удаляется целиком. `-` перед командой — остановка не должна
+# падать, если таблицы уже нет (например, после ручного удаления).
+ExecStop=-/usr/sbin/nft delete table bridge workout_gateway_isolation
+
+[Install]
+WantedBy=multi-user.target

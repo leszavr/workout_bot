@@ -2,8 +2,8 @@
 
 ## Локальное окружение: workout-manager.sh
 
-Скрипт в корне проекта поднимает и обслуживает локальное окружение: PostgreSQL,
-Redis и MinIO в docker compose, backend, веб-интерфейс, Telegram-бот.
+Скрипт в корне проекта поднимает и обслуживает локальное окружение: PostgreSQL
+и MinIO в docker compose, backend, веб-интерфейс, Telegram-бот.
 
 ```bash
 ./workout-manager.sh start        # инфраструктура + backend + веб, логи в терминале, Ctrl+C — стоп
@@ -21,9 +21,10 @@ Redis и MinIO в docker compose, backend, веб-интерфейс, Telegram-�
 - **не запускает backend без базы.** uvicorn поднимается и без PostgreSQL, но
   тогда все запросы отвечают ошибкой, а в интерфейсе это выглядит как
   `Failed to fetch`. Доступность базы проверяется по `DATABASE_URL` до запуска.
-- **не запускает бота без Redis.** Состояние анкеты хранится в Redis; при
-  недоступности бот завершился бы при старте, поэтому `REDIS_URL` проверяется
-  заранее (`start bot`, `start services`, `doctor`).
+- **бота запускает без хранилищ.** У шлюза их нет: состояние диалога и ответы
+  анкеты лежат в PostgreSQL (RU), а служебное состояние aiogram — в памяти
+  процесса. Единственные обязательные настройки — `BOT_TOKEN`,
+  `BACKEND_INTERNAL_URL` и `INTERNAL_SERVICE_TOKEN`.
 - **восстанавливает публикацию порта PostgreSQL.** Контейнер может остаться
   запущенным, потеряв проброс порта на хост; тогда контейнер пересоздаётся
   (данные в именованном volume не затрагиваются).
@@ -47,18 +48,21 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 
 ## Зависимости
 
-- PostgreSQL — основные данные;
-- Redis — состояние анкеты (FSM) между сообщениями и перезапусками;
+- PostgreSQL — основные данные, включая состояние диалога анкеты;
 - MinIO — бинарные изображения упражнений;
 - FastAPI — backend/API;
-- Telegram gateway — пользовательский транспорт. Данных не хранит: анкета,
-  профили и состояние диалога живут в RU, шлюз общается с Backend только через
-  `/internal/v1/telegram/*`. Свой Redis (EU) нужен только для служебного
-  состояния aiogram и имеет TTL;
+- Telegram gateway — пользовательский транспорт. Хранилищ у него нет вовсе:
+  анкета, профили и состояние диалога живут в RU, шлюз общается с Backend только
+  через `/internal/v1/telegram/*`. Служебное состояние aiogram (изоляция
+  параллельных обновлений одного пользователя) держится в памяти процесса;
 - Worker — повтор transient-отказов генерации и доставки, восстановление
-  операций после падения процесса (`python -m apps.worker.main`). Redis ему не
-  нужен: очередь повторов и аренда живут в PostgreSQL;
+  операций после падения процесса (`python -m apps.worker.main`). Хранилища,
+  кроме PostgreSQL, ему не нужны: очередь повторов и аренда живут там;
 - Next.js — внутренняя админка.
+
+Redis не использует ни один компонент. Контейнер `redis` в docker compose
+оставлен как часть RU-инфраструктуры; подключать к нему Telegram Gateway нельзя —
+он работает в EU-сегменте.
 
 ## Обязательные проверки после развёртывания
 
@@ -82,11 +86,13 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
   `lease_expires_at`: такие worker обязан вернуть в очередь за один цикл. Запись,
   застрявшая в `sending`, недостижима для шлюза — он забирает только `pending` и
   созревшие `failed`;
-- у контейнера шлюза нет `DATABASE_URL` и ключей MinIO:
+- у контейнера шлюза нет `DATABASE_URL`, `REDIS_URL` и ключей MinIO:
   `docker compose config` для `telegram-bot` не должен их содержать. Это
   проверяется фактически, а не по коду;
-- в Redis шлюза у ключей есть TTL (`redis-cli ttl <key>` > 0) и нет ответов
-  анкеты: они лежат в `telegram_sessions` (RU);
+- у процесса шлюза нет установленных соединений к хранилищам RU и нет сетевого
+  пути к ним: подключение к 5432, 6379, 9000 и 9001 изнутри контейнера шлюза
+  должно завершаться таймаутом. За это отвечает
+  `workout-gateway-isolation.service` на хосте (см. ниже);
 - в `generation_jobs` нет записей в статусе `running` с истёкшим
   `lease_expires_at`: такие job worker обязан вернуть в очередь в течение одного
   цикла (`WORKER_POLL_INTERVAL_SECONDS`).
@@ -96,7 +102,6 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 Полный список и примеры — `.env.example`. Критические группы:
 - Telegram: `BOT_TOKEN`, `ADMIN_CHAT_ID`;
 - PostgreSQL: `DATABASE_URL`/пароли;
-- Redis: `REDIS_URL` (обязателен для бота), `REDIS_PORT`;
 - admin/JWT;
 - MinIO/media;
 - `PROGRAM_PRIMARY_GENERATOR`, `PROGRAM_FALLBACK_GENERATOR`;
@@ -105,9 +110,8 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
   `staging-app.env` и содержит только нужные шлюзу значения): `BACKEND_INTERNAL_URL`,
   `INTERNAL_SERVICE_TOKEN`, `BACKEND_REQUEST_TIMEOUT_SECONDS`,
   `BACKEND_REQUEST_RETRIES`, `BACKEND_RETRY_DELAY_SECONDS`,
-  `TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS`, `TELEGRAM_DELIVERY_BATCH_SIZE`,
-  `GATEWAY_STATE_TTL_SECONDS`. `DATABASE_URL` и `MINIO_*` в этом файле быть не
-  должно;
+  `TELEGRAM_DELIVERY_POLL_INTERVAL_SECONDS`, `TELEGRAM_DELIVERY_BATCH_SIZE`.
+  `DATABASE_URL`, `REDIS_URL` и `MINIO_*` в этом файле быть не должно;
 - Backend: `TELEGRAM_DELIVERY_LEASE_SECONDS` — аренда задания на отправку;
   должна покрывать рендер HTML и отправку документа, иначе задание отдадут
   второму экземпляру шлюза и пользователь получит файл дважды;
@@ -121,6 +125,48 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
   (1800 с), иначе job отберут у живого исполнителя и генерация пойдёт дважды.
 
 Секреты не коммитить. Для production требуется отдельная процедура backup/restore и регулярная проверка восстановления.
+
+## Сетевая изоляция шлюза от хранилищ RU
+
+Шлюз находится в общей docker-сети с Backend: связность Gateway → Backend нужна,
+а от фиксированного адреса контейнера (`TELEGRAM_BOT_IP`, `172.18.0.20`) зависит
+policy routing Telegram-трафика. Поэтому доступ к хранилищам закрыт точечным
+правилом, а не отдельной сетью.
+
+Правило живёт в семействе `bridge`: трафик между контейнерами одного bridge
+коммутируется на канальном уровне, `br_netfilter` на хосте не загружен, и правила
+семейства `ip` (включая `DOCKER-USER`) его не видят.
+
+- файл правила: `deploy/nftables-workout-gateway-isolation.nft` → на хосте
+  `/etc/nftables-workout-gateway-isolation.nft`;
+- unit: `deploy/workout-gateway-isolation.service` → на хосте
+  `/etc/systemd/system/workout-gateway-isolation.service`, `enabled`;
+- что запрещено: с адреса шлюза TCP на 5432 (PostgreSQL), 6379 (Redis), 9000
+  (MinIO API), 9001 (MinIO Console). Backend (8000) и Telegram (443) не
+  затронуты.
+
+Проверка:
+
+```bash
+systemctl is-active workout-gateway-isolation
+nft list table bridge workout_gateway_isolation      # счётчик drop растёт при попытках
+docker exec <gateway> python -c "import socket; socket.create_connection(('redis',6379),timeout=4)"
+# ожидается TimeoutError
+```
+
+Отдельный unit используется намеренно: `nftables.service` выключен, и его
+включение применило бы `/etc/nftables.conf` с `flush ruleset`, то есть снесло бы
+правила ufw и docker.
+
+Откат:
+
+```bash
+systemctl stop workout-gateway-isolation     # таблица удаляется, доступ возвращается
+systemctl disable workout-gateway-isolation
+```
+
+При смене адреса шлюза в compose правило нужно обновить синхронно; расхождение
+ловит `tests/unit/test_gateway_storage_isolation.py`.
 
 ## Локальная разработка и тесты
 
@@ -144,12 +190,6 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 переменная не задана или совпадает с `DATABASE_URL`. Часть интеграционных тестов
 требует наполненного каталога упражнений.
 
-Тестам устойчивого FSM нужен доступный Redis: без `REDIS_URL` они были бы
-пропущены, поэтому `./workout-manager.sh test` проверяет подключение заранее.
-Свои ключи такие тесты создают со случайными идентификаторами и удаляют после
-себя, поэтому рабочий Redis они не портят; при желании можно указать отдельный
-экземпляр через `TEST_REDIS_URL`.
-
 Тесты рассчитаны на общую БД разработки, в которой есть посторонние записи:
 они вычищают только свои данные по префиксу и не удаляют чужие. Проверки
 защиты от потери админского доступа считают всех активных администраторов в
@@ -161,20 +201,19 @@ docker compose -f docker/docker-compose.yml --env-file .env up --build
 
 ## Инцидент: бот не отвечает на анкету
 
-Состояние анкеты хранится в Redis, и его недоступность выглядит как «бот
-перестал понимать ответы».
+Состояние диалога живёт в PostgreSQL (RU), поэтому «бот перестал понимать
+ответы» означает недоступность Backend или его базы, а не потерю состояния в EU.
 
-1. Пользователь получает сообщение «Сервис временно недоступен, ответ не
-   сохранён» — значит хранилище состояния недоступно, а не сломалась анкета.
-2. Проверить Redis: `./workout-manager.sh doctor` (строка «Redis из .env») и
-   `./workout-manager.sh logs redis`.
-3. В логах бота искать `event=fsm_storage_unavailable` и
-   `event=fsm_storage_error`: в них только имя операции и класс ошибки, без
-   пользовательских данных.
-4. Сохранённые профили и программы при этом не затронуты: PostgreSQL остаётся
-   source of truth. Потеряться могут только незавершённые анкеты.
-5. После восстановления Redis пользователи продолжают анкету с того же вопроса;
-   перезапуск бота состояние не сбрасывает.
+1. Пользователь получает сообщение «Сервис временно недоступен. Ваши ответы
+   сохранены» — значит шлюз не получил ответ от Backend.
+2. В логах шлюза искать `event=backend_unavailable` и `event=backend_rejected`:
+   в них только стадия и код ответа, без пользовательских данных.
+3. Проверить Backend: `/health`, `/ready` и доступность PostgreSQL
+   (`./workout-manager.sh doctor`).
+4. Сохранённые профили и программы не затронуты: PostgreSQL остаётся source of
+   truth, незавершённая анкета лежит в `telegram_sessions`.
+5. После восстановления Backend пользователи продолжают анкету с того же
+   вопроса; перезапуск шлюза состояние не сбрасывает — в EU его нет.
 
 ## Инцидент: программа не пришла
 
@@ -300,11 +339,14 @@ CI (`.github/workflows/ci.yml`) запускается на каждый Pull Re
 `main`. Джобы:
 
 - **backend** — миграции до head, засев каталога упражнений из публичного
-  репозитория `leszavr/workout`, полный `pytest` на реальной PostgreSQL и
-  реальном Redis (сервис `redis:7`, `REDIS_URL` задан — тесты устойчивого FSM
-  выполняются, а не скипаются);
+  репозитория `leszavr/workout`, полный `pytest` на реальной PostgreSQL. Сервиса
+  Redis в CI нет: к нему не подключается ни один компонент, а появление такой
+  зависимости ловит `tests/unit/test_gateway_storage_isolation.py`;
 - **migrations** — на чистой базе `upgrade head` → `downgrade base` →
   `upgrade head`, плюс проверка единственного alembic head;
+- **contracts** — валидация release-манифеста и архитектурные проверки:
+  контракты компонентов, единственная точка генерации и изоляция шлюза от
+  хранилищ RU;
 - **frontend** — `npm ci`, lint, `tsc --noEmit`, production build.
 
 При падении CI на Pull Request автоматически создаётся issue с меткой
