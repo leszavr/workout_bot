@@ -73,7 +73,8 @@
 Таблицы: `users`, `profiles` (JSONB), `consents`, `exercises`,
 `workout_programs`, `generation_jobs`, `exercise_media`, `program_deliveries`,
 `ai_*` (конфигурация AI-провайдеров), `equipment_*` и `exercise_*` базы знаний
-об оборудовании (см. «Gym Knowledge Base»).
+об оборудовании (см. «Gym Knowledge Base»), `external_*` и `exercise_source_*`
+внешних источников знаний (см. «Внешние источники знаний об упражнениях»).
 
 - Профиль проходит Pydantic-валидацию перед записью и после чтения:
   `Pydantic Model → Validation → PostgreSQL JSONB`. БД не является
@@ -81,13 +82,16 @@
 - `ProfileRepository` — интерфейс; `PostgresProfileRepository` (основной)
   и `FileProfileRepository` (dev/test, когда `DATABASE_URL` не задан).
 - Миграции: `alembic upgrade head`.
-- Каталог упражнений: 873 записи из `leszavr/workout`, идемпотентный
-  импорт по ключу `(external_id, source)` — `scripts/import_exercises.py`.
-- Бинарные медиаобъекты (WebP-фото упражнений) хранятся в **MinIO**
-  (S3-compatible object storage), PostgreSQL хранит только метаданные
-  (`exercise_media`: storage_key, checksum, размеры, лицензия, источник).
-  MinIO не является частью Git; воспроизводимость обеспечивается
-  импортёром `scripts/import_exercise_media.py` + исходным репозиторием.
+- Каталог упражнений: 873 записи из `leszavr/workout` плюс 953 записи,
+  импортированные из внешнего каталога (`workout_bot/external`); ключ у обоих
+  один — `(external_id, source)`. Идемпотентные импортёры:
+  `scripts/import_exercises.py` и `scripts/ingest_external_exercises.py`.
+- Бинарные медиаобъекты (фотографии в WebP и анимации выполнения в GIF) хранятся
+  в **MinIO** (S3-compatible object storage), PostgreSQL хранит только метаданные
+  (`exercise_media`: media_type, storage_key, checksum, размеры, лицензия,
+  источник). MinIO не является частью Git; воспроизводимость обеспечивается
+  импортёрами `scripts/import_exercise_media.py`,
+  `scripts/ingest_external_exercises.py --import-media` и исходными источниками.
 - `ai_endpoints` хранит результат последней проверки подключения
   (`last_test_at`, `last_test_status`, `last_test_error_type`) — только время,
   статус и класс ошибки, без ключей и тела ответа провайдера. Это состояние,
@@ -252,6 +256,69 @@ EquipmentCompatibilityService → compatible | incompatible | unknown + прич
 
 Диагностика полноты и целостности — `GET /api/v1/admin/knowledge/health`
 (все числа считаются из базы) и раздел админки «База знаний».
+
+## Внешние источники знаний об упражнениях
+
+Каталог пополняется из внешних источников, но **canonical сущность остаётся
+одна** — `exercises` с ключом `(external_id, source)`. Второго каталога нет, и ни
+один модуль ingestion не является runtime-зависимостью генерации: она читает
+`exercises` и базу знаний об оборудовании. Подробности —
+`docs/infrastructure/EXTERNAL_EXERCISE_KNOWLEDGE_INGESTION_REPORT.md`.
+
+```
+external_sources → external_source_versions   (commit SHA / хеш архива)
+        ↓
+external_exercise_records  (staging: решение, качество, уверенность, причины)
+        ↓
+    exercises              (canonical, единственный)
+        ├── exercise_source_links        (origin | enrichment |
+        │                                 duplicate_variant | observation)
+        ├── exercise_field_provenance    (откуда каждое поле)
+        └── exercise_program_observations (typical_* / source_*)
+```
+
+Уровни и таблицы:
+
+- `external_sources` — реестр источников: вид (каталог упражнений против датасета
+  программ), домашняя страница, условия на данные и на медиа отдельно. Различие
+  вида принципиально: каталог может дать новое упражнение, датасет программ — только
+  знание о том, как упражнения используются.
+- `external_source_versions` — состояние источника на момент чтения. Без версии
+  импорт невоспроизводим: «в базе 1324 записи» не отвечает, из какого коммита.
+- `external_exercise_records` — staging-слой. Хранит нормализованную внешнюю запись
+  вместе с решением, оценкой качества, уверенностью сопоставления и причинами.
+  Строка остаётся и для отклонённых записей: причина, по которой упражнение не
+  попало в каталог, — такой же результат импорта, как добавленное упражнение.
+- `exercise_source_links` — из каких источников собрано упражнение. Отдельно от
+  staging, потому что отвечает на другой вопрос: не «что решено про внешнюю
+  запись», а «какие источники участвуют в этом упражнении».
+- `exercise_field_provenance` — происхождение конкретного поля. Merge не
+  перезаписывает поля слепо, поэтому «откуда это значение» — вопрос про поле.
+- `exercise_program_observations` — наблюдение источника программ. Все поля названы
+  `typical_*` и `source_*`: это статистика чужих программ, а не назначение нашей.
+  Нагрузку определяет методология проекта, и генерация эту таблицу не читает.
+
+Ключевые свойства:
+
+- **дедупликация различает три исхода**, а не два: то же упражнение, другой вариант
+  того же движения, другое упражнение. Тождество решается предикатом (совпало ядро
+  движения, совпали содержательные различители, не противоречат оборудование и
+  мышца), а не порогом; уверенность считается отдельно и служит выбору лучшего
+  кандидата и показу администратору;
+- **AI в сопоставлении и оценке не участвует**: результат импорта обязан совпадать
+  при повторном запуске на тех же данных;
+- **отсутствие техники — отказ**, а не низкий балл: упражнение без объяснения, как
+  его выполнять, нельзя показать пользователю;
+- **ни одно поле не перезаписывается слепо**: canonical каталог вычитан, внешний
+  источник содержит машинный перевод и испорченную кодировку;
+- **импорт идемпотентен и сходится за один прогон**: связь источника читается
+  сопоставлением как факт, роли `origin` и `duplicate_variant` не понижаются, план
+  перепроверяется против фактического состояния записи.
+
+Запуск — операция обслуживания (`scripts/ingest_external_exercises.py`), потому что
+требует локальной копии источника; backend к внешним источникам не обращается.
+Admin API (`/api/v1/admin/ingestion/*`) и раздел админки «Внешние источники» —
+только чтение.
 
 ### Safety Framework (`safety.py`)
 ```
@@ -507,29 +574,40 @@ correlation id. Stack trace пользователю не отправляетс
 ## Медиа упражнений (этап 5)
 
 ```
-Exercise Catalog (leszavr/workout)
-        ↓
-scripts/import_exercise_media.py (Pillow → WebP, checksum, идемпотентность)
-        ↓
+Exercise Catalog (leszavr/workout)        Внешний каталог (hasaneyldrm/…)
+        ↓                                          ↓
+scripts/import_exercise_media.py          ingest_external_exercises --import-media
+   (Pillow → WebP, checksum)                (WebP для фото, GIF как есть)
+        ↓                                          ↓
 ExerciseMediaRepository → PostgreSQL (exercise_media: метаданные)
         ↓
-ObjectStorage → MinIO (бинарные WebP-объекты)
+ObjectStorage → MinIO (бинарные объекты)
         ↓
 Admin UI / HTML Renderer / GET /api/v1/media/exercises/...
 ```
 
-- `ExerciseMedia` (domain): упражнение может иметь несколько изображений,
-  порядок задаётся `sequence`, первое изображение — primary. Уникальность
-  по `(exercise_external_id, source, sequence)`.
-- Импортёр идемпотентен: повторный импорт без изменений исходников
-  не создаёт дубликатов (сравнение по checksum); изменение исходного
-  файла приводит к перечитыванию. Для каждого файла сохраняются
-  provenance-данные: источник (`leszavr/workout`), лицензия
-  (`Unlicense`, public domain), исходный путь, checksum.
+- `ExerciseMedia` (domain): упражнение может иметь несколько медиа-ассетов,
+  порядок задаётся `sequence`, первый — primary. Уникальность по
+  `(exercise_external_id, source, sequence)`.
+- Два типа медиа: `image` (статичный кадр показывает положение) и `animation`
+  (показывает движение). Различие содержательное и вынесено в контракт полем
+  `media_type`: выдавать GIF за фотографию нельзя, а печатной версии программы
+  анимация не нужна.
+- Форматы различаются по типу. Статичный кадр конвертируется в WebP через общий
+  `convert_to_webp` — два формата для одного вида медиа означали бы две ветки во
+  всех потребителях. Анимация сохраняется как GIF без перекодирования: условия
+  использования медиа внешнего источника ограничивают разрешение 180×180, а
+  перекодирование меняет тайминги кадров.
+- Импортёры идемпотентны: повторный импорт без изменений исходников не создаёт
+  дубликатов (сравнение по checksum); изменение исходного файла приводит к
+  перечитыванию. Для каждого файла сохраняются provenance-данные: источник,
+  лицензия, исходный путь, checksum. У медиа внешнего каталога правообладатель
+  третий (Gym visual), и его атрибуция хранится в метаданных ассета, а не в
+  документации.
 - Media endpoint `GET /api/v1/media/exercises/{external_id}/{sequence}`
-  отдаёт WebP из MinIO с `Cache-Control: public, max-age=86400, immutable`;
+  отдаёт объект из MinIO с `Cache-Control: public, max-age=86400, immutable`;
   несуществующее упражнение/изображение → 404.
-- Admin UI показывает фото упражнений на карточке упражнения.
+- Admin UI показывает медиа на карточке упражнения с подписью типа.
 
 ## Готовность AI-конфигурации (Phase 1.1)
 
@@ -747,6 +825,21 @@ python -m scripts.import_exercise_media /path/to/workout --source-version <commi
 # строит скрипт. Он идемпотентен, выполняет то же сопоставление и пересчитывает
 # выводимое знание — требования по названию и альтернативы.
 # `--dry-run` печатает отчёт без записи.
+python -m scripts.build_equipment_knowledge
+
+# Внешние источники знаний об упражнениях (необязательный шаг).
+# Читает локальные копии источников: приложение к ним не обращается.
+# Порядок жёсткий: сначала отчёт без изменения каталога, затем применение.
+python -m scripts.ingest_external_exercises \
+    --github /path/to/exercises-dataset --github-version <commit> \
+    --kaggle /path/to/kaggle-csv-dir \
+    --dry-run --report /tmp/ingestion_dry_run.json
+python -m scripts.ingest_external_exercises \
+    --github /path/to/exercises-dataset --github-version <commit> \
+    --kaggle /path/to/kaggle-csv-dir --import-media
+
+# Обязательно после импорта: знание об оборудовании строится по всему каталогу,
+# и новые упражнения без этого шага останутся без нормализованных требований.
 python -m scripts.build_equipment_knowledge
 
 # Telegram-бот (нужны BACKEND_INTERNAL_URL и INTERNAL_SERVICE_TOKEN:
