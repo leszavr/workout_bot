@@ -201,9 +201,16 @@ def test_categories_endpoint_returns_counts(client: TestClient, auth_headers: di
 
 
 def test_catalog_import_produced_requirements(client: TestClient, auth_headers: dict):
-    """Значения `exercises.equipment` переведены в нормализованные требования."""
+    """Значения `exercises.equipment` переведены в нормализованные требования.
+
+    Требует выполненного `scripts.build_equipment_knowledge`: миграция `0016`
+    сопоставляет уже существующие данные, а в чистом окружении каталог
+    импортируется после миграций.
+    """
     health = client.get(f"{KB}/health", headers=auth_headers).json()
     assert health["exercises_total"] > 0
+    if health["requirements_total"] == 0:
+        pytest.skip("Знание об оборудовании не построено")
     assert health["equipment_known"] > 0
     assert health["requirements_total"] >= health["equipment_known"]
 
@@ -802,12 +809,19 @@ def test_seed_declares_specializations(client: TestClient, auth_headers: dict):
 def test_specialization_closes_generic_requirement(
     client: TestClient, auth_headers: dict
 ):
-    exercise = client.get(
-        "/api/v1/exercises?equipment=machine&limit=1", headers=auth_headers
+    """Требование родового `resistance_machine` закрывается жимом ногами.
+
+    Упражнение ищется по требованию базы знаний, а не по значению каталога:
+    значение `machine` могло быть переопределено администратором, и тест обязан
+    проверять то состояние, из которого движок делает вывод.
+    """
+    candidates = client.get(
+        f"/api/v1/exercises?equipment_id=resistance_machine&is_active=all&limit=1",
+        headers=auth_headers,
     ).json()["items"]
-    if not exercise:
-        pytest.skip("В каталоге нет упражнений с родовым значением machine")
-    external_id = exercise[0]["external_id"]
+    if not candidates:
+        pytest.skip("Нет упражнений с требованием resistance_machine")
+    external_id = candidates[0]["external_id"]
     result = client.post(
         f"{KB}/compatibility",
         headers=auth_headers,

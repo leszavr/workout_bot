@@ -82,6 +82,14 @@ jobs:
       - name: Import exercise catalog
         run: python -m scripts.import_exercises .exercise-catalog
 
+      # Сопоставление оборудования обязано идти после импорта каталога: миграция
+      # 0016 применяется к уже существующим данным, а в чистом окружении таблица
+      # exercises на момент миграций пуста. Скрипт выполняет тот же пересчёт и
+      # идемпотентен, поэтому годится и для чистой установки, и для повторного
+      # запуска.
+      - name: Build equipment knowledge
+        run: python -m scripts.build_equipment_knowledge
+
       - name: Run tests
         run: pytest -q
 

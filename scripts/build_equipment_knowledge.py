@@ -1,17 +1,28 @@
-"""Пересчёт выводимого знания базы: требования по названию и альтернативы.
+"""Пересчёт знания об оборудовании из каталога упражнений.
 
 Скрипт, а не миграция, потому что результат зависит от текущего содержимого
-словаря и пересчитывается при его пополнении. Миграция описывает единичный
-переход схемы и данных, а это — воспроизводимая операция обслуживания.
+каталога и словаря и пересчитывается при их изменении. Миграция описывает
+единичный переход для уже существующих данных, а это — воспроизводимая операция
+обслуживания.
+
+Почему одной миграции недостаточно. Миграция `0016` сопоставляет значения
+каталога с словарём в тот момент, когда её применяют. В чистом окружении порядок
+обратный: сначала `alembic upgrade head`, потом импорт каталога — и миграция
+работает по пустой таблице `exercises`. Поэтому сопоставление обязано быть
+повторяемой операцией: этот скрипт выполняет полный пересчёт по тем же правилам
+и запускается после импорта каталога.
 
 Что делает скрипт:
 
 1. Читает каталог упражнений и словарь оборудования.
-2. Достраивает требования для упражнений, которым импорт 0016 не смог назначить
-   оборудование: сопоставляет название упражнения со словарём синонимов
-   (`Ab_Roller` → `ab_wheel`, `Sled_Push` → `weight_sled`).
-3. Пересчитывает альтернативные упражнения по признакам каталога.
-4. Печатает отчёт: mapped / inferred / ambiguous / unmapped и распределение
+2. Сопоставляет значения `exercises.equipment` с canonical ID словаря —
+   подтверждённые требования (`catalog_import`).
+3. Для упражнений, которым значение каталога ничего не дало, выводит требования
+   из названия (`name_inference`).
+4. Записывает значения без canonical ID в `unmapped_equipment_values`, чтобы
+   пробел данных остался видимым.
+5. Пересчитывает альтернативные упражнения по признакам каталога.
+6. Печатает отчёт: mapped / inferred / ambiguous / unmapped и распределение
    типов замены.
 
 Запуск:
@@ -21,9 +32,9 @@
 изменения данных.
 
 Идемпотентность: выводимые записи удаляются по источнику
-(`name_inference`, `derived`) и создаются заново. Требования и альтернативы,
-заведённые администратором вручную (`source=admin`) и импортированные из
-каталога (`catalog_import`), не затрагиваются.
+(`catalog_import`, `name_inference`, `derived`) и создаются заново. Требования и
+альтернативы, заведённые администратором вручную (`source=admin`), не
+затрагиваются.
 """
 from __future__ import annotations
 
@@ -53,7 +64,12 @@ from src.infrastructure.persistence.postgres.exercise_repository import (
 # альтернатив сравнивает упражнения между собой.
 CATALOG_LIMIT = 5000
 
-DERIVED_REQUIREMENT_SOURCES = [KnowledgeSource.NAME_INFERENCE.value]
+# Источники, которые скрипт пересоздаёт целиком. `admin` в список не входит:
+# правки администратора сильнее любого правила.
+DERIVED_REQUIREMENT_SOURCES = [
+    KnowledgeSource.CATALOG_IMPORT.value,
+    KnowledgeSource.NAME_INFERENCE.value,
+]
 DERIVED_ALTERNATIVE_SOURCES = [KnowledgeSource.DERIVED.value]
 
 
@@ -62,13 +78,6 @@ async def build(*, dry_run: bool, skip_alternatives: bool) -> dict:
     exercises_repo = ExerciseRepository(sessions)
     equipment_repo = EquipmentRepository(sessions)
     knowledge_repo = ExerciseKnowledgeRepository(sessions)
-
-    # Прежний результат этого же правила снимается до чтения состояния. Иначе
-    # выведенные ранее требования считались бы «уже известными», упражнение
-    # выпало бы из пересчёта, а последующее удаление по источнику стёрло бы их
-    # окончательно: повторный запуск терял знание вместо его обновления.
-    if not dry_run:
-        await knowledge_repo.delete_requirements_by_source(DERIVED_REQUIREMENT_SOURCES)
 
     # is_active=None: знание строится и для деактивированных упражнений. Иначе
     # включение упражнения обратно оставляло бы его без требований.
@@ -82,47 +91,44 @@ async def build(*, dry_run: bool, skip_alternatives: bool) -> dict:
         )
 
     refs = [ExerciseRef(e.external_id, e.source) for e in exercises]
-    existing = await knowledge_repo.requirements_for(refs)
-    if dry_run:
-        # Отчёт должен показывать результат чистого пересчёта, а не состояние
-        # после предыдущего запуска: иначе dry-run и реальный прогон расходятся.
-        existing = {
-            key: [
-                r for r in value if r.source is not KnowledgeSource.NAME_INFERENCE
-            ]
-            for key, value in existing.items()
-        }
 
-    # Вывод по названию нужен только там, где импорт каталога ничего не дал:
-    # значение источника сильнее догадки по названию.
-    without_requirements = [
-        e
-        for e in exercises
-        if not existing.get((e.external_id, e.source))
+    # Требования администратора читаются до пересчёта: упражнение, у которого они
+    # есть, правилам не отдаётся — иначе правило переопределяло бы решение
+    # человека.
+    existing = await knowledge_repo.requirements_for(refs)
+    admin_owned = {
+        key
+        for key, values in existing.items()
+        if any(r.source is KnowledgeSource.ADMIN for r in values)
+    }
+    subject = [
+        e for e in exercises if (e.external_id, e.source) not in admin_owned
     ]
+
     importer = EquipmentKnowledgeImporter(index)
-    plan = importer.build_plan(without_requirements)
-    inferred = [
-        r
-        for r in plan.requirements
-        if r.source is KnowledgeSource.NAME_INFERENCE
-    ]
+    plan = importer.build_plan(subject)
 
     stats: dict = {
         "exercises_total": len(exercises),
-        "with_requirements_before": len(exercises) - len(without_requirements),
-        "inferred_requirements": len(inferred),
+        "admin_owned": len(admin_owned),
+        "requirements_confirmed": plan.report.requirements_confirmed,
+        "requirements_inferred": plan.report.requirements_inferred,
+        "mapped_exercises": plan.report.mapped_exercises,
+        "inferred_exercises": plan.report.inferred_exercises,
         "still_unknown": plan.report.unknown_exercises,
         "unmapped_values": len(plan.unmapped),
         "report": plan.report.as_dict(),
     }
 
     if not dry_run:
-        stats["inferred_written"] = await knowledge_repo.bulk_insert_requirements(
-            inferred
+        # Прежний результат этих же правил снимается перед записью: иначе
+        # переименованное или удалённое из словаря оборудование осталось бы в
+        # требованиях навсегда.
+        await knowledge_repo.delete_requirements_by_source(DERIVED_REQUIREMENT_SOURCES)
+        await knowledge_repo.clear_unmapped()
+        stats["requirements_written"] = await knowledge_repo.bulk_insert_requirements(
+            plan.requirements
         )
-        # unmapped из этого прохода дополняют записанное миграцией: значение
-        # каталога могло быть незакрытым, а название — тоже ничего не дать.
         stats["unmapped_written"] = await knowledge_repo.record_unmapped(plan.unmapped)
 
     if not skip_alternatives:
@@ -147,11 +153,17 @@ async def build(*, dry_run: bool, skip_alternatives: bool) -> dict:
 def _print_report(stats: dict) -> None:
     print("=== Отчёт построения базы знаний об оборудовании ===")
     print(f"Упражнений в каталоге:            {stats['exercises_total']}")
-    print(f"С требованиями до запуска:        {stats['with_requirements_before']}")
-    print(f"Выведено по названию:             {stats['inferred_requirements']}")
-    if "inferred_written" in stats:
-        print(f"  записано:                      {stats['inferred_written']}")
+    print(f"Требования задал администратор:   {stats['admin_owned']}")
+    print(f"Сопоставлено из каталога:         {stats['mapped_exercises']}")
+    print(f"Выведено по названию:             {stats['inferred_exercises']}")
     print(f"Осталось без требований:          {stats['still_unknown']}")
+    print(
+        "Строк требований:                 "
+        f"подтверждённых {stats['requirements_confirmed']}, "
+        f"выведенных {stats['requirements_inferred']}"
+    )
+    if "requirements_written" in stats:
+        print(f"  записано:                      {stats['requirements_written']}")
     print(f"Незакрытых значений:              {stats['unmapped_values']}")
 
     report = stats["report"]
@@ -189,7 +201,7 @@ def _print_report(stats: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Пересчёт выводимого знания базы оборудования"
+        description="Пересчёт знания об оборудовании из каталога упражнений"
     )
     parser.add_argument(
         "--dry-run",
