@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -597,6 +598,359 @@ class ComponentInstanceRow(Base):
         DateTime(timezone=True), server_default=func.now(), index=True
     )
     registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class EquipmentCapabilityRow(Base):
+    """Функциональная возможность оборудования (Gym Knowledge Base).
+
+    Отдельная таблица, а не список строк в оборудовании: возможность существует
+    независимо от конкретного тренажёра и является целью ссылок сразу из двух
+    мест — из оборудования и из требований упражнения. Список строк в JSONB не
+    даёт ни ссылочной целостности, ни ответа на вопрос «какие возможности
+    вообще существуют».
+
+    Ключ — строковый `capability_id`, а не surrogate: на возможность ссылаются
+    данные, миграции и админка, и ссылка `adjustable_resistance` читается, тогда
+    как `17` — нет.
+    """
+
+    __tablename__ = "equipment_capabilities"
+
+    capability_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    name_ru: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str | None] = mapped_column(String(300))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class EquipmentItemRow(Base):
+    """Единица контролируемого словаря оборудования.
+
+    Добавление нового тренажёра — вставка строки, а не изменение Python-кода:
+    ни генератор, ни фильтр не содержат перечисления оборудования.
+
+    `category` — строка, а не enum БД: категории пополняются вместе со словарём,
+    а enum потребовал бы миграцию на каждое пополнение.
+
+    `specializes` — ссылка на родовое оборудование: `leg_press` специализирует
+    `resistance_machine`. Отношение нужно, потому что источник каталога говорит
+    родовыми словами (у 67 упражнений оборудование указано как `machine`), и без
+    него человек с жимом ногами получал бы «не подходит» на упражнение «жим
+    ногами». ON DELETE SET NULL: удаление родовой записи не должно уничтожать
+    частную.
+    """
+
+    __tablename__ = "equipment_items"
+
+    equipment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    name_ru: Mapped[str] = mapped_column(String(120))
+    category: Mapped[str] = mapped_column(String(64), index=True)
+    description: Mapped[str | None] = mapped_column(String(300))
+    specializes: Mapped[str | None] = mapped_column(
+        ForeignKey("equipment_items.equipment_id", ondelete="SET NULL"), index=True
+    )
+    manufacturer: Mapped[str | None] = mapped_column(String(120))
+    model_name: Mapped[str | None] = mapped_column(String(120))
+    attributes: Mapped[dict] = mapped_column(JSONB, default=dict)
+    source: Mapped[str] = mapped_column(String(32), default="seed")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class EquipmentCapabilityLinkRow(Base):
+    """Связь «оборудование умеет возможность».
+
+    Отдельная таблица связей, потому что связь читается в обе стороны: «что
+    умеет этот тренажёр» и «какое оборудование даёт наклон». JSONB-список
+    отвечал бы только на первый вопрос.
+    """
+
+    __tablename__ = "equipment_item_capabilities"
+    __table_args__ = (
+        UniqueConstraint(
+            "equipment_id", "capability_id", name="uq_equipment_capability"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    equipment_id: Mapped[str] = mapped_column(
+        ForeignKey("equipment_items.equipment_id", ondelete="CASCADE"), index=True
+    )
+    capability_id: Mapped[str] = mapped_column(
+        # RESTRICT: возможность, на которую ссылается оборудование, нельзя
+        # удалить незаметно — иначе требование упражнения станет невыполнимым
+        # молча.
+        ForeignKey("equipment_capabilities.capability_id", ondelete="RESTRICT"),
+        index=True,
+    )
+
+
+class EquipmentAliasRow(Base):
+    """Синоним оборудования: значение источника или формулировка пользователя.
+
+    Уникальность по (alias, equipment_id), а не по alias: «скамья» может
+    означать и `flat_bench`, и `adjustable_bench`, и сопоставление такого
+    синонима обязано быть неоднозначным явно, а не выбирать первый вариант.
+
+    `match_mode` различает полное совпадение и совпадение по основе слова:
+    значение каталога `body only` сопоставляется целиком, а во фразе анкеты
+    «две гантели по 16 кг» нужна основа «гантел».
+    """
+
+    __tablename__ = "equipment_aliases"
+    __table_args__ = (
+        UniqueConstraint("alias", "equipment_id", name="uq_equipment_alias_target"),
+        Index("ix_equipment_aliases_alias", "alias"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    equipment_id: Mapped[str] = mapped_column(
+        ForeignKey("equipment_items.equipment_id", ondelete="CASCADE"), index=True
+    )
+    alias: Mapped[str] = mapped_column(String(120))
+    match_mode: Mapped[str] = mapped_column(String(16), default="exact")
+    source: Mapped[str] = mapped_column(String(32), default="seed")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ExerciseEquipmentRequirementRow(Base):
+    """Нормализованная потребность упражнения в оборудовании.
+
+    Ссылка на упражнение — каноническая пара (external_id, source), как в
+    `exercise_media`: surrogate `exercises.id` не является каноническим
+    идентификатором и меняется при пересоздании каталога.
+
+    FK на упражнение нет по той же причине, что и в `exercise_media`: составной
+    внешний ключ к (external_id, source) потребовал бы уникального индекса,
+    который существует, но привязал бы требования к жизненному циклу конкретной
+    строки каталога. Целостность проверяется метрикой orphan-ссылок в
+    Knowledge Base Health, где она видна администратору, а не падает на импорте.
+
+    Ровно одна из ссылок `equipment_id`/`capability_id` заполнена: это
+    гарантируется CHECK-ограничением, а не только Pydantic-моделью — данные
+    правятся и миграциями тоже.
+    """
+
+    __tablename__ = "exercise_equipment_requirements"
+    __table_args__ = (
+        UniqueConstraint(
+            "exercise_external_id",
+            "exercise_source",
+            "equipment_id",
+            "capability_id",
+            "requirement",
+            name="uq_exercise_requirement",
+        ),
+        CheckConstraint(
+            "(equipment_id IS NULL) <> (capability_id IS NULL)",
+            name="ck_exercise_requirement_target",
+        ),
+        CheckConstraint(
+            "requirement <> 'alternative' OR alternative_group IS NOT NULL",
+            name="ck_exercise_requirement_alternative_group",
+        ),
+        Index(
+            "ix_exercise_requirements_exercise",
+            "exercise_external_id",
+            "exercise_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exercise_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    exercise_source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
+    equipment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("equipment_items.equipment_id", ondelete="RESTRICT"), index=True
+    )
+    capability_id: Mapped[str | None] = mapped_column(
+        ForeignKey("equipment_capabilities.capability_id", ondelete="RESTRICT"),
+        index=True,
+    )
+    requirement: Mapped[str] = mapped_column(String(16), default="required", index=True)
+    alternative_group: Mapped[int | None] = mapped_column(Integer)
+    confidence: Mapped[str] = mapped_column(String(16), default="confirmed", index=True)
+    source: Mapped[str] = mapped_column(String(32), default="catalog_import")
+    notes: Mapped[str | None] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UnmappedEquipmentValueRow(Base):
+    """Значение оборудования источника, не получившее canonical ID.
+
+    Существует, чтобы миграция не теряла информацию молча. Строка `other`
+    в каталоге означает «оборудование нужно, но какое — не сказано»; выбросив
+    её, система получила бы упражнение без требований и считала бы его
+    выполнимым где угодно.
+    """
+
+    __tablename__ = "unmapped_equipment_values"
+    __table_args__ = (
+        UniqueConstraint(
+            "exercise_external_id",
+            "exercise_source",
+            "raw_value",
+            name="uq_unmapped_equipment_value",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exercise_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    exercise_source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
+    raw_value: Mapped[str] = mapped_column(String(120), index=True)
+    reason: Mapped[str] = mapped_column(String(16), default="unmapped", index=True)
+    notes: Mapped[str | None] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ExerciseAlternativeRow(Base):
+    """Альтернативное упражнение с явным типом замены.
+
+    Тип замены хранится, а не вычисляется на чтении: «полная замена» и «похожее
+    движение» — разные утверждения для пользователя, и решение о степени
+    эквивалентности должно быть зафиксировано и проверяемо.
+
+    Направление связи хранится обеими строками (A→B и B→A записываются
+    отдельно), потому что степень замены не всегда симметрична: упражнение с
+    меньшими требованиями к стабилизации является частичной заменой более
+    сложного, но не наоборот.
+    """
+
+    __tablename__ = "exercise_alternatives"
+    __table_args__ = (
+        UniqueConstraint(
+            "exercise_external_id",
+            "exercise_source",
+            "alternative_external_id",
+            "alternative_source",
+            name="uq_exercise_alternative_pair",
+        ),
+        CheckConstraint(
+            "exercise_external_id <> alternative_external_id "
+            "OR exercise_source <> alternative_source",
+            name="ck_exercise_alternative_not_self",
+        ),
+        Index(
+            "ix_exercise_alternatives_exercise",
+            "exercise_external_id",
+            "exercise_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exercise_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    exercise_source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
+    alternative_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    alternative_source: Mapped[str] = mapped_column(
+        String(64), default="leszavr/workout"
+    )
+    substitution: Mapped[str] = mapped_column(String(16), default="similar", index=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    rationale: Mapped[dict] = mapped_column(JSONB, default=dict)
+    source: Mapped[str] = mapped_column(String(32), default="derived")
+    notes: Mapped[str | None] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class EquipmentProfileRow(Base):
+    """Профиль фактически доступного оборудования.
+
+    Не привязан жёстко к пользователю: `owner_type` + `owner_ref` позволяют
+    описать зал один раз и переиспользовать, а временный профиль («в отпуске,
+    только резина») не затирает основной.
+
+    `assume_unlisted_unavailable` отвечает, что означает отсутствие позиции в
+    профиле. Для домашнего профиля, где человек перечислил всё, — «нет». Для
+    зала, о котором известно только название, — «неизвестно»: придумывать
+    отсутствие тренажёра нельзя.
+    """
+
+    __tablename__ = "equipment_profiles"
+    __table_args__ = (
+        UniqueConstraint("profile_key", name="uq_equipment_profile_key"),
+        Index("ix_equipment_profiles_owner", "owner_type", "owner_ref"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    profile_key: Mapped[str] = mapped_column(String(64))
+    owner_type: Mapped[str] = mapped_column(String(16), default="user", index=True)
+    owner_ref: Mapped[str | None] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(120))
+    assume_unlisted_unavailable: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(32), default="admin")
+    notes: Mapped[str | None] = mapped_column(String(300))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class EquipmentProfileItemRow(Base):
+    """Позиция оборудования в профиле.
+
+    `availability` хранит три состояния, включая `unknown`: «пользователь не
+    сказал» и «пользователь сказал, что нет» — разные факты, и первый не должен
+    исключать упражнения.
+
+    `source_ref` хранит ссылку на источник факта, например ключ фотографии в
+    объектном хранилище. Так путь «фото → кандидат → подтверждение человеком»
+    выражается состоянием записи (`source=photo`, `confidence=inferred` →
+    `confidence=confirmed`), а не отдельной подсистемой распознавания.
+    """
+
+    __tablename__ = "equipment_profile_items"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "equipment_id", name="uq_profile_equipment"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    profile_id: Mapped[int] = mapped_column(
+        ForeignKey("equipment_profiles.id", ondelete="CASCADE"), index=True
+    )
+    equipment_id: Mapped[str] = mapped_column(
+        ForeignKey("equipment_items.equipment_id", ondelete="RESTRICT"), index=True
+    )
+    quantity: Mapped[int | None] = mapped_column(Integer)
+    availability: Mapped[str] = mapped_column(String(16), default="available")
+    confidence: Mapped[str] = mapped_column(String(16), default="confirmed")
+    extra_capabilities: Mapped[list] = mapped_column(JSONB, default=list)
+    source: Mapped[str] = mapped_column(String(32), default="admin")
+    source_ref: Mapped[str | None] = mapped_column(String(300))
+    notes: Mapped[str | None] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(

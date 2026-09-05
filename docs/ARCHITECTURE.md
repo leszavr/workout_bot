@@ -72,7 +72,8 @@
 Основное хранилище — **PostgreSQL** (SQLAlchemy 2.0 async + asyncpg + Alembic).
 Таблицы: `users`, `profiles` (JSONB), `consents`, `exercises`,
 `workout_programs`, `generation_jobs`, `exercise_media`, `program_deliveries`,
-`ai_*` (конфигурация AI-провайдеров).
+`ai_*` (конфигурация AI-провайдеров), `equipment_*` и `exercise_*` базы знаний
+об оборудовании (см. «Gym Knowledge Base»).
 
 - Профиль проходит Pydantic-валидацию перед записью и после чтения:
   `Pydantic Model → Validation → PostgreSQL JSONB`. БД не является
@@ -121,9 +122,15 @@ PostgreSQL (`telegram_sessions`), в RU. Профиль попадает в `pro
 ## Внутренний веб-интерфейс
 
 Next.js (App Router, TypeScript), `apps/web`. Страницы: Dashboard,
-Profiles (+ карточка с Structured View / Raw JSON), Exercises (+ карточка).
-Авторизация: admin login + JWT (`/api/v1/auth/login`), учётные данные
+Profiles (+ карточка с Structured View / Raw JSON), Exercises (+ карточка),
+Knowledge Base (оборудование, полнота, незакрытые значения), AI, Infrastructure,
+Users. Авторизация: admin login + JWT (`/api/v1/auth/login`), учётные данные
 только из переменных окружения.
+
+Фильтрация и пагинация везде серверные. Это касается и фильтров базы знаний в
+каталоге упражнений: они сводятся к набору канонических идентификаторов и
+попадают в тот же SQL-запрос, а не отсеивают строки после выборки страницы —
+иначе «первые 50» перестали бы быть первыми пятьюдесятью подходящими.
 
 ## Ключевые решения
 
@@ -195,6 +202,56 @@ handlers не содержат бизнес-логики и получают е�
 - **предпочтения**: `CardioPreference.EXCLUDE` исключает кардио;
   `excluded_exercises` пользователя исключаются по имени/алиасам.
 Результат — `ExerciseCandidatePool` с причиной каждого исключения.
+
+Фильтр по-прежнему работает на значениях каталога и словаре `EQUIPMENT_ALIASES`
+в коде. Gym Knowledge Base (см. ниже) существует рядом и пока не подключена к
+pipeline генерации: переключение фильтра на неё — отдельный шаг, потому что оно
+меняет состав пула программ у всех пользователей и требует собственной приёмки.
+
+## Gym Knowledge Base: оборудование как знание
+
+Модель оборудования вынесена из свободных строк в нормализованное знание.
+Подробности — `docs/infrastructure/GYM_KNOWLEDGE_BASE_EQUIPMENT_INTELLIGENCE_REPORT.md`.
+
+```
+Exercise → Requirement (REQUIRED | OPTIONAL | ALTERNATIVE)
+         → Equipment  → Capability
+                      → Specialization (leg_press → resistance_machine)
+Profile  → Availability (available | unavailable | unknown)
+         ↓
+EquipmentCompatibilityService → compatible | incompatible | unknown + причина
+```
+
+Уровни знания и таблицы:
+
+- `equipment_capabilities` — что объект умеет (наклонная опора, регулируемое
+  сопротивление). Отдельная сущность, потому что два тренажёра разных
+  производителей называются по-разному, но функционально совпадают.
+- `equipment_items` — что это за объект. Строковый первичный ключ; `specializes`
+  выражает «частный случай родового» (`leg_press` → `resistance_machine`), что
+  необходимо, поскольку источник каталога говорит родовыми словами.
+- `equipment_item_capabilities`, `equipment_aliases` — связи и синонимы. Синонимы
+  живут в данных, а не в Python: добавление тренажёра больше не требует правки
+  кода.
+- `exercise_equipment_requirements` — потребность упражнения с различением
+  «без этого нельзя» / «желательно» / «одно из» (группы `alternative_group`).
+- `unmapped_equipment_values` — значения источника без canonical ID. Существует,
+  чтобы импорт не терял информацию молча.
+- `exercise_alternatives` — альтернативы с явным типом замены (EXACT / SIMILAR /
+  PARTIAL) и обоснованием.
+- `equipment_profiles`, `equipment_profile_items` — что фактически доступно
+  пользователю или залу; `assume_unlisted_unavailable` отвечает, значит ли
+  отсутствие позиции «нет» или «неизвестно».
+
+Ключевое свойство: **UNKNOWN ≠ INCOMPATIBLE**. Отсутствие знания о требованиях
+упражнения и отсутствие ответа пользователя про тренажёр не являются
+доказательством несовместимости, и deterministic-слой не придумывает факт
+отсутствия оборудования. AI получает результат как факт и в вычислении не
+участвует; создавать equipment ID он не может — все ссылки обязаны существовать
+в базе.
+
+Диагностика полноты и целостности — `GET /api/v1/admin/knowledge/health`
+(все числа считаются из базы) и раздел админки «База знаний».
 
 ### Safety Framework (`safety.py`)
 ```
@@ -683,6 +740,12 @@ python -m scripts.import_exercises /path/to/workout --source-version <commit>
 
 # Импорт фото упражнений в MinIO (идемпотентный, можно повторять)
 python -m scripts.import_exercise_media /path/to/workout --source-version <commit>
+
+# База знаний об оборудовании: словарь и требования из значений каталога
+# поставляются миграциями 0014-0016. Выводимое знание (требования по названию
+# упражнения и альтернативы) пересчитывается скриптом — идемпотентно, можно
+# повторять после пополнения словаря. `--dry-run` печатает отчёт без записи.
+python -m scripts.build_equipment_knowledge
 
 # Telegram-бот (нужны BACKEND_INTERNAL_URL и INTERNAL_SERVICE_TOKEN:
 # данных у шлюза нет, всё идёт через internal API)
