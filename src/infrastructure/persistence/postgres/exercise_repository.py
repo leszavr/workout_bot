@@ -71,6 +71,13 @@ class ExerciseQuery:
     is_active: bool | None = True
     # None — без ограничения; True/False — только с фотографиями или без.
     has_media: bool | None = None
+    # Ограничение выборки набором канонических идентификаторов. Нужно фильтрам,
+    # которые вычисляются вне каталога: совместимость с оборудованием и наличие
+    # знания о требованиях живут в базе знаний, а не в колонках `exercises`.
+    # Пустой набор (не None) означает «ничего не подошло» и должен давать пустой
+    # результат, а не игнорироваться: иначе фильтр без совпадений показывал бы
+    # весь каталог.
+    external_ids: frozenset[str] | None = None
 
 
 @dataclass
@@ -231,6 +238,14 @@ class ExerciseRepository:
                 .exists()
             )
             conditions.append(media_exists if query.has_media else ~media_exists)
+        if query.external_ids is not None:
+            if not query.external_ids:
+                # Пустой набор — это результат фильтра, а не его отсутствие.
+                conditions.append(literal(False))
+            else:
+                conditions.append(
+                    ExerciseRow.external_id.in_(sorted(query.external_ids))
+                )
         return conditions
 
     @staticmethod

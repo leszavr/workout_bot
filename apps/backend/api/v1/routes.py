@@ -24,6 +24,9 @@ from apps.backend.api.v1.dependencies import (
     build_program_html_service,
     build_program_service,
 )
+from apps.backend.api.v1.equipment_dependencies import (
+    build_equipment_knowledge_service,
+)
 from apps.backend.api.v1.user_dependencies import build_admin_user_service
 from apps.backend.auth import (
     AuthenticatedUser,
@@ -560,6 +563,28 @@ class MediaFilter(StrEnum):
     ALL = "all"
 
 
+class EquipmentKnowledgeFilter(StrEnum):
+    """Состояние знания о требованиях упражнения к оборудованию.
+
+    Отдельный фильтр нужен, потому что пробел в данных невидим иначе: у 77
+    упражнений каталога поле `equipment` пусто, и без такого фильтра «про это
+    упражнение мы ничего не знаем» неотличимо от «оборудование не нужно».
+    """
+
+    KNOWN = "known"
+    UNKNOWN = "unknown"
+    ALL = "all"
+
+
+class RequirementKindFilter(StrEnum):
+    """Характер требования, по которому фильтруется каталог."""
+
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+    ALTERNATIVE = "alternative"
+    ANY = "any"
+
+
 @router.get("/exercises")
 async def list_exercises(
     _: Annotated[AuthenticatedUser, Depends(require_viewer)],
@@ -570,6 +595,26 @@ async def list_exercises(
     primary_muscle: Annotated[list[str] | None, Query()] = None,
     force: Annotated[list[str] | None, Query()] = None,
     mechanic: Annotated[list[str] | None, Query()] = None,
+    # Фильтры базы знаний. Отделены от `equipment` намеренно: там значения
+    # источника каталога (`barbell`, `machine`), здесь canonical ID словаря
+    # (`cable_machine`, `leg_press`), и смешивать их в одном параметре значило бы
+    # сделать смысл фильтра зависимым от полноты импорта.
+    equipment_id: Annotated[list[str] | None, Query()] = None,
+    capability: Annotated[list[str] | None, Query()] = None,
+    requirement_kind: Annotated[
+        RequirementKindFilter, Query()
+    ] = RequirementKindFilter.ANY,
+    equipment_knowledge: Annotated[
+        EquipmentKnowledgeFilter, Query()
+    ] = EquipmentKnowledgeFilter.ALL,
+    # Оборудование, доступное «на руках»: по нему считается статус совместимости
+    # для показанной страницы.
+    available_equipment: Annotated[list[str] | None, Query()] = None,
+    # Что означает отсутствие оборудования в перечислении: «нет» или
+    # «неизвестно». По умолчанию — «неизвестно»: придумывать отсутствие
+    # тренажёра deterministic-слою запрещено.
+    assume_unlisted_unavailable: Annotated[bool, Query()] = False,
+    compatibility: Annotated[list[str] | None, Query()] = None,
     # По умолчанию — только активные: из них собираются программы. Значение
     # `all` нужно администратору, иначе «упражнений 873» в сводке не сходилось
     # бы со списком, где отключённые скрыты.
@@ -586,12 +631,37 @@ async def list_exercises(
     Фильтры и сортировка выполняются в базе, а не на клиенте: 873 упражнения
     можно передать целиком, но тогда «первые 50 по алфавиту» и «первые 50
     сложных» — разные выборки, а фильтр применялся бы к произвольной части
-    каталога.
+    каталога. Это остаётся верным и для фильтров базы знаний: они сводятся к
+    набору канонических идентификаторов и попадают в тот же SQL-запрос, а не
+    отсеивают строки после выборки страницы.
 
     `with_facets=true` добавляет число упражнений по каждому значению признака
     в текущей выборке. Счётчики считаются по тому же фильтру, что и список:
     иначе они обещали бы результаты, которых после уточнения фильтра нет.
+
+    Статус совместимости считается только для показанной страницы: считать его
+    для всего каталога ради 50 строк на экране незачем.
     """
+    knowledge = build_equipment_knowledge_service()
+    requirement_kinds = (
+        None
+        if requirement_kind is RequirementKindFilter.ANY
+        else [requirement_kind.value]
+    )
+    try:
+        knowledge_ids = await knowledge.exercise_ids_for_equipment_filter(
+            equipment_ids=list(_clean(equipment_id)),
+            requirement_kinds=requirement_kinds,
+            capability_ids=list(_clean(capability)),
+            knowledge_state=(
+                None
+                if equipment_knowledge is EquipmentKnowledgeFilter.ALL
+                else equipment_knowledge.value
+            ),
+        )
+    except ProfilePersistenceError as exc:
+        raise HTTPException(status_code=422, detail=safe_error_message(exc)) from exc
+
     query = ExerciseQuery(
         search=search,
         exercise_types=_clean(exercise_type),
@@ -604,6 +674,7 @@ async def list_exercises(
         if is_active is ActiveFilter.ALL
         else is_active is ActiveFilter.ACTIVE,
         has_media=None if media is MediaFilter.ALL else media is MediaFilter.WITH,
+        external_ids=knowledge_ids,
     )
     repository = build_exercise_repository()
     try:
@@ -617,6 +688,46 @@ async def list_exercises(
         facets = asdict(await repository.facets(query)) if with_facets else None
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=422, detail=safe_error_message(exc)) from exc
+
+    wanted_statuses = {s.strip() for s in (compatibility or []) if s.strip()}
+    available = _clean(available_equipment)
+    compatibility_results: dict[str, dict] = {}
+    if rows and (available or assume_unlisted_unavailable or wanted_statuses):
+        available_set = await knowledge.available_from_equipment_ids(
+            list(available), assume_unlisted_unavailable=assume_unlisted_unavailable
+        )
+        # Источник берётся из строк страницы: каталог может содержать несколько
+        # источников, и статус относится к конкретному упражнению.
+        by_source: dict[str, list[str]] = {}
+        for row in rows:
+            by_source.setdefault(row.source, []).append(row.external_id)
+        for source_name, ids in by_source.items():
+            results = await knowledge.compatibility_for_catalog(
+                external_ids=ids, source=source_name, available=available_set
+            )
+            compatibility_results.update(
+                {
+                    external_id: {
+                        "status": result.status.value,
+                        "reason": result.reason.value,
+                        "missing": result.missing,
+                        "matched": result.matched,
+                        "unknown": result.unknown,
+                    }
+                    for external_id, result in results.items()
+                }
+            )
+        if wanted_statuses:
+            # Фильтр по статусу применяется к странице, а не к каталогу: он
+            # вычисляем только вместе с перечнем доступного оборудования, и
+            # переносить его в SQL значило бы дублировать движок совместимости
+            # в запросе.
+            rows = [
+                row
+                for row in rows
+                if compatibility_results.get(row.external_id, {}).get("status")
+                in wanted_statuses
+            ]
 
     payload: dict = {
         "total": total,
@@ -641,10 +752,15 @@ async def list_exercises(
                 "source": row.source,
                 "is_active": row.is_active,
                 "has_media": bool(row.images),
+                "compatibility": compatibility_results.get(row.external_id),
             }
             for row in rows
         ],
     }
+    if wanted_statuses:
+        # Число под фильтром статуса относится к отфильтрованной странице:
+        # обещать общее количество, которое не проверялось, нельзя.
+        payload["filtered_page_count"] = len(payload["items"])
     if facets is not None:
         payload["facets"] = facets
     return payload

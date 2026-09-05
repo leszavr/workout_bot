@@ -133,6 +133,96 @@ export function muscleList(values: readonly string[]): string {
   return catalogList(values, MUSCLE_LABELS);
 }
 
+// --- База знаний об оборудовании ---------------------------------------------
+//
+// Названия оборудования и возможностей приходят из базы вместе с записью
+// (`name_ru`), поэтому словаря подписей здесь нет: словарь пополняется через
+// админку, и дублировать его в коде значило бы гарантированно с ним разойтись.
+// Здесь только подписи закрытых наборов — статусов и типов, определённых кодом.
+
+export const COMPATIBILITY_LABELS: Record<string, string> = {
+  compatible: "подходит",
+  incompatible: "не подходит",
+  unknown: "неизвестно",
+};
+
+export const COMPATIBILITY_REASON_LABELS: Record<string, string> = {
+  no_equipment_needed: "оборудование не требуется",
+  all_required_available: "всё необходимое есть",
+  alternative_equipment_available: "подходит один из вариантов",
+  specialized_equipment_available: "подходит имеющийся тренажёр этого вида",
+  required_equipment_missing: "нет обязательного оборудования",
+  no_alternative_available: "ни один из вариантов недоступен",
+  requirements_unknown: "требования не заполнены",
+  availability_unknown: "наличие оборудования не подтверждено",
+};
+
+export const REQUIREMENT_LABELS: Record<string, string> = {
+  required: "обязательно",
+  optional: "желательно",
+  alternative: "одно из",
+};
+
+export const SUBSTITUTION_LABELS: Record<string, string> = {
+  exact: "полная замена",
+  similar: "похожее движение",
+  partial: "частичная замена",
+};
+
+export const CONFIDENCE_LABELS: Record<string, string> = {
+  confirmed: "подтверждено",
+  inferred: "выведено",
+  unknown: "неизвестно",
+};
+
+export const KNOWLEDGE_SOURCE_LABELS: Record<string, string> = {
+  seed: "начальный словарь",
+  catalog_import: "импорт каталога",
+  name_inference: "вывод по названию",
+  admin: "администратор",
+  questionnaire: "анкета",
+  photo: "фотография",
+  derived: "вычислено",
+};
+
+export const EQUIPMENT_CATEGORY_LABELS: Record<string, string> = {
+  free_weight: "свободный вес",
+  bench: "скамьи",
+  rack: "рамы и стойки",
+  machine: "тренажёры",
+  cable: "блочные тренажёры",
+  cardio: "кардио",
+  band: "резина",
+  ball: "мячи",
+  accessory: "аксессуары",
+  support: "опоры",
+  bodyweight: "собственный вес",
+  bodyweight_support: "опоры для собственного веса",
+  strongman: "стронгмен",
+  recovery: "восстановление",
+};
+
+export const UNMAPPED_REASON_LABELS: Record<string, string> = {
+  ambiguous: "требует уточнения",
+  unmapped: "нет в словаре",
+};
+
+/** Тон статуса совместимости. `unknown` — предупреждение, а не отказ. */
+export function compatibilityTone(
+  status: string,
+): "ok" | "warn" | "bad" | "neutral" {
+  if (status === "compatible") return "ok";
+  if (status === "incompatible") return "bad";
+  if (status === "unknown") return "warn";
+  return "neutral";
+}
+
+export function substitutionTone(value: string): "ok" | "info" | "neutral" {
+  if (value === "exact") return "ok";
+  if (value === "similar") return "info";
+  return "neutral";
+}
+
 // --- Значения анкеты ---------------------------------------------------------
 //
 // Бот сохраняет ответы кодами (`male`, `gym`, `over_1_year`), и API отдаёт

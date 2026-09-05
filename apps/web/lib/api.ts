@@ -322,6 +322,23 @@ export interface ExerciseListItem {
   source: string;
   is_active: boolean;
   has_media: boolean;
+  /**
+   * Результат детерминированной проверки совместимости. Приходит только когда
+   * в запросе указано доступное оборудование: без него статус не вычисляется, и
+   * `null` означает «не проверялось», а не «неизвестно».
+   */
+  compatibility?: ExerciseCompatibility | null;
+}
+
+/** Статус совместимости упражнения с доступным оборудованием. */
+export type CompatibilityStatus = "compatible" | "incompatible" | "unknown";
+
+export interface ExerciseCompatibility {
+  status: CompatibilityStatus;
+  reason: string;
+  missing: string[];
+  matched: string[];
+  unknown: string[];
 }
 
 /** Число упражнений по одному значению признака в текущей выборке. */
@@ -350,6 +367,13 @@ export type ExerciseSort =
 
 export type ActiveFilter = "active" | "inactive" | "all";
 export type MediaFilter = "with" | "without" | "all";
+/** Состояние знания о требованиях упражнения к оборудованию. */
+export type EquipmentKnowledgeFilter = "known" | "unknown" | "all";
+export type RequirementKindFilter =
+  | "required"
+  | "optional"
+  | "alternative"
+  | "any";
 
 /** Фильтр каталога. Списки внутри поля — OR, разные поля — AND. */
 export interface ExerciseQueryParams {
@@ -360,6 +384,20 @@ export interface ExerciseQueryParams {
   primary_muscle?: string[];
   force?: string[];
   mechanic?: string[];
+  /**
+   * Canonical ID словаря оборудования. Отличается от `equipment`: там значения
+   * источника каталога (`barbell`, `machine`), здесь записи базы знаний
+   * (`cable_machine`, `leg_press`).
+   */
+  equipment_id?: string[];
+  capability?: string[];
+  requirement_kind?: RequirementKindFilter;
+  equipment_knowledge?: EquipmentKnowledgeFilter;
+  /** Оборудование «на руках»: по нему считается статус совместимости. */
+  available_equipment?: string[];
+  /** Считать ли неперечисленное оборудование отсутствующим, а не неизвестным. */
+  assume_unlisted_unavailable?: boolean;
+  compatibility?: CompatibilityStatus[];
   is_active?: ActiveFilter;
   media?: MediaFilter;
   sort_by?: ExerciseSort;
@@ -372,6 +410,12 @@ export interface ExerciseQueryParams {
 export interface ExerciseListResponse extends PagedResponse<ExerciseListItem> {
   /** Приходит только при `with_facets=true`. */
   facets?: ExerciseFacets;
+  /**
+   * Сколько строк страницы прошло фильтр по статусу совместимости. Приходит
+   * только при таком фильтре: `total` относится к выборке до его применения,
+   * потому что статус вычисляется для показанной страницы, а не для каталога.
+   */
+  filtered_page_count?: number;
 }
 
 export interface ExerciseMediaItem {
@@ -1358,6 +1402,207 @@ export interface AIProviderForUI {
   }>;
 }
 
+// --- Gym Knowledge Base: оборудование ------------------------------------------
+//
+// Словарь оборудования отделён от каталога упражнений: каталог описывает
+// упражнения, словарь — мир, в котором они выполняются. Один и тот же
+// canonical ID связывает их.
+
+export interface EquipmentAlias {
+  alias: string;
+  match_mode: "exact" | "stem";
+}
+
+export interface EquipmentItem {
+  equipment_id: string;
+  name: string;
+  name_ru: string;
+  category: string;
+  description: string | null;
+  capabilities: string[];
+  aliases: EquipmentAlias[];
+  /**
+   * Родовое оборудование, частным случаем которого является запись:
+   * `leg_press` специализирует `resistance_machine`. Требование родового
+   * закрывается частным, обратное неверно.
+   */
+  specializes: string | null;
+  manufacturer: string | null;
+  model_name: string | null;
+  is_active: boolean;
+  /** Сколько упражнений ссылается на эту запись. */
+  exercise_count?: number;
+}
+
+export interface EquipmentCapability {
+  capability_id: string;
+  name: string;
+  name_ru: string;
+  description: string | null;
+  is_active: boolean;
+}
+
+export type RequirementKind = "required" | "optional" | "alternative";
+export type KnowledgeConfidence = "confirmed" | "inferred" | "unknown";
+
+export interface ExerciseRequirement {
+  equipment_id: string | null;
+  capability_id: string | null;
+  requirement: RequirementKind;
+  alternative_group: number | null;
+  confidence: KnowledgeConfidence;
+  source: string;
+  notes: string | null;
+}
+
+export type SubstitutionType = "exact" | "similar" | "partial";
+
+export interface ExerciseAlternative {
+  alternative_external_id: string;
+  alternative_source: string;
+  substitution: SubstitutionType;
+  score: number;
+  rationale: Record<string, unknown>;
+  source: string;
+}
+
+export interface KnowledgeHealth {
+  exercises_total: number;
+  exercises_active: number;
+  equipment_known: number;
+  equipment_unknown: number;
+  equipment_confirmed: number;
+  equipment_inferred: number;
+  exercises_with_alternatives: number;
+  equipment_items_total: number;
+  equipment_items_active: number;
+  equipment_items_unused: number;
+  capabilities_total: number;
+  aliases_total: number;
+  requirements_total: number;
+  alternatives_total: number;
+  unmapped_values: number;
+  unmapped_exercises: number;
+  orphan_equipment_references: number;
+  invalid_capability_references: number;
+  impossible_requirement_combinations: number;
+  duplicate_requirements: number;
+  equipment_known_ratio: number;
+  unmapped_summary: Array<{ raw_value: string; reason: string; count: number }>;
+}
+
+export interface UnmappedValue {
+  exercise_external_id: string;
+  exercise_source: string;
+  raw_value: string;
+  reason: "ambiguous" | "unmapped";
+  notes: string | null;
+}
+
+export interface EquipmentQueryParams {
+  search?: string;
+  category?: string[];
+  capability?: string[];
+  is_active?: ActiveFilter;
+  usage?: "used" | "unused" | "all";
+  limit?: number;
+  offset?: number;
+}
+
+export interface EquipmentPayload {
+  equipment_id: string;
+  name: string;
+  name_ru: string;
+  category: string;
+  description?: string | null;
+  capabilities: string[];
+  aliases: EquipmentAlias[];
+  specializes?: string | null;
+  manufacturer?: string | null;
+  model_name?: string | null;
+  is_active: boolean;
+}
+
+export const knowledgeApi = {
+  equipment: (params?: EquipmentQueryParams) => {
+    const qs = new URLSearchParams();
+    if (params?.search) qs.set("search", params.search);
+    for (const [key, values] of [
+      ["category", params?.category],
+      ["capability", params?.capability],
+    ] as const) {
+      for (const value of values ?? []) qs.append(key, value);
+    }
+    if (params?.is_active) qs.set("is_active", params.is_active);
+    if (params?.usage) qs.set("usage", params.usage);
+    qs.set("limit", String(params?.limit ?? 50));
+    qs.set("offset", String(params?.offset ?? 0));
+    return request<PagedResponse<EquipmentItem>>(
+      `/api/v1/admin/knowledge/equipment?${qs}`
+    );
+  },
+  equipmentItem: (equipmentId: string) =>
+    request<EquipmentItem>(
+      `/api/v1/admin/knowledge/equipment/${encodeURIComponent(equipmentId)}`
+    ),
+  categories: () =>
+    request<{ items: FacetCount[] }>(
+      "/api/v1/admin/knowledge/equipment/categories"
+    ),
+  capabilities: () =>
+    request<ListResponse<EquipmentCapability>>(
+      "/api/v1/admin/knowledge/capabilities"
+    ),
+  createEquipment: (payload: EquipmentPayload) =>
+    request<EquipmentItem>("/api/v1/admin/knowledge/equipment", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateEquipment: (
+    equipmentId: string,
+    payload: Partial<Omit<EquipmentPayload, "equipment_id">>
+  ) =>
+    request<EquipmentItem>(
+      `/api/v1/admin/knowledge/equipment/${encodeURIComponent(equipmentId)}`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    ),
+  deactivateEquipment: (equipmentId: string) =>
+    request<EquipmentItem>(
+      `/api/v1/admin/knowledge/equipment/${encodeURIComponent(equipmentId)}/deactivate`,
+      { method: "POST" }
+    ),
+  deleteEquipment: (equipmentId: string) =>
+    request<void>(
+      `/api/v1/admin/knowledge/equipment/${encodeURIComponent(equipmentId)}`,
+      { method: "DELETE" }
+    ),
+  requirements: (externalId: string, source?: string) => {
+    const qs = new URLSearchParams();
+    if (source) qs.set("source", source);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request<ListResponse<ExerciseRequirement>>(
+      `/api/v1/admin/knowledge/exercises/${encodeURIComponent(externalId)}/requirements${suffix}`
+    );
+  },
+  alternatives: (externalId: string, source?: string) => {
+    const qs = new URLSearchParams();
+    if (source) qs.set("source", source);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request<ListResponse<ExerciseAlternative>>(
+      `/api/v1/admin/knowledge/exercises/${encodeURIComponent(externalId)}/alternatives${suffix}`
+    );
+  },
+  health: () => request<KnowledgeHealth>("/api/v1/admin/knowledge/health"),
+  unmapped: (params?: { limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    qs.set("limit", String(params?.limit ?? 100));
+    qs.set("offset", String(params?.offset ?? 0));
+    return request<PagedResponse<UnmappedValue>>(
+      `/api/v1/admin/knowledge/unmapped?${qs}`
+    );
+  },
+};
+
 export const api = {
   dashboard: () => request<Dashboard>("/api/v1/dashboard"),
   profiles: (params?: {
@@ -1397,11 +1642,24 @@ export const api = {
       ["primary_muscle", params?.primary_muscle],
       ["force", params?.force],
       ["mechanic", params?.mechanic],
+      ["equipment_id", params?.equipment_id],
+      ["capability", params?.capability],
+      ["available_equipment", params?.available_equipment],
+      ["compatibility", params?.compatibility],
     ] as const) {
       for (const value of values ?? []) qs.append(key, value);
     }
     if (params?.is_active) qs.set("is_active", params.is_active);
     if (params?.media) qs.set("media", params.media);
+    if (params?.requirement_kind && params.requirement_kind !== "any") {
+      qs.set("requirement_kind", params.requirement_kind);
+    }
+    if (params?.equipment_knowledge && params.equipment_knowledge !== "all") {
+      qs.set("equipment_knowledge", params.equipment_knowledge);
+    }
+    if (params?.assume_unlisted_unavailable) {
+      qs.set("assume_unlisted_unavailable", "true");
+    }
     if (params?.sort_by) qs.set("sort_by", params.sort_by);
     if (params?.order) qs.set("order", params.order);
     if (params?.with_facets) qs.set("with_facets", "true");

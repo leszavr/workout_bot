@@ -1,20 +1,48 @@
 "use client";
 
+// Карточка упражнения.
+//
+// Оборудование показано дважды и это не дублирование: «в справочнике» —
+// значение источника каталога, «требования» — нормализованное знание системы.
+// Подбор с учётом оборудования опирается на второе, и расхождение между ними
+// должно быть видно, а не спрятано.
+//
+// Пустые требования показываются явным сообщением, а не пустым списком: по
+// такому упражнению система отвечает «неизвестно», а не «оборудование не нужно»,
+// и это разные утверждения.
+
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import AppNav from "@/components/AppNav";
-import { Card, Empty, Skeleton, Status } from "@/components/ui/Primitives";
-import { API_BASE, api, ExerciseDetail, getToken } from "@/lib/api";
+import { Card, Empty, Notice, Skeleton, Status, Tag } from "@/components/ui/Primitives";
 import {
+  API_BASE,
+  EquipmentCapability,
+  EquipmentItem,
+  ExerciseAlternative,
+  ExerciseDetail,
+  ExerciseRequirement,
+  api,
+  getToken,
+  knowledgeApi,
+} from "@/lib/api";
+import {
+  CONFIDENCE_LABELS,
   DIFFICULTY_LABELS,
   EXERCISE_TYPE_LABELS,
   FORCE_LABELS,
+  KNOWLEDGE_SOURCE_LABELS,
   MECHANIC_LABELS,
+  REQUIREMENT_LABELS,
+  SUBSTITUTION_LABELS,
   equipmentList,
   muscleList,
+  substitutionTone,
 } from "@/lib/labels";
+
+const VOCABULARY_LIMIT = 200;
 
 function Text({ value }: { readonly value: string }) {
   if (value === "—") return <span className="muted">—</span>;
@@ -29,6 +57,14 @@ function List({ items }: { readonly items: string[] }) {
 export default function ExerciseDetailPage() {
   const params = useParams<{ id: string }>();
   const [exercise, setExercise] = useState<ExerciseDetail | null>(null);
+  const [requirements, setRequirements] = useState<ExerciseRequirement[] | null>(
+    null,
+  );
+  const [alternatives, setAlternatives] = useState<ExerciseAlternative[]>([]);
+  const [equipment, setEquipment] = useState<Record<string, EquipmentItem>>({});
+  const [capabilities, setCapabilities] = useState<
+    Record<string, EquipmentCapability>
+  >({});
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -41,6 +77,39 @@ export default function ExerciseDetailPage() {
       .then(setExercise)
       .catch((e) => setError(e.message));
   }, [params.id]);
+
+  useEffect(() => {
+    if (!exercise) return;
+    // Знание об оборудовании читается отдельным запросом: карточка упражнения
+    // остаётся читаемой, даже если база знаний для него ещё не заполнена.
+    knowledgeApi
+      .requirements(exercise.external_id, exercise.source)
+      .then((response) => setRequirements(response.items))
+      .catch(() => setRequirements([]));
+    knowledgeApi
+      .alternatives(exercise.external_id, exercise.source)
+      .then((response) => setAlternatives(response.items))
+      .catch(() => undefined);
+  }, [exercise]);
+
+  useEffect(() => {
+    knowledgeApi
+      .equipment({ limit: VOCABULARY_LIMIT, is_active: "all", usage: "all" })
+      .then((response) => {
+        const map: Record<string, EquipmentItem> = {};
+        for (const item of response.items) map[item.equipment_id] = item;
+        setEquipment(map);
+      })
+      .catch(() => undefined);
+    knowledgeApi
+      .capabilities()
+      .then((response) => {
+        const map: Record<string, EquipmentCapability> = {};
+        for (const item of response.items) map[item.capability_id] = item;
+        setCapabilities(map);
+      })
+      .catch(() => undefined);
+  }, []);
 
   if (error) {
     return (
@@ -75,6 +144,29 @@ export default function ExerciseDetailPage() {
   const restrictions =
     exercise.contraindications.length > 0 || exercise.limitations.length > 0;
 
+  const equipmentName = (id: string) => equipment[id]?.name_ru ?? id;
+  const capabilityName = (id: string) => capabilities[id]?.name_ru ?? id;
+
+  // Группы «одно из» показываются вместе: три отдельные строки не сообщают, что
+  // достаточно любого из вариантов. Обычный объект, а не Map: цель компиляции
+  // проекта — ES5, и перебор Map требовал бы downlevelIteration.
+  const groups: Record<number, ExerciseRequirement[]> = {};
+  const plain: ExerciseRequirement[] = [];
+  for (const requirement of requirements ?? []) {
+    if (
+      requirement.requirement === "alternative" &&
+      requirement.alternative_group !== null
+    ) {
+      const group = requirement.alternative_group;
+      groups[group] = [...(groups[group] ?? []), requirement];
+    } else {
+      plain.push(requirement);
+    }
+  }
+  const groupNumbers = Object.keys(groups)
+    .map(Number)
+    .sort((a, b) => a - b);
+
   return (
     <div className="app-shell">
       <AppNav />
@@ -96,9 +188,12 @@ export default function ExerciseDetailPage() {
           description="По этим признакам упражнение подбирается в программу."
         >
           <div className="kv">
-            <div className="k">Оборудование</div>
+            <div className="k">Оборудование в справочнике</div>
             <div>
               <Text value={equipmentList(exercise.equipment)} />
+              <div className="field-hint">
+                Значение источника каталога. Подбор опирается на требования ниже.
+              </div>
             </div>
             <div className="k">Основные мышцы</div>
             <div>
@@ -132,6 +227,128 @@ export default function ExerciseDetailPage() {
                 : "—"}
             </div>
           </div>
+        </Card>
+
+        <Card
+          title="Требования к оборудованию"
+          description="Нормализованное знание системы. По нему определяется, выполнимо ли упражнение доступным оборудованием."
+        >
+          {requirements === null && <Skeleton rows={2} />}
+
+          {requirements !== null && requirements.length === 0 && (
+            <Notice tone="warn" title="Требования не заполнены">
+              Система отвечает по этому упражнению «неизвестно», а не
+              «оборудование не нужно»: отсутствие данных не является
+              доказательством ни того, ни другого. Пока требования не заполнены,
+              подбор с учётом оборудования для него не работает.
+            </Notice>
+          )}
+
+          {requirements !== null && requirements.length > 0 && (
+            <div className="kv">
+              {plain.map((requirement) => (
+                <RequirementRow
+                  key={`${requirement.equipment_id ?? requirement.capability_id}-${requirement.requirement}`}
+                  requirement={requirement}
+                  equipmentName={equipmentName}
+                  capabilityName={capabilityName}
+                />
+              ))}
+              {groupNumbers.map((group) => {
+                const variants = groups[group];
+                return (
+                  <div key={`group-${group}`} style={{ display: "contents" }}>
+                    <div className="k">Одно из вариантов</div>
+                    <div>
+                      <div
+                        className="field-row"
+                        style={{ flexWrap: "wrap", gap: 4 }}
+                      >
+                        {variants.map((variant) => (
+                          <Tag
+                            key={
+                              variant.equipment_id ??
+                              variant.capability_id ??
+                              ""
+                            }
+                          >
+                            {variant.equipment_id
+                              ? equipmentName(variant.equipment_id)
+                              : capabilityName(variant.capability_id ?? "")}
+                          </Tag>
+                        ))}
+                      </div>
+                      <div className="field-hint">
+                        Достаточно любого из перечисленного.{" "}
+                        {CONFIDENCE_LABELS[variants[0]?.confidence ?? ""] ?? ""}{" "}
+                        ·{" "}
+                        {KNOWLEDGE_SOURCE_LABELS[variants[0]?.source ?? ""] ??
+                          variants[0]?.source}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+
+        <Card
+          title="Чем можно заменить"
+          description="Тип замены различается: «полная замена» и «похожее движение» — разные утверждения, и одно не выдаётся за другое."
+        >
+          {alternatives.length === 0 ? (
+            <Empty
+              title="Замен не найдено"
+              hint="Совпадений по основным мышцам и характеру движения нет либо знание ещё не пересчитано."
+            />
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Упражнение</th>
+                    <th>Тип замены</th>
+                    <th>Оборудование</th>
+                    <th>Совпадение</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {alternatives.map((alternative) => (
+                    <tr key={alternative.alternative_external_id}>
+                      <td>
+                        <Link
+                          href={`/exercises?search=${encodeURIComponent(alternative.alternative_external_id)}`}
+                        >
+                          {alternative.alternative_external_id}
+                        </Link>
+                      </td>
+                      <td>
+                        <Status
+                          tone={substitutionTone(alternative.substitution)}
+                        >
+                          {SUBSTITUTION_LABELS[alternative.substitution] ??
+                            alternative.substitution}
+                        </Status>
+                      </td>
+                      <td>
+                        {Array.isArray(alternative.rationale.equipment) &&
+                        (alternative.rationale.equipment as string[]).length >
+                          0 ? (
+                          (alternative.rationale.equipment as string[])
+                            .map(equipmentName)
+                            .join(", ")
+                        ) : (
+                          <span className="muted">не заполнено</span>
+                        )}
+                      </td>
+                      <td>{Math.round(alternative.score * 100)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </Card>
 
         {exercise.description && (
@@ -210,5 +427,33 @@ export default function ExerciseDetailPage() {
         )}
       </main>
     </div>
+  );
+}
+
+function RequirementRow(props: Readonly<{
+  requirement: ExerciseRequirement;
+  equipmentName: (id: string) => string;
+  capabilityName: (id: string) => string;
+}>) {
+  const { requirement } = props;
+  const target = requirement.equipment_id
+    ? props.equipmentName(requirement.equipment_id)
+    : props.capabilityName(requirement.capability_id ?? "");
+  return (
+    <>
+      <div className="k">
+        {REQUIREMENT_LABELS[requirement.requirement] ?? requirement.requirement}
+      </div>
+      <div>
+        <div>{target}</div>
+        <div className="field-hint">
+          {requirement.capability_id
+            ? "Требуется возможность: подойдёт любое оборудование, которое её даёт."
+            : "Требуется конкретное оборудование."}{" "}
+          {CONFIDENCE_LABELS[requirement.confidence] ?? requirement.confidence} ·{" "}
+          {KNOWLEDGE_SOURCE_LABELS[requirement.source] ?? requirement.source}
+        </div>
+      </div>
+    </>
   );
 }
