@@ -808,6 +808,10 @@ async def _media_items_for(row: ExerciseRow) -> list[dict]:
     return [
         {
             "sequence": a.sequence,
+            # Тип медиа обязателен в контракте: статичный кадр показывает
+            # положение, анимация — движение, и интерфейс подписывает их
+            # по-разному. Без поля клиент выдавал бы GIF за фотографию.
+            "media_type": a.media_type,
             "mime_type": a.mime_type,
             "width": a.width,
             "height": a.height,

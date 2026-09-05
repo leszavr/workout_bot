@@ -207,6 +207,127 @@ export const UNMAPPED_REASON_LABELS: Record<string, string> = {
   unmapped: "нет в словаре",
 };
 
+// --- Внешние источники знаний об упражнениях ----------------------------------
+//
+// Подписи называют решение так, как оно принято: «уже есть» и «вариант
+// существующего» — разные утверждения, и в интерфейсе они не должны сливаться в
+// «дубль».
+
+export const INGESTION_SOURCE_KIND_LABELS: Record<string, string> = {
+  exercise_catalog: "каталог упражнений",
+  program_dataset: "датасет программ",
+};
+
+export const INGESTION_DECISION_LABELS: Record<string, string> = {
+  existing: "уже есть",
+  enrichable: "дополняет существующее",
+  new_relevant: "новое упражнение",
+  duplicate_variant: "повтор внутри источника",
+  low_quality: "недостаточно данных",
+  questionable: "требует проверки",
+  unknown: "решение за человеком",
+};
+
+export const INGESTION_STATUS_LABELS: Record<string, string> = {
+  pending: "ожидает решения",
+  imported: "добавлено",
+  enriched: "дополнено",
+  skipped: "пропущено",
+  rejected: "отклонено",
+};
+
+export const QUALITY_STATUS_LABELS: Record<string, string> = {
+  ready: "пригодно",
+  review: "на проверку",
+  reject: "непригодно",
+};
+
+/** Тон решения по внешней записи. */
+export function ingestionDecisionTone(
+  decision: string,
+): "ok" | "info" | "warn" | "bad" | "neutral" {
+  if (decision === "new_relevant") return "ok";
+  if (decision === "enrichable") return "info";
+  if (decision === "existing" || decision === "duplicate_variant") return "neutral";
+  if (decision === "low_quality") return "bad";
+  return "warn";
+}
+
+export function qualityStatusTone(status: string): "ok" | "warn" | "bad" | "neutral" {
+  if (status === "ready") return "ok";
+  if (status === "review") return "warn";
+  if (status === "reject") return "bad";
+  return "neutral";
+}
+
+// Причины решения приходят кодами: они одинаковы в отчёте этапа, в базе и в
+// интерфейсе, поэтому расшифровка живёт в одном месте.
+export const INGESTION_REASON_LABELS: Record<string, string> = {
+  existing_source_link: "связь предыдущего импорта",
+  normalized_name_match: "совпало название",
+  alias_match: "совпал синоним",
+  transliteration_match: "совпало русское название",
+  movement_core_match: "совпало движение",
+  variant_tokens_match: "совпали признаки выполнения",
+  variant_tokens_differ: "различаются признаки выполнения",
+  equipment_match: "совпало оборудование",
+  equipment_differs: "различается оборудование",
+  equipment_unknown: "оборудование неизвестно",
+  target_match: "совпала целевая мышца",
+  target_in_secondary_muscles: "целевая мышца есть в дополнительных",
+  target_differs: "различается целевая мышца",
+  target_unknown: "целевая мышца неизвестна",
+  secondary_muscles_match: "совпали дополнительные мышцы",
+  force_mechanic_match: "совпал характер усилия",
+  intra_source_duplicate: "повтор внутри источника",
+  technique_present: "есть техника",
+  technique_missing: "нет техники",
+  technique_too_short: "техника выглядит обрезанной",
+  technique_ru_present: "есть русская техника",
+  technique_ru_missing: "нет русской техники",
+  equipment_mapped: "оборудование сопоставлено",
+  equipment_unmapped: "оборудование не сопоставлено",
+  equipment_missing: "оборудование не указано",
+  target_muscle_mapped: "целевая мышца сопоставлена",
+  target_muscle_unmapped: "целевая мышца не сопоставлена",
+  secondary_muscles_mapped: "дополнительные мышцы сопоставлены",
+  media_present: "есть медиа",
+  media_missing: "нет медиа",
+  description_present: "есть описание",
+  name_encoding_broken: "испорченная кодировка названия",
+  name_too_short: "слишком короткое название",
+  muscle_terms_ambiguous: "неоднозначные обозначения мышц",
+  filled_missing_value: "заполнено пустое поле",
+  more_complete_than_canonical: "полнее, чем в справочнике",
+  new_exercise_from_source: "поле пришло из источника",
+  external_name_kept_as_alias: "название сохранено синонимом",
+  program_dataset_observation: "наблюдение датасета программ",
+};
+
+export function ingestionReasonLabel(reason: string): string {
+  return INGESTION_REASON_LABELS[reason] ?? reason;
+}
+
+export const PROVENANCE_FIELD_LABELS: Record<string, string> = {
+  name: "название",
+  name_ru: "русское название",
+  aliases: "синонимы",
+  description: "описание",
+  technique: "техника",
+  technique_ru: "русская техника",
+  primary_muscles: "основные мышцы",
+  secondary_muscles: "дополнительные мышцы",
+  media: "медиа",
+  equipment_requirements: "требования к оборудованию",
+};
+
+export const SOURCE_RELATION_LABELS: Record<string, string> = {
+  origin: "источник упражнения",
+  enrichment: "дополнил данные",
+  duplicate_variant: "повтор источника",
+  observation: "программное наблюдение",
+};
+
 /** Тон статуса совместимости. `unknown` — предупреждение, а не отказ. */
 export function compatibilityTone(
   status: string,

@@ -958,6 +958,287 @@ class EquipmentProfileItemRow(Base):
     )
 
 
+class ExternalSourceRow(Base):
+    """Реестр внешних источников знаний об упражнениях.
+
+    Источник описывается данными, а не константой в коде: добавление источника
+    не должно требовать правки Python, а условия использования данных и media
+    обязаны быть видны администратору рядом с результатами импорта.
+
+    `kind` различает каталог упражнений и датасет программ. Различие
+    принципиально: каталог может дать новое упражнение, датасет программ — только
+    знание о том, как упражнения используются, и строка программы кандидатом в
+    каталог не является.
+    """
+
+    __tablename__ = "external_sources"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('exercise_catalog', 'program_dataset')",
+            name="ck_external_source_kind",
+        ),
+    )
+
+    source_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160))
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    homepage: Mapped[str | None] = mapped_column(String(300))
+    data_license: Mapped[str | None] = mapped_column(String(200))
+    media_license: Mapped[str | None] = mapped_column(String(300))
+    attribution: Mapped[str | None] = mapped_column(String(300))
+    notes: Mapped[str | None] = mapped_column(String(500))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExternalSourceVersionRow(Base):
+    """Состояние источника на момент чтения.
+
+    Существует ради воспроизводимости: «в базе 1324 записи» не отвечает на
+    вопрос, из какого коммита или архива они взяты, а без ответа повторить
+    импорт нельзя.
+    """
+
+    __tablename__ = "external_source_versions"
+    __table_args__ = (
+        UniqueConstraint("source_key", "version", name="uq_external_source_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_key: Mapped[str] = mapped_column(
+        ForeignKey("external_sources.source_key", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[str] = mapped_column(String(128))
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    record_count: Mapped[int] = mapped_column(Integer, default=0)
+    notes: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExternalExerciseRecordRow(Base):
+    """Staging-запись внешнего источника вместе с решением о ней.
+
+    Строка сохраняется и для отклонённых записей: причина, по которой внешнее
+    упражнение не попало в каталог, — такой же результат импорта, как добавленное
+    упражнение, и без неё «мы взяли 150 из 1324» ничем не подтверждено.
+
+    Уникальность по (`source_key`, `source_record_id`) даёт идемпотентность:
+    повторная загрузка того же источника попадает в ту же строку, а не создаёт
+    вторую.
+    """
+
+    __tablename__ = "external_exercise_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_key", "source_record_id", name="uq_external_exercise_record"
+        ),
+        CheckConstraint(
+            "quality_status IN ('ready', 'review', 'reject')",
+            name="ck_external_record_quality_status",
+        ),
+        CheckConstraint(
+            "decision IN ('existing', 'enrichable', 'new_relevant', "
+            "'duplicate_variant', 'low_quality', 'questionable', 'unknown')",
+            name="ck_external_record_decision",
+        ),
+        CheckConstraint(
+            "import_status IN ('pending', 'imported', 'enriched', 'skipped', "
+            "'rejected')",
+            name="ck_external_record_import_status",
+        ),
+        Index("ix_external_records_name_key", "name_key"),
+        Index("ix_external_records_decision", "source_key", "decision"),
+        Index("ix_external_records_status", "source_key", "import_status"),
+        Index("ix_external_records_matched", "matched_external_id", "matched_source"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_key: Mapped[str] = mapped_column(
+        ForeignKey("external_sources.source_key", ondelete="CASCADE"), index=True
+    )
+    source_version: Mapped[str] = mapped_column(String(128))
+    source_record_id: Mapped[str] = mapped_column(String(128))
+    record_hash: Mapped[str] = mapped_column(String(64))
+    raw_name: Mapped[str] = mapped_column(String(255))
+    normalized_name: Mapped[str] = mapped_column(String(255))
+    name_key: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    quality_score: Mapped[float] = mapped_column(Float, default=0.0)
+    quality_status: Mapped[str] = mapped_column(String(16), default="review", index=True)
+    quality_reasons: Mapped[dict] = mapped_column(JSONB, default=list)
+    decision: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
+    match_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    match_reasons: Mapped[dict] = mapped_column(JSONB, default=list)
+    matched_external_id: Mapped[str | None] = mapped_column(String(128))
+    matched_source: Mapped[str | None] = mapped_column(String(64))
+    import_status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    import_note: Mapped[str | None] = mapped_column(String(300))
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExerciseSourceLinkRow(Base):
+    """Из каких внешних записей собрано canonical упражнение.
+
+    Отдельно от staging, потому что отвечает на другой вопрос: не «что мы решили
+    про внешнюю запись», а «какие источники участвуют в этом упражнении». У
+    одного упражнения источников несколько (origin плюс обогащение), и держать
+    их списком в колонке `exercises` значило бы хранить связь в скалярном поле.
+    """
+
+    __tablename__ = "exercise_source_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "exercise_external_id",
+            "exercise_source",
+            "source_key",
+            "source_record_id",
+            name="uq_exercise_source_link",
+        ),
+        CheckConstraint(
+            "relation IN ('origin', 'enrichment', 'duplicate_variant', "
+            "'observation')",
+            name="ck_exercise_source_link_relation",
+        ),
+        Index(
+            "ix_exercise_source_links_exercise",
+            "exercise_external_id",
+            "exercise_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exercise_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    exercise_source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
+    source_key: Mapped[str] = mapped_column(
+        ForeignKey("external_sources.source_key", ondelete="CASCADE"), index=True
+    )
+    source_record_id: Mapped[str] = mapped_column(String(128))
+    source_version: Mapped[str] = mapped_column(String(128))
+    relation: Mapped[str] = mapped_column(String(24), default="enrichment", index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reasons: Mapped[dict] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExerciseFieldProvenanceRow(Base):
+    """Происхождение значения одного поля canonical упражнения.
+
+    Merge не перезаписывает поля слепо: русская техника может прийти из одного
+    источника, название остаться canonical, а медиа — из третьего. «Откуда это
+    значение» — вопрос про поле, и ответ хранится по полю.
+    """
+
+    __tablename__ = "exercise_field_provenance"
+    __table_args__ = (
+        UniqueConstraint(
+            "exercise_external_id",
+            "exercise_source",
+            "field",
+            name="uq_exercise_field_provenance",
+        ),
+        Index(
+            "ix_exercise_field_provenance_exercise",
+            "exercise_external_id",
+            "exercise_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exercise_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    exercise_source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
+    field: Mapped[str] = mapped_column(String(48))
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    source_record_id: Mapped[str] = mapped_column(String(128))
+    source_version: Mapped[str] = mapped_column(String(128))
+    value_hash: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExerciseProgramObservationRow(Base):
+    """Наблюдение источника программ об упражнении.
+
+    Все числовые поля названы `typical_*` и `source_*` не для красоты: это
+    статистика чужих программ, а не назначение нашей. Превращать «в источнике
+    встречается 4×10» в «назначить 4×10» нельзя — нагрузку определяет методология
+    проекта, и запись этой таблицы на неё не влияет.
+
+    Удержание отделено от повторений: в источнике отрицательное значение
+    повторений обозначает секунды удержания, и усреднять их вместе значило бы
+    считать среднее по двум разным величинам.
+    """
+
+    __tablename__ = "exercise_program_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "exercise_external_id",
+            "exercise_source",
+            "source_key",
+            name="uq_exercise_program_observation",
+        ),
+        Index(
+            "ix_exercise_program_observations_exercise",
+            "exercise_external_id",
+            "exercise_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exercise_external_id: Mapped[str] = mapped_column(String(128), index=True)
+    exercise_source: Mapped[str] = mapped_column(String(64), default="leszavr/workout")
+    source_key: Mapped[str] = mapped_column(
+        ForeignKey("external_sources.source_key", ondelete="CASCADE"), index=True
+    )
+    source_version: Mapped[str] = mapped_column(String(128))
+    source_record_id: Mapped[str] = mapped_column(String(128))
+    program_count: Mapped[int] = mapped_column(Integer, default=0)
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=0)
+    typical_sets_median: Mapped[float | None] = mapped_column(Float)
+    typical_sets_min: Mapped[int | None] = mapped_column(Integer)
+    typical_sets_max: Mapped[int | None] = mapped_column(Integer)
+    typical_reps_median: Mapped[float | None] = mapped_column(Float)
+    typical_reps_min: Mapped[int | None] = mapped_column(Integer)
+    typical_reps_max: Mapped[int | None] = mapped_column(Integer)
+    typical_hold_seconds_median: Mapped[float | None] = mapped_column(Float)
+    typical_intensity_median: Mapped[float | None] = mapped_column(Float)
+    source_goals: Mapped[dict] = mapped_column(JSONB, default=dict)
+    source_levels: Mapped[dict] = mapped_column(JSONB, default=dict)
+    source_equipment_contexts: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class TelegramSessionRow(Base):
     """Серверное состояние диалога Telegram-анкеты.
 

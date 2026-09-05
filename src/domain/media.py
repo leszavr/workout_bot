@@ -1,11 +1,16 @@
 """Модель медиа-ассетов упражнений (Stage 5).
 
-Упражнение связано с 1..N медиа-ассетами (фотографии). Количество не
+Упражнение связано с 1..N медиа-ассетами (фотографии и анимации). Количество не
 ограничено схемой БД — лимит задаётся конфигурацией
 (``EXERCISE_MEDIA_MAX_PER_EXERCISE``) и может меняться без миграций.
 
 Каноническая привязка — ``(external_id, source)`` каталога упражнений:
 программы и медиа ссылаются на один и тот же stable ID.
+
+Типов медиа два, и различие содержательное: статичное изображение показывает
+положение, анимация — движение. Внешний каталог даёт оба, и складывать их в один
+тип значило бы терять возможность отдать пользователю только фото там, где
+анимация не нужна (например, в печатной версии программы).
 """
 from __future__ import annotations
 
@@ -14,11 +19,12 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 MEDIA_TYPE_IMAGE = "image"
-ALLOWED_MEDIA_TYPES = {MEDIA_TYPE_IMAGE}
+MEDIA_TYPE_ANIMATION = "animation"
+ALLOWED_MEDIA_TYPES = {MEDIA_TYPE_IMAGE, MEDIA_TYPE_ANIMATION}
 
 
 class ExerciseMediaAsset(BaseModel):
-    """Один медиа-ассет упражнения (изображение в object storage)."""
+    """Один медиа-ассет упражнения (изображение или анимация в object storage)."""
 
     model_config = ConfigDict(extra="forbid")
 

@@ -6,6 +6,8 @@ GET /version — machine-readable metadata компонента (версия, b
 /api/v1/     — внутренний API: auth, dashboard, profiles, users, exercises.
 /api/v1/admin/knowledge — база знаний об оборудовании (словарь, требования,
                альтернативы, совместимость, health).
+/api/v1/admin/ingestion — ingestion внешних источников знаний об упражнениях
+               (источники, staging-записи, provenance полей, наблюдения).
 /internal/v1 — service-to-service API: регистрация компонентов, safety gate.
 
 Запуск: uvicorn apps.backend.main:app
@@ -21,6 +23,7 @@ from apps.backend.api.v1.admin_user_routes import router as admin_user_router
 from apps.backend.api.v1.ai_routes import router as ai_admin_router
 from apps.backend.api.v1.component_routes import router as component_router
 from apps.backend.api.v1.equipment_routes import router as knowledge_router
+from apps.backend.api.v1.ingestion_routes import router as ingestion_router
 from apps.backend.api.v1.internal_routes import router as internal_router
 from apps.backend.api.v1.telegram_routes import router as telegram_internal_router
 from apps.backend.api.v1.media_routes import router as media_router
@@ -101,6 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_user_router)
     app.include_router(component_router)
     app.include_router(knowledge_router)
+    app.include_router(ingestion_router)
     app.include_router(internal_router)
     app.include_router(telegram_internal_router)
     return app
