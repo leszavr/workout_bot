@@ -361,6 +361,37 @@ class IngestionRepository:
             raise _persistence_error(exc, "Ошибка чтения staging-записей") from exc
         return total, [_record_to_domain(row) for row in rows]
 
+    async def get_record(
+        self, source_key: str, source_record_id: str
+    ) -> ExternalExerciseRecord | None:
+        """Одна staging-запись по её естественному ключу.
+
+        Отдельный метод, а не фильтр поверх `list_records`. Разница не
+        стилистическая: список отдаёт страницу, и поиск нужной записи среди
+        отданных строк находит её только тогда, когда она попала на первую
+        страницу. У источника `hasaneyldrm/exercises-dataset` 1324 записи, и
+        запись с 201-й позиции существовала бы в базе, но отвечала 404.
+
+        Запрос идёт по паре (`source_key`, `source_record_id`) — тому же
+        уникальному ключу `uq_external_exercise_record`, по которому работает
+        идемпотентный upsert. Поэтому результат не зависит ни от числа записей,
+        ни от порядка сортировки, ни от размера страницы.
+        """
+        try:
+            async with self._sessions() as session:
+                row = (
+                    await session.execute(
+                        select(ExternalExerciseRecordRow).where(
+                            ExternalExerciseRecordRow.source_key == source_key,
+                            ExternalExerciseRecordRow.source_record_id
+                            == source_record_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            raise _persistence_error(exc, "Ошибка чтения staging-записи") from exc
+        return _record_to_domain(row) if row is not None else None
+
     async def record_counts(self) -> dict[str, dict[str, int]]:
         """Счётчики решений и статусов импорта по каждому источнику."""
         try:

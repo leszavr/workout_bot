@@ -202,20 +202,21 @@ async def get_record(
     source_record_id: str,
     _: Annotated[AuthenticatedUser, Depends(require_viewer)],
 ) -> dict:
-    """Одна внешняя запись целиком, включая payload источника."""
+    """Одна внешняя запись целиком, включая payload источника.
+
+    Запись ищется прямым запросом по естественному ключу
+    (`source_key`, `source_record_id`), а не фильтром поверх страницы списка:
+    у источника больше тысячи записей, и поиск среди отданной страницы нашёл бы
+    только те, что попали на первую.
+    """
     repository = build_ingestion_repository()
     try:
-        _, items = await repository.list_records(
-            RecordQuery(source_keys=(source_key,)), limit=200, offset=0
-        )
+        record = await repository.get_record(source_key, source_record_id)
     except ProfilePersistenceError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    match = next(
-        (item for item in items if item.source_record_id == source_record_id), None
-    )
-    if match is None:
+    if record is None:
         raise HTTPException(status_code=404, detail="External record not found")
-    return _record_out(match, full=True)
+    return _record_out(record, full=True)
 
 
 @router.get("/exercises/{external_id}/provenance")

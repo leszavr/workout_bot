@@ -36,7 +36,6 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from src.application.equipment.import_service import EquipmentKnowledgeImporter
 from src.application.equipment.matching import EquipmentMatcher
 from src.application.ingestion.candidates import ExternalExerciseCandidate
 from src.application.ingestion.equipment_tags import field_tags

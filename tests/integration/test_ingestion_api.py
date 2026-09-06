@@ -444,3 +444,153 @@ def test_health_counts_are_computed_from_database(
     assert body["records_rejected"] >= 1
     assert body["by_source"][SOURCE_KEY]["decision:new_relevant"] == 1
     assert body["by_source"][SOURCE_KEY]["import:rejected"] == 1
+
+
+# --- Поиск записи не зависит от пагинации ---------------------------------------
+
+BULK_SOURCE_KEY = "test/ingestion-api-bulk"
+# Больше страницы списка. Прежняя реализация detail endpoint искала запись среди
+# первых 200 отданных строк, поэтому объём должен превышать именно эту границу.
+BULK_RECORD_COUNT = 260
+PAST_PAGE_INDEX = 250
+
+
+@pytest.fixture
+def bulk_records(client: TestClient):
+    """Источник с числом записей больше страницы списка."""
+
+    async def _purge() -> None:
+        from sqlalchemy import delete
+
+        from src.infrastructure.persistence.postgres.db import get_session_factory
+        from src.infrastructure.persistence.postgres.models import (
+            ExternalExerciseRecordRow,
+            ExternalSourceRow,
+        )
+
+        async with get_session_factory()() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(ExternalExerciseRecordRow).where(
+                        ExternalExerciseRecordRow.source_key == BULK_SOURCE_KEY
+                    )
+                )
+                await session.execute(
+                    delete(ExternalSourceRow).where(
+                        ExternalSourceRow.source_key == BULK_SOURCE_KEY
+                    )
+                )
+
+    async def _seed() -> None:
+        from src.domain.ingestion import (
+            ExternalExerciseRecord,
+            ExternalSource,
+            ExternalSourceKind,
+        )
+        from src.infrastructure.persistence.postgres.db import get_session_factory
+        from src.infrastructure.persistence.postgres.ingestion_repository import (
+            IngestionRepository,
+        )
+
+        repository = IngestionRepository(get_session_factory())
+        await repository.upsert_source(
+            ExternalSource(
+                source_key=BULK_SOURCE_KEY,
+                name="Тестовый источник: объём больше страницы",
+                kind=ExternalSourceKind.EXERCISE_CATALOG,
+            )
+        )
+        # Названия нумерованы с ведущими нулями: список сортируется по
+        # нормализованному названию, поэтому позиция записи в выдаче совпадает с
+        # её номером, и «за пределами первой страницы» — проверяемый факт.
+        await repository.upsert_records(
+            [
+                ExternalExerciseRecord(
+                    source_key=BULK_SOURCE_KEY,
+                    source_version="bulk-1",
+                    source_record_id=f"bulk-{index:04d}",
+                    record_hash="d" * 64,
+                    raw_name=f"Bulk Fixture Exercise {index:04d}",
+                    normalized_name=f"Bulk Fixture Exercise {index:04d}",
+                    name_key=f"bulk exercise fixture {index:04d}",
+                    payload={"name": f"Bulk Fixture Exercise {index:04d}"},
+                )
+                for index in range(BULK_RECORD_COUNT)
+            ]
+        )
+
+    client.portal.call(_purge)
+    client.portal.call(_seed)
+    yield
+    client.portal.call(_purge)
+
+
+def test_record_beyond_first_page_is_found(
+    client: TestClient, auth_headers: dict, bulk_records
+):
+    """Запись за пределами первой страницы списка отдаётся detail endpoint'ом.
+
+    Прежняя реализация читала первые 200 записей источника и искала нужную среди
+    них: существующая запись с 201-й позиции отвечала 404. Тест фиксирует именно
+    этот случай, поэтому позиция записи проверяется, а не предполагается.
+    """
+    record_id = f"bulk-{PAST_PAGE_INDEX:04d}"
+
+    # 1. Запись существует и лежит за пределами первой страницы.
+    page = client.get(
+        f"{API}/records?source={BULK_SOURCE_KEY}&limit=200&offset=0",
+        headers=auth_headers,
+    ).json()
+    assert page["total"] == BULK_RECORD_COUNT
+    assert record_id not in {item["source_record_id"] for item in page["items"]}
+
+    # 2. Detail endpoint её находит.
+    response = client.get(
+        f"{API}/records/{BULK_SOURCE_KEY}/{record_id}", headers=auth_headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source_record_id"] == record_id
+    assert body["normalized_name"] == f"Bulk Fixture Exercise {PAST_PAGE_INDEX:04d}"
+    assert body["payload"]["name"] == f"Bulk Fixture Exercise {PAST_PAGE_INDEX:04d}"
+
+
+def test_last_record_of_large_source_is_found(
+    client: TestClient, auth_headers: dict, bulk_records
+):
+    """Последняя запись источника находится так же, как первая."""
+    for index in (0, BULK_RECORD_COUNT - 1):
+        response = client.get(
+            f"{API}/records/{BULK_SOURCE_KEY}/bulk-{index:04d}", headers=auth_headers
+        )
+        assert response.status_code == 200, index
+        assert response.json()["source_record_id"] == f"bulk-{index:04d}"
+
+
+def test_record_id_is_case_sensitive(
+    client: TestClient, auth_headers: dict, bulk_records
+):
+    """Идентификатор записи сравнивается точно, а не без учёта регистра.
+
+    Ключ приходит от источника, и «похожий» идентификатор — не тот же
+    идентификатор: отдавать по нему запись означало бы утверждать соответствие,
+    которого источник не устанавливал.
+    """
+    response = client.get(
+        f"{API}/records/{BULK_SOURCE_KEY}/BULK-0250", headers=auth_headers
+    )
+    assert response.status_code == 404
+
+
+def test_record_of_another_source_is_not_returned(
+    client: TestClient, auth_headers: dict, bulk_records
+):
+    """Запись ищется в пределах своего источника.
+
+    Идентификаторы источников независимы: `0001` у одного источника и `0001` у
+    другого — разные записи, и отдавать чужую значило бы смешивать источники.
+    """
+    response = client.get(
+        f"{API}/records/{SOURCE_KEY}/bulk-0250", headers=auth_headers
+    )
+    assert response.status_code == 404
