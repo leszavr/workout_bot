@@ -739,7 +739,7 @@ canonical compound-упражнений: 489 записей действующе
 
 | Проверка | Результат |
 | --- | --- |
-| CI, job Backend (unit + integration) | 1357 passed, 16 skipped |
+| CI, job Backend (unit + integration) | 1361 passed, 16 skipped |
 | `pytest -q` локально | 1345 passed, 32 skipped |
 | unit-тесты ingestion | 98 (matching 43, quality 37, sources 18) |
 | integration-тесты ingestion | 32 (service 13, API 19) |
@@ -755,8 +755,9 @@ canonical compound-упражнений: 489 записей действующе
 `tests/integration/test_gateway_boundary.py` выполняются; локально они пропущены с
 причиной «DATABASE_URL and INTERNAL_SERVICE_TOKEN are required». Локально
 пропущено 32 теста, из них 16 — эти, остальные 16 не относятся к текущему этапу.
-Числа проверяемы: локальное — `pytest -q`, CI — вывод job Backend прогона рабочего
-процесса.
+Разница локального прогона (1345) и CI (1361) складывается из этих 16 тестов
+сетевой границы. Числа проверяемы: локальное — `pytest -q`, CI — вывод job Backend
+прогона `34002123221` (после исправления detail endpoint).
 
 Чистая установка проверена целиком: полная очистка данных → `import_exercises` →
 `import_exercise_media` → `build_equipment_knowledge` →
