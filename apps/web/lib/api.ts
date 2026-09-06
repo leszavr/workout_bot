@@ -420,6 +420,8 @@ export interface ExerciseListResponse extends PagedResponse<ExerciseListItem> {
 
 export interface ExerciseMediaItem {
   sequence: number;
+  /** `image` — статичный кадр, `animation` — анимация выполнения. */
+  media_type: string;
   mime_type: string;
   width: number;
   height: number;
@@ -1601,6 +1603,182 @@ export const knowledgeApi = {
       `/api/v1/admin/knowledge/unmapped?${qs}`
     );
   },
+};
+
+// --- Внешние источники знаний об упражнениях ----------------------------------
+
+/** Источник знаний вместе с последней прочитанной версией. */
+export interface IngestionSource {
+  source_key: string;
+  name: string;
+  kind: "exercise_catalog" | "program_dataset";
+  homepage: string | null;
+  data_license: string | null;
+  media_license: string | null;
+  attribution: string | null;
+  notes: string | null;
+  is_active: boolean;
+  version: string | null;
+  content_hash: string | null;
+  retrieved_at: string | null;
+  record_count: number;
+  // Счётчики приходят ключами вида `decision:new_relevant`, `import:imported`,
+  // `quality:ready`: набор значений задаётся сервером, и фиксировать его в типе
+  // значило бы дублировать перечисление на клиенте.
+  counts: Record<string, number>;
+}
+
+export interface IngestionRecord {
+  source_key: string;
+  source_version: string;
+  source_record_id: string;
+  raw_name: string;
+  normalized_name: string;
+  quality_score: number;
+  quality_status: "ready" | "review" | "reject";
+  quality_reasons: string[];
+  decision:
+    | "existing"
+    | "enrichable"
+    | "new_relevant"
+    | "duplicate_variant"
+    | "low_quality"
+    | "questionable"
+    | "unknown";
+  match_confidence: number;
+  match_reasons: string[];
+  matched_external_id: string | null;
+  matched_source: string | null;
+  import_status: "pending" | "imported" | "enriched" | "skipped" | "rejected";
+  import_note: string | null;
+  imported_at: string | null;
+  // Приходят только в карточке одной записи.
+  record_hash?: string;
+  name_key?: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface ExerciseFieldProvenance {
+  field: string;
+  source_key: string;
+  source_record_id: string;
+  source_version: string;
+  reason: string | null;
+}
+
+export interface ExerciseSourceLinkOut {
+  source_key: string;
+  source_record_id: string;
+  source_version: string;
+  relation: "origin" | "enrichment" | "duplicate_variant" | "observation";
+  confidence: number;
+  reasons: string[];
+}
+
+/** Наблюдение датасета программ: статистика чужих программ, не предписание. */
+export interface ProgramObservation {
+  source_key: string;
+  source_version: string;
+  program_count: number;
+  occurrence_count: number;
+  typical_sets_median: number | null;
+  typical_sets_min: number | null;
+  typical_sets_max: number | null;
+  typical_reps_median: number | null;
+  typical_reps_min: number | null;
+  typical_reps_max: number | null;
+  typical_hold_seconds_median: number | null;
+  typical_intensity_median: number | null;
+  source_goals: Record<string, number>;
+  source_levels: Record<string, number>;
+  source_equipment_contexts: Record<string, number>;
+}
+
+export interface ExerciseProvenance {
+  exercise_external_id: string;
+  exercise_source: string;
+  fields: ExerciseFieldProvenance[];
+  sources: ExerciseSourceLinkOut[];
+  program_observations: ProgramObservation[];
+}
+
+export interface IngestionHealth {
+  external_records_total: number;
+  source_links_total: number;
+  field_provenance_total: number;
+  program_observations_total: number;
+  exercises_with_source_links: number;
+  exercises_with_observations: number;
+  records_imported: number;
+  records_enriched: number;
+  records_review: number;
+  records_rejected: number;
+  records_duplicate_variant: number;
+  by_source: Record<string, Record<string, number>>;
+}
+
+export interface IngestionRecordQuery {
+  source?: string[];
+  decision?: string[];
+  quality?: string[];
+  status?: string[];
+  search?: string;
+  min_confidence?: number;
+  max_confidence?: number;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Строка запроса для списка внешних записей.
+ *
+ * Вынесена из клиента отдельной функцией, чтобы её можно было проверить тестом:
+ * многозначные фильтры (несколько источников, несколько решений) собираются
+ * повторением параметра, а не запятыми, и ошибка здесь не видна до открытия
+ * страницы — сервер молча вернул бы «всё» вместо отобранного.
+ */
+export function ingestionRecordsQuery(params?: IngestionRecordQuery): string {
+  const qs = new URLSearchParams();
+  for (const [key, values] of [
+    ["source", params?.source],
+    ["decision", params?.decision],
+    ["quality", params?.quality],
+    ["status", params?.status],
+  ] as const) {
+    for (const value of values ?? []) qs.append(key, value);
+  }
+  if (params?.search) qs.set("search", params.search);
+  // Ноль — допустимая граница уверенности, поэтому проверяется undefined, а не
+  // ложность значения.
+  if (params?.min_confidence !== undefined)
+    qs.set("min_confidence", String(params.min_confidence));
+  if (params?.max_confidence !== undefined)
+    qs.set("max_confidence", String(params.max_confidence));
+  qs.set("limit", String(params?.limit ?? 50));
+  qs.set("offset", String(params?.offset ?? 0));
+  return `?${qs}`;
+}
+
+export const ingestionApi = {
+  sources: () =>
+    request<ListResponse<IngestionSource>>("/api/v1/admin/ingestion/sources"),
+  records: (params?: IngestionRecordQuery) =>
+    request<PagedResponse<IngestionRecord>>(
+      `/api/v1/admin/ingestion/records${ingestionRecordsQuery(params)}`
+    ),
+  record: (sourceKey: string, recordId: string) =>
+    request<IngestionRecord>(
+      `/api/v1/admin/ingestion/records/${sourceKey}/${encodeURIComponent(recordId)}`
+    ),
+  provenance: (externalId: string, source?: string) => {
+    const qs = new URLSearchParams();
+    if (source) qs.set("source", source);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request<ExerciseProvenance>(
+      `/api/v1/admin/ingestion/exercises/${encodeURIComponent(externalId)}/provenance${suffix}`
+    );
+  },
+  health: () => request<IngestionHealth>("/api/v1/admin/ingestion/health"),
 };
 
 export const api = {

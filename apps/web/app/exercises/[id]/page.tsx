@@ -23,9 +23,11 @@ import {
   EquipmentItem,
   ExerciseAlternative,
   ExerciseDetail,
+  ExerciseProvenance,
   ExerciseRequirement,
   api,
   getToken,
+  ingestionApi,
   knowledgeApi,
 } from "@/lib/api";
 import {
@@ -35,9 +37,12 @@ import {
   FORCE_LABELS,
   KNOWLEDGE_SOURCE_LABELS,
   MECHANIC_LABELS,
+  PROVENANCE_FIELD_LABELS,
   REQUIREMENT_LABELS,
+  SOURCE_RELATION_LABELS,
   SUBSTITUTION_LABELS,
   equipmentList,
+  ingestionReasonLabel,
   muscleList,
   substitutionTone,
 } from "@/lib/labels";
@@ -65,6 +70,9 @@ export default function ExerciseDetailPage() {
   const [capabilities, setCapabilities] = useState<
     Record<string, EquipmentCapability>
   >({});
+  // Происхождение читается отдельным запросом: карточка остаётся читаемой, даже
+  // если импорт внешних источников ещё не выполнялся.
+  const [provenance, setProvenance] = useState<ExerciseProvenance | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -90,6 +98,18 @@ export default function ExerciseDetailPage() {
       .alternatives(exercise.external_id, exercise.source)
       .then((response) => setAlternatives(response.items))
       .catch(() => undefined);
+    ingestionApi
+      .provenance(exercise.external_id, exercise.source)
+      .then(setProvenance)
+      .catch(() =>
+        setProvenance({
+          exercise_external_id: exercise.external_id,
+          exercise_source: exercise.source,
+          fields: [],
+          sources: [],
+          program_observations: [],
+        }),
+      );
   }, [exercise]);
 
   useEffect(() => {
@@ -140,7 +160,11 @@ export default function ExerciseDetailPage() {
 
   const technique = exercise.technique_ru || exercise.technique;
   const photos = exercise.media ?? [];
-  const license = photos.length > 0 ? photos[0].license : null;
+  // Лицензий может быть несколько: медиа одного упражнения приходит из разных
+  // источников, и указание авторства обязано перечислить все.
+  const licenses = Array.from(
+    new Set(photos.map((item) => item.license).filter((v): v is string => !!v)),
+  );
   const restrictions =
     exercise.contraindications.length > 0 || exercise.limitations.length > 0;
 
@@ -368,13 +392,13 @@ export default function ExerciseDetailPage() {
           )}
         </Card>
 
-        <Card title="Фотографии">
+        <Card title="Изображения">
           {photos.length > 0 ? (
             <>
               <div style={{ display: "flex", gap: "var(--s-3)", flexWrap: "wrap" }}>
                 {photos.map((item) => (
                   <a
-                    key={item.sequence}
+                    key={`${item.media_type}-${item.sequence}`}
                     href={`${API_BASE}${item.url}`}
                     target="_blank"
                     rel="noreferrer"
@@ -382,7 +406,9 @@ export default function ExerciseDetailPage() {
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={`${API_BASE}${item.url}`}
-                      alt={`${exercise.name_ru || exercise.name} — фото ${item.sequence}`}
+                      alt={`${exercise.name_ru || exercise.name} — ${
+                        item.media_type === "animation" ? "анимация" : "фото"
+                      } ${item.sequence}`}
                       style={{
                         height: 150,
                         width: "auto",
@@ -390,21 +416,189 @@ export default function ExerciseDetailPage() {
                         border: "1px solid var(--border)",
                       }}
                     />
+                    <div className="muted" style={{ textAlign: "center" }}>
+                      {item.media_type === "animation" ? "анимация" : "фото"}
+                    </div>
                   </a>
                 ))}
               </div>
-              {license && (
+              {licenses.length > 0 && (
                 <p className="field-hint" style={{ marginTop: "var(--s-3)" }}>
-                  Автор материалов: {photos[0].source || exercise.source} · лицензия{" "}
-                  {license}
+                  Автор материалов: {photos[0].source || exercise.source} ·{" "}
+                  {licenses.join(" · ")}
                 </p>
               )}
             </>
           ) : (
             <Empty
-              title="Фотографий нет"
-              hint="Упражнение загружено без изображений."
+              title="Изображений нет"
+              hint="Упражнение загружено без фотографий и анимаций."
             />
+          )}
+        </Card>
+
+        <Card
+          title="Откуда данные"
+          description="Происхождение полей и связи с внешними источниками. Пустой раздел означает, что упражнение пришло из исходного справочника проекта."
+        >
+          {provenance === null && <Skeleton rows={2} />}
+
+          {provenance !== null &&
+            provenance.fields.length === 0 &&
+            provenance.sources.length === 0 &&
+            provenance.program_observations.length === 0 && (
+              <Empty
+                title="Внешних источников нет"
+                hint="Все данные упражнения получены из исходного справочника проекта."
+              />
+            )}
+
+          {provenance !== null && provenance.sources.length > 0 && (
+            <>
+              <h3 className="section-title">Источники</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Источник</th>
+                      <th>Роль</th>
+                      <th>Версия</th>
+                      <th>Уверенность</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {provenance.sources.map((link) => (
+                      <tr key={`${link.source_key}-${link.source_record_id}`}>
+                        <td>
+                          <code>{link.source_key}</code>
+                          <div className="muted">
+                            <code>{link.source_record_id}</code>
+                          </div>
+                        </td>
+                        <td>
+                          {SOURCE_RELATION_LABELS[link.relation] ?? link.relation}
+                        </td>
+                        <td>
+                          <code>{link.source_version}</code>
+                        </td>
+                        <td>
+                          {link.confidence > 0 ? (
+                            link.confidence.toFixed(2)
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          {provenance !== null && provenance.fields.length > 0 && (
+            <>
+              <h3 className="section-title">Поля из внешних источников</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Поле</th>
+                      <th>Источник</th>
+                      <th>Почему взято</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {provenance.fields.map((entry) => (
+                      <tr key={entry.field}>
+                        <td>
+                          {PROVENANCE_FIELD_LABELS[entry.field] ?? entry.field}
+                        </td>
+                        <td>
+                          <code>{entry.source_key}</code>
+                        </td>
+                        <td>
+                          {entry.reason ? (
+                            ingestionReasonLabel(entry.reason)
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          {provenance !== null && provenance.program_observations.length > 0 && (
+            <>
+              <h3 className="section-title">Как упражнение используют в чужих программах</h3>
+              <p className="field-hint">
+                Это наблюдение источника, а не назначение нагрузки: подходы и
+                повторения программы определяет методология проекта.
+              </p>
+              {provenance.program_observations.map((observation) => (
+                <div className="kv" key={observation.source_key}>
+                  <div className="k">Источник</div>
+                  <div>
+                    <code>{observation.source_key}</code>
+                  </div>
+
+                  <div className="k">Программ с этим упражнением</div>
+                  <div>{observation.program_count}</div>
+
+                  <div className="k">Всего вхождений</div>
+                  <div>{observation.occurrence_count}</div>
+
+                  <div className="k">Подходов (медиана, диапазон)</div>
+                  <div>
+                    {observation.typical_sets_median ?? "—"}
+                    {observation.typical_sets_min !== null &&
+                      observation.typical_sets_max !== null &&
+                      ` (${observation.typical_sets_min}–${observation.typical_sets_max})`}
+                  </div>
+
+                  <div className="k">Повторений (медиана, диапазон)</div>
+                  <div>
+                    {observation.typical_reps_median ?? "—"}
+                    {observation.typical_reps_min !== null &&
+                      observation.typical_reps_max !== null &&
+                      ` (${observation.typical_reps_min}–${observation.typical_reps_max})`}
+                  </div>
+
+                  {observation.typical_hold_seconds_median !== null && (
+                    <>
+                      <div className="k">Удержание, с (медиана)</div>
+                      <div>{observation.typical_hold_seconds_median}</div>
+                    </>
+                  )}
+
+                  <div className="k">Цели программ</div>
+                  <div>
+                    {Object.keys(observation.source_goals).length > 0 ? (
+                      Object.entries(observation.source_goals)
+                        .map(([goal, value]) => `${goal}: ${value}`)
+                        .join(", ")
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </div>
+
+                  <div className="k">Уровни подготовки</div>
+                  <div>
+                    {Object.keys(observation.source_levels).length > 0 ? (
+                      Object.entries(observation.source_levels)
+                        .map(([level, value]) => `${level}: ${value}`)
+                        .join(", ")
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </>
           )}
         </Card>
 

@@ -202,7 +202,7 @@ class ExerciseFilter:
         included: list[Exercise] = []
         excluded: list[ExclusionRecord] = []
 
-        for exercise in sorted(exercises, key=lambda e: e.name):
+        for exercise in sorted(exercises, key=lambda e: e.name.lower()):
             if not exercise.is_active:
                 excluded.append(self._record(exercise, "упражнение деактивировано"))
                 continue

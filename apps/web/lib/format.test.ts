@@ -9,14 +9,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { analyticsQuery } from "./api.ts";
+import { analyticsQuery, ingestionRecordsQuery } from "./api.ts";
 import {
+  INGESTION_DECISION_LABELS,
   count,
   dateTime,
   duration,
   generationStatusTone,
+  ingestionDecisionTone,
+  ingestionReasonLabel,
   metricLabel,
   percent,
+  qualityStatusTone,
   validationStateLabel,
 } from "./labels.ts";
 
@@ -100,4 +104,78 @@ test("запрос аналитики: фильтры и дополнитель�
 test("запрос аналитики: числовая версия инструкции передаётся числом", () => {
   const params = new URLSearchParams(analyticsQuery({ prompt_version: 2 }).slice(1));
   assert.equal(params.get("prompt_version"), "2");
+});
+
+// --- Внешние источники знаний об упражнениях ---------------------------------
+
+test("запрос записей: многозначные фильтры повторяют параметр", () => {
+  // Сервер читает несколько значений одного параметра. Если склеить их запятой,
+  // фильтр молча перестанет работать: сервер получит одно значение
+  // «new_relevant,enrichable», не найдёт такого решения и вернёт пустой список.
+  const query = ingestionRecordsQuery({
+    decision: ["new_relevant", "enrichable"],
+    source: ["a/b", "c/d"],
+  });
+  assert.ok(query.includes("decision=new_relevant"));
+  assert.ok(query.includes("decision=enrichable"));
+  assert.ok(query.includes("source=a%2Fb"));
+  assert.ok(query.includes("source=c%2Fd"));
+});
+
+test("запрос записей: нулевая уверенность — это граница, а не пустое значение", () => {
+  const query = ingestionRecordsQuery({ min_confidence: 0 });
+  assert.ok(query.includes("min_confidence=0"));
+});
+
+test("запрос записей: пагинация задаётся по умолчанию", () => {
+  const query = ingestionRecordsQuery();
+  assert.ok(query.includes("limit=50"));
+  assert.ok(query.includes("offset=0"));
+});
+
+test("подписи решений: код без перевода не показывается пользователю", () => {
+  // В интерфейсе не должно быть английских кодов: каждое решение и каждая
+  // причина обязаны иметь русскую подпись.
+  for (const decision of [
+    "existing",
+    "enrichable",
+    "new_relevant",
+    "duplicate_variant",
+    "low_quality",
+    "questionable",
+    "unknown",
+  ]) {
+    assert.ok(INGESTION_DECISION_LABELS[decision], decision);
+  }
+  for (const reason of [
+    "existing_source_link",
+    "normalized_name_match",
+    "variant_tokens_differ",
+    "equipment_differs",
+    "target_in_secondary_muscles",
+    "technique_missing",
+    "filled_missing_value",
+  ]) {
+    assert.notEqual(ingestionReasonLabel(reason), reason, reason);
+  }
+});
+
+test("неизвестная причина показывается как есть, а не теряется", () => {
+  // Отчёт может добавить причину раньше, чем интерфейс: показать код лучше, чем
+  // показать пустое место.
+  assert.equal(ingestionReasonLabel("brand_new_reason"), "brand_new_reason");
+});
+
+test("тон решения: новое упражнение и низкое качество различаются", () => {
+  assert.equal(ingestionDecisionTone("new_relevant"), "ok");
+  assert.equal(ingestionDecisionTone("low_quality"), "bad");
+  // «Требует проверки» — предупреждение, а не отказ: запись может быть верной.
+  assert.equal(ingestionDecisionTone("questionable"), "warn");
+  assert.equal(ingestionDecisionTone("unknown"), "warn");
+});
+
+test("тон качества: на проверку — предупреждение, непригодно — отказ", () => {
+  assert.equal(qualityStatusTone("ready"), "ok");
+  assert.equal(qualityStatusTone("review"), "warn");
+  assert.equal(qualityStatusTone("reject"), "bad");
 });

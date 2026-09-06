@@ -323,9 +323,16 @@ class DeterministicProgramGenerator:
         for exercise in pool.allowed:
             groups.setdefault(classify_role(exercise), []).append(exercise)
         # Детерминированная сортировка: compound-упражнения выше, затем имя.
+        #
+        # Имя сравнивается без учёта регистра. Каталог содержит упражнения из
+        # разных источников с разным стилем написания, и сравнение с учётом
+        # регистра ставило бы весь один источник после всего другого: в Python
+        # строчные буквы идут после заглавных. Пул при этом урезается по
+        # длительности занятия, и в программу попадали бы упражнения только
+        # одного источника.
         for exercises in groups.values():
             exercises.sort(
-                key=lambda e: (0 if e.mechanic == "compound" else 1, e.name)
+                key=lambda e: (0 if e.mechanic == "compound" else 1, e.name.lower())
             )
         return groups
 

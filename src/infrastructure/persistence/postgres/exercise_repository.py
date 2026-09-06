@@ -46,6 +46,11 @@ SORT_FIELDS = {
 }
 DEFAULT_SORT = "name"
 
+# Поля, которые сортируются без учёта регистра. Каталог содержит названия из
+# разных источников, и порядок «сначала все с заглавной, потом все со строчной»
+# был бы порядком по источнику, а не по алфавиту.
+TEXT_SORT_FIELDS = frozenset({"name", "name_ru", "exercise_type", "force", "mechanic"})
+
 # Порядок сложности: алфавитный порядок (beginner, expert, intermediate) для
 # сложности бессмысленен — «продвинутый» оказывался между начальным и средним.
 DIFFICULTY_ORDER = ("beginner", "intermediate", "expert")
@@ -255,6 +260,12 @@ class ExerciseRepository:
         Без вторичного ключа строки с равным значением (например, все
         `strength`) идут в произвольном порядке базы, и страницы пагинации
         пересекаются между запросами.
+
+        Текстовые поля сортируются без учёта регистра. Это не косметика: в
+        порядке по умолчанию PostgreSQL (`C`-коллация в части установок) и в
+        Python строчные буквы идут после всех заглавных, поэтому упражнения,
+        названные строчными, оказывались в конце любой выборки — а с ними и
+        любая группа, целиком пришедшая из источника с другим стилем написания.
         """
         if sort_by == "difficulty":
             # Сложность сортируется по смыслу, а не по алфавиту.
@@ -263,6 +274,8 @@ class ExerciseRepository:
             )
         else:
             primary = SORT_FIELDS.get(sort_by, SORT_FIELDS[DEFAULT_SORT])
+            if sort_by in TEXT_SORT_FIELDS:
+                primary = func.lower(primary)
         ordered = primary.desc() if descending else primary.asc()
         return nulls_last(ordered), ExerciseRow.id.asc()
 
