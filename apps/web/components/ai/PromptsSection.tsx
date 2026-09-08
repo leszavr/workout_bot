@@ -12,13 +12,27 @@
 // Рабочий цикл: посмотреть целиком → скопировать за основу → изменить →
 // выбрать для задачи → запустить генерацию → посмотреть результат.
 //
-// Полный текст не усечён нигде: администратор должен видеть ровно то, что
-// уходит в модель. Список показывает только превью, а сам текст загружается
-// при открытии карточки — инструкция бывает в десятки килобайт.
+// Версии показаны таблицей, как остальные списки интерфейса: раньше это был
+// столбец карточек, где каждая строка занимала треть экрана, и сравнить пять
+// версий по размеру и дате правки было нельзя без прокрутки. Полный текст не
+// усечён нигде: администратор должен видеть ровно то, что уходит в модель.
+// Список показывает только превью, а сам текст загружается при открытии
+// карточки — инструкция бывает в десятки килобайт.
 
 import { useCallback, useEffect, useState } from "react";
 
-import { Card, Empty, Field, Notice, Skeleton, Status, Tag, moment } from "@/components/ui/Primitives";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { DataColumn, DataTable } from "@/components/ui/DataTable";
+import {
+  Card,
+  ErrorState,
+  Field,
+  Notice,
+  Skeleton,
+  Status,
+  Tag,
+  moment,
+} from "@/components/ui/Primitives";
 import { AIPromptDetail, AIPromptItem, ApiError, aiApi } from "@/lib/api";
 
 interface Shared {
@@ -61,28 +75,93 @@ export default function PromptsSection(props: Readonly<Shared & {
 
   const afterChange = (message: string) => {
     props.onChanged(message);
+    setOpenId(null);
     load().catch(() => undefined);
   };
 
-  return (
-    <Card
-      title="Инструкции для ИИ"
-      description="Текст, по которому модель собирает программу. Задача использует ту версию, которая выбрана в её настройках; остальные хранятся для сравнения. Другого источника инструкций нет."
-      actions={
-        props.canWrite && creatingFrom === null ? (
+  const columns: ReadonlyArray<DataColumn<AIPromptItem>> = [
+    {
+      key: "version",
+      header: "Версия",
+      render: (item) => (
+        <>
+          <strong>
+            №{item.version} · {item.name}
+          </strong>
+          <p className="field-hint" style={{ margin: "2px 0 0" }}>
+            {item.system_prompt_preview}
+            {item.system_prompt_length > item.system_prompt_preview.length &&
+              "…"}
+          </p>
+        </>
+      ),
+    },
+    {
+      key: "usage",
+      header: "Используется",
+      hint: "Задача берёт ту версию, которая выбрана в её настройках; остальные хранятся для сравнения.",
+      render: (item) => (
+        <>
+          {item.version === activeVersion ? (
+            <Status tone="ok">используется задачей</Status>
+          ) : (
+            <Status tone="neutral">не используется</Status>
+          )}
+          {!item.enabled && <Tag tone="warn">выключена</Tag>}
+        </>
+      ),
+    },
+    {
+      key: "size",
+      header: "Размер",
+      numeric: true,
+      hint: "Символов в правилах и в шаблоне запроса.",
+      render: (item) => (
+        <>
+          {item.system_prompt_length}
+          <div className="muted" style={{ fontSize: 12 }}>
+            шаблон: {item.user_template_length}
+          </div>
+        </>
+      ),
+    },
+    {
+      key: "updated",
+      header: "Изменена",
+      render: (item) => (
+        <span className="muted">{moment(item.updated_at)}</span>
+      ),
+    },
+    {
+      key: "actions",
+      header: "Действия",
+      render: (item) => (
+        <div className="button-row">
           <button
             type="button"
-            className="primary small"
-            onClick={() => setCreatingFrom(0)}
+            className="small"
+            onClick={() => setOpenId(openId === item.id ? null : item.id)}
           >
-            Создать инструкцию
+            {openId === item.id ? "Свернуть" : "Открыть текст"}
           </button>
-        ) : undefined
-      }
-    >
-      {loading && <Skeleton rows={3} />}
-      {failure && <div className="error">Не удалось загрузить инструкции: {failure}</div>}
+          {props.canWrite && (
+            <button
+              type="button"
+              className="small"
+              onClick={() => setCreatingFrom(item.id)}
+            >
+              Копия
+            </button>
+          )}
+        </div>
+      ),
+    },
+  ];
 
+  const open = openId ? items.find((item) => item.id === openId) : undefined;
+
+  return (
+    <>
       {creatingFrom !== null && (
         <NewPrompt
           canWrite={props.canWrite}
@@ -95,31 +174,57 @@ export default function PromptsSection(props: Readonly<Shared & {
         />
       )}
 
-      {!loading && !failure && items.length === 0 && creatingFrom === null && (
-        <Empty
-          title="Инструкций нет"
-          hint="Без инструкции ИИ вызвать нельзя: задача останется не готовой, и программу соберёт алгоритмический генератор. Создайте инструкцию."
+      <Card
+        title="Инструкции для ИИ"
+        description="Текст, по которому модель собирает программу. Задача использует ту версию, которая выбрана в её настройках; остальные хранятся для сравнения. Другого источника инструкций нет."
+        actions={
+          props.canWrite && creatingFrom === null ? (
+            <button
+              type="button"
+              className="primary small"
+              onClick={() => setCreatingFrom(0)}
+            >
+              Создать инструкцию
+            </button>
+          ) : undefined
+        }
+      >
+        <DataTable
+          columns={columns}
+          rows={items}
+          rowKey={(item) => String(item.id)}
+          loading={loading}
+          error={
+            failure ? `Не удалось загрузить инструкции: ${failure}` : undefined
+          }
+          emptyTitle="Инструкций нет"
+          emptyHint="Без инструкции ИИ вызвать нельзя: задача останется не готовой, и программу соберёт алгоритмический генератор."
         />
-      )}
+      </Card>
 
-      {items.length > 0 && (
-        <div className="stack">
-          {items.map((item) => (
-            <PromptRow
-              key={item.id}
-              canWrite={props.canWrite}
-              onChanged={afterChange}
-              onError={props.onError}
-              item={item}
-              isActive={item.version === activeVersion}
-              open={openId === item.id}
-              onToggle={() => setOpenId(openId === item.id ? null : item.id)}
-              onCopy={() => setCreatingFrom(item.id)}
-            />
-          ))}
-        </div>
+      {open && (
+        <Card
+          title={`Инструкция №${open.version} · ${open.name}`}
+          description="Полный текст без сокращений — ровно то, что получает модель."
+          actions={
+            <button
+              type="button"
+              className="ghost small"
+              onClick={() => setOpenId(null)}
+            >
+              Закрыть
+            </button>
+          }
+        >
+          <PromptEditor
+            canWrite={props.canWrite}
+            onChanged={afterChange}
+            onError={props.onError}
+            promptId={open.id}
+          />
+        </Card>
       )}
-    </Card>
+    </>
   );
 }
 
@@ -185,15 +290,22 @@ function NewPrompt(props: Readonly<Shared & {
 
   if (loadingSource) {
     return (
-      <div className="subcard" style={{ marginBottom: 20 }}>
+      <Card title="Новая инструкция">
         <Skeleton rows={3} />
-      </div>
+      </Card>
     );
   }
 
   return (
-    <div className="subcard" style={{ marginBottom: 20 }}>
-      <Notice tone="info" title={`Будет создана версия №${props.nextVersion}`}>
+    <Card
+      title={`Новая инструкция (версия №${props.nextVersion})`}
+      actions={
+        <button type="button" className="ghost small" onClick={props.onClose}>
+          Закрыть
+        </button>
+      }
+    >
+      <Notice tone="info">
         {sourceLabel
           ? `Текст скопирован из инструкции ${sourceLabel} — правьте свободно, оригинал не изменится. `
           : ""}
@@ -237,7 +349,7 @@ function NewPrompt(props: Readonly<Shared & {
         />
       </Field>
 
-      <div className="button-row" style={{ marginTop: 12 }}>
+      <div className="button-row" style={{ marginTop: "var(--s-3)" }}>
         <button
           type="button"
           className="primary"
@@ -255,69 +367,11 @@ function NewPrompt(props: Readonly<Shared & {
           Отмена
         </button>
       </div>
-    </div>
+    </Card>
   );
 }
 
-// --- Строка списка и карточка ----------------------------------------------------
-
-function PromptRow(props: Readonly<Shared & {
-  item: AIPromptItem;
-  isActive: boolean;
-  open: boolean;
-  onToggle: () => void;
-  onCopy: () => void;
-}>) {
-  const { item, canWrite } = props;
-
-  return (
-    <div className="subcard">
-      <div className="card-head" style={{ marginBottom: props.open ? 12 : 0 }}>
-        <div>
-          <div className="inline-list">
-            <strong>
-              №{item.version} · {item.name}
-            </strong>
-            {props.isActive ? (
-              <Status tone="ok">используется задачей</Status>
-            ) : (
-              <Status tone="neutral">не используется</Status>
-            )}
-            {!item.enabled && <Tag tone="warn">выключена</Tag>}
-          </div>
-          <p className="field-hint" style={{ marginTop: 4 }}>
-            {item.system_prompt_preview}
-            {item.system_prompt_length > item.system_prompt_preview.length && "…"}
-          </p>
-          <p className="field-hint" style={{ marginTop: 2 }}>
-            правила: {item.system_prompt_length} симв. · шаблон:{" "}
-            {item.user_template_length} симв. · изменена {moment(item.updated_at)}
-          </p>
-        </div>
-
-        <div className="card-actions">
-          <button type="button" className="small" onClick={props.onToggle}>
-            {props.open ? "Свернуть" : "Открыть полностью"}
-          </button>
-          {canWrite && (
-            <button type="button" className="small" onClick={props.onCopy}>
-              Создать копию
-            </button>
-          )}
-        </div>
-      </div>
-
-      {props.open && (
-        <PromptEditor
-          canWrite={canWrite}
-          onChanged={props.onChanged}
-          onError={props.onError}
-          promptId={item.id}
-        />
-      )}
-    </div>
-  );
-}
+// --- Просмотр и правка ----------------------------------------------------------
 
 function PromptEditor(props: Readonly<Shared & { promptId: number }>) {
   const { promptId, canWrite } = props;
@@ -328,6 +382,7 @@ function PromptEditor(props: Readonly<Shared & { promptId: number }>) {
   const [loading, setLoading] = useState(true);
   const [failure, setFailure] = useState("");
   const [saving, setSaving] = useState(false);
+  const [confirming, setConfirming] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -376,27 +431,27 @@ function PromptEditor(props: Readonly<Shared & { promptId: number }>) {
 
   const remove = async () => {
     if (!prompt) return;
-    if (
-      !window.confirm(
-        `Удалить инструкцию №${prompt.version} «${prompt.name}»? Отменить это нельзя.`
-      )
-    ) {
-      return;
-    }
+    setSaving(true);
     try {
       await aiApi.deletePrompt(promptId);
+      setConfirming(false);
       props.onChanged(`Инструкция №${prompt.version} удалена`);
     } catch (e) {
       const error = e as ApiError;
       const blockers = error.blockers?.map((b) => b.detail).join("; ");
       props.onError(
-        blockers ? `${error.message} Мешает: ${blockers}` : error.message
+        blockers ? `${error.message} Мешает: ${blockers}` : error.message,
       );
+      setConfirming(false);
+    } finally {
+      setSaving(false);
     }
   };
 
   if (loading) return <Skeleton rows={4} />;
-  if (failure) return <div className="error">Не удалось загрузить текст: {failure}</div>;
+  if (failure) {
+    return <ErrorState message={`Не удалось загрузить текст: ${failure}`} />;
+  }
   if (!prompt) return null;
 
   const dirty =
@@ -452,7 +507,7 @@ function PromptEditor(props: Readonly<Shared & { promptId: number }>) {
       </Field>
 
       {canWrite && (
-        <div className="button-row" style={{ marginTop: 16 }}>
+        <div className="button-row" style={{ marginTop: "var(--s-4)" }}>
           <button
             type="button"
             className="primary"
@@ -472,8 +527,8 @@ function PromptEditor(props: Readonly<Shared & { promptId: number }>) {
           </button>
           <button
             type="button"
-            className="small danger"
-            onClick={remove}
+            className="danger"
+            onClick={() => setConfirming(true)}
             disabled={saving || prompt.in_use}
             title={
               prompt.in_use
@@ -484,6 +539,18 @@ function PromptEditor(props: Readonly<Shared & { promptId: number }>) {
             Удалить
           </button>
         </div>
+      )}
+
+      {confirming && (
+        <ConfirmDialog
+          title={`Удалить инструкцию №${prompt.version} «${prompt.name}»?`}
+          description="Версия исчезнет вместе с текстом. Отменить это нельзя, а версия, выбранная в настройках задачи, не удаляется вовсе."
+          confirmLabel="Удалить инструкцию"
+          danger
+          busy={saving}
+          onConfirm={remove}
+          onCancel={() => setConfirming(false)}
+        />
       )}
     </>
   );

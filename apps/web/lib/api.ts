@@ -1781,70 +1781,96 @@ export const ingestionApi = {
   health: () => request<IngestionHealth>("/api/v1/admin/ingestion/health"),
 };
 
+export interface ProfileQueryParams {
+  search?: string;
+  status?: string;
+  generated?: boolean;
+  delivered?: boolean;
+  sort?: ProfileSort;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Строка запроса списка анкет.
+ *
+ * Вынесена из `api.profiles`, чтобы её можно было проверить тестом: разница
+ * между «фильтр не задан» и «фильтр равен false» здесь меняет смысл выборки, а
+ * на экране такая ошибка выглядит просто как другой список.
+ */
+export function profilesQuery(params?: ProfileQueryParams): string {
+  const qs = new URLSearchParams();
+  if (params?.search) qs.set("search", params.search);
+  if (params?.status) qs.set("status", params.status);
+  // Явное false — это фильтр «без программы», а не отсутствие фильтра.
+  if (params?.generated !== undefined) {
+    qs.set("generated", String(params.generated));
+  }
+  if (params?.delivered !== undefined) {
+    qs.set("delivered", String(params.delivered));
+  }
+  if (params?.sort) qs.set("sort", params.sort);
+  qs.set("limit", String(params?.limit ?? 50));
+  qs.set("offset", String(params?.offset ?? 0));
+  return qs.toString();
+}
+
+/**
+ * Строка запроса каталога упражнений.
+ *
+ * Вынесена из `api.exercises` по той же причине: значения «любое» и «все» —
+ * отсутствие фильтра, и отправлять их серверу нельзя, иначе фильтр по знанию об
+ * оборудовании применится там, где администратор его не задавал.
+ */
+export function exercisesQuery(params?: ExerciseQueryParams): string {
+  const qs = new URLSearchParams();
+  if (params?.search) qs.set("search", params.search);
+  // Многозначные фильтры уходят повторяющимся параметром: FastAPI собирает
+  // их в список, и «штанга или гантели» — это один запрос, а не два.
+  for (const [key, values] of [
+    ["exercise_type", params?.exercise_type],
+    ["difficulty", params?.difficulty],
+    ["equipment", params?.equipment],
+    ["primary_muscle", params?.primary_muscle],
+    ["force", params?.force],
+    ["mechanic", params?.mechanic],
+    ["equipment_id", params?.equipment_id],
+    ["capability", params?.capability],
+    ["available_equipment", params?.available_equipment],
+    ["compatibility", params?.compatibility],
+  ] as const) {
+    for (const value of values ?? []) qs.append(key, value);
+  }
+  if (params?.is_active) qs.set("is_active", params.is_active);
+  if (params?.media) qs.set("media", params.media);
+  if (params?.requirement_kind && params.requirement_kind !== "any") {
+    qs.set("requirement_kind", params.requirement_kind);
+  }
+  if (params?.equipment_knowledge && params.equipment_knowledge !== "all") {
+    qs.set("equipment_knowledge", params.equipment_knowledge);
+  }
+  if (params?.assume_unlisted_unavailable) {
+    qs.set("assume_unlisted_unavailable", "true");
+  }
+  if (params?.sort_by) qs.set("sort_by", params.sort_by);
+  if (params?.order) qs.set("order", params.order);
+  if (params?.with_facets) qs.set("with_facets", "true");
+  qs.set("limit", String(params?.limit ?? 50));
+  qs.set("offset", String(params?.offset ?? 0));
+  return qs.toString();
+}
+
 export const api = {
   dashboard: () => request<Dashboard>("/api/v1/dashboard"),
-  profiles: (params?: {
-    search?: string;
-    status?: string;
-    generated?: boolean;
-    delivered?: boolean;
-    sort?: ProfileSort;
-    limit?: number;
-    offset?: number;
-  }) => {
-    const qs = new URLSearchParams();
-    if (params?.search) qs.set("search", params.search);
-    if (params?.status) qs.set("status", params.status);
-    // Явное false — это фильтр «без программы», а не отсутствие фильтра.
-    if (params?.generated !== undefined) qs.set("generated", String(params.generated));
-    if (params?.delivered !== undefined) qs.set("delivered", String(params.delivered));
-    if (params?.sort) qs.set("sort", params.sort);
-    qs.set("limit", String(params?.limit ?? 50));
-    qs.set("offset", String(params?.offset ?? 0));
-    return request<ProfileListResponse>(`/api/v1/profiles?${qs}`);
-  },
+  profiles: (params?: ProfileQueryParams) =>
+    request<ProfileListResponse>(`/api/v1/profiles?${profilesQuery(params)}`),
   profile: (id: string) => request<ProfileDetail>(`/api/v1/profiles/${id}`),
   deleteProfile: (id: string) =>
     request<void>(`/api/v1/profiles/${id}`, { method: "DELETE" }),
   deleteProgram: (id: string) =>
     request<void>(`/api/v1/programs/${id}`, { method: "DELETE" }),
-  exercises: (params?: ExerciseQueryParams) => {
-    const qs = new URLSearchParams();
-    if (params?.search) qs.set("search", params.search);
-    // Многозначные фильтры уходят повторяющимся параметром: FastAPI собирает
-    // их в список, и «штанга или гантели» — это один запрос, а не два.
-    for (const [key, values] of [
-      ["exercise_type", params?.exercise_type],
-      ["difficulty", params?.difficulty],
-      ["equipment", params?.equipment],
-      ["primary_muscle", params?.primary_muscle],
-      ["force", params?.force],
-      ["mechanic", params?.mechanic],
-      ["equipment_id", params?.equipment_id],
-      ["capability", params?.capability],
-      ["available_equipment", params?.available_equipment],
-      ["compatibility", params?.compatibility],
-    ] as const) {
-      for (const value of values ?? []) qs.append(key, value);
-    }
-    if (params?.is_active) qs.set("is_active", params.is_active);
-    if (params?.media) qs.set("media", params.media);
-    if (params?.requirement_kind && params.requirement_kind !== "any") {
-      qs.set("requirement_kind", params.requirement_kind);
-    }
-    if (params?.equipment_knowledge && params.equipment_knowledge !== "all") {
-      qs.set("equipment_knowledge", params.equipment_knowledge);
-    }
-    if (params?.assume_unlisted_unavailable) {
-      qs.set("assume_unlisted_unavailable", "true");
-    }
-    if (params?.sort_by) qs.set("sort_by", params.sort_by);
-    if (params?.order) qs.set("order", params.order);
-    if (params?.with_facets) qs.set("with_facets", "true");
-    qs.set("limit", String(params?.limit ?? 50));
-    qs.set("offset", String(params?.offset ?? 0));
-    return request<ExerciseListResponse>(`/api/v1/exercises?${qs}`);
-  },
+  exercises: (params?: ExerciseQueryParams) =>
+    request<ExerciseListResponse>(`/api/v1/exercises?${exercisesQuery(params)}`),
   exercise: (id: number) => request<ExerciseDetail>(`/api/v1/exercises/${id}`),
   exerciseByExternalId: (externalId: string, source?: string) => {
     const qs = new URLSearchParams();

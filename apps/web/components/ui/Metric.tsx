@@ -37,8 +37,13 @@ export function Metric(props: Readonly<{
       </div>
       <div className="label">{props.label}</div>
       {props.secondary && <div className="muted">{props.secondary}</div>}
-      <p className="field-hint">{props.hint}</p>
-      {props.action}
+      {/* Пояснение раскрывается наведением и остаётся доступным для
+          скринридера: развёрнутым оно в плитке 180px занимает больше места, чем
+          само число, и сетка показателей превращается в текст. */}
+      <p className="field-hint stat-hint" title={props.hint}>
+        {props.hint}
+      </p>
+      {props.action && <div className="stat-action">{props.action}</div>}
     </div>
   );
 }

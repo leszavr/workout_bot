@@ -6,7 +6,7 @@
 // разделах. До этого поля стояли рядами с одними placeholder'ами: что именно
 // вводить и зачем — приходилось угадывать.
 
-import { ReactNode } from "react";
+import { Fragment, ReactNode } from "react";
 
 /** Поле формы: подпись сверху, подсказка снизу, ошибка вместо подсказки. */
 export function Field(props: Readonly<{
@@ -102,6 +102,64 @@ export function Empty(props: Readonly<{
       <div className="empty-title">{props.title}</div>
       {props.hint && <p className="empty-hint">{props.hint}</p>}
       {props.action}
+    </div>
+  );
+}
+
+/**
+ * Ошибка запроса.
+ *
+ * Отдельно от `Notice`: ошибка обязана сообщать роль alert (её читает
+ * скринридер) и предлагать повтор там, где повтор осмыслен. Раньше страницы
+ * писали `<div className="error">{error}</div>` — без роли и без повтора.
+ */
+export function ErrorState(props: Readonly<{
+  message: string;
+  onRetry?: () => void;
+}>) {
+  return (
+    <div className="error" role="alert">
+      <div>{props.message}</div>
+      {props.onRetry && (
+        <div className="button-row" style={{ marginTop: "var(--s-3)" }}>
+          <button type="button" className="small" onClick={props.onRetry}>
+            Повторить
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Список «поле — значение» для карточек сущностей.
+ *
+ * Значение может быть длинным пояснением, поэтому у строки есть подпись под
+ * значением: без неё карточка упражнения объясняла разницу между справочником и
+ * требованиями в отдельном абзаце, оторванном от самого значения.
+ */
+export function KeyValue(props: Readonly<{
+  rows: ReadonlyArray<{
+    key: string;
+    value: ReactNode;
+    hint?: string;
+    hidden?: boolean;
+  }>;
+}>) {
+  const rows = props.rows.filter((row) => !row.hidden);
+  return (
+    <div className="kv">
+      {rows.map((row) => (
+        // Fragment, а не обёртка: `.kv` — сетка из двух колонок, и лишний
+        // элемент между сеткой и ячейками сломал бы её разметку.
+        <Fragment key={row.key}>
+          <div className="k">{row.key}</div>
+          <div>
+            {row.value}
+            {row.hint && <div className="field-hint">{row.hint}</div>}
+          </div>
+        </Fragment>
+      ))}
     </div>
   );
 }

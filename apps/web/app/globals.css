@@ -61,6 +61,9 @@
   --sidebar-bg: #131a24;
   --sidebar-text: #c9d2dd;
   --sidebar-active: #1e2836;
+  --sidebar-width: 240px;
+  --sidebar-width-collapsed: 60px;
+  --header-height: 52px;
 }
 
 * {
@@ -98,118 +101,250 @@ a:hover {
   border-radius: var(--radius-sm);
 }
 
-/* --- Каркас страницы ------------------------------------------------------- */
+/* --- Каркас страницы -------------------------------------------------------
+ *
+ * Меню фиксировано слева, рабочая область скроллится отдельно. Шапка рабочей
+ * области закреплена сверху: при длинных таблицах путь до раздела и выход
+ * остаются на месте, а не уезжают за верх экрана.
+ */
 
-.app-shell {
-  display: flex;
+.admin-shell {
   min-height: 100vh;
+  display: flex;
 }
 
-.sidebar {
-  width: 232px;
+.admin-sidebar {
+  width: var(--sidebar-width);
   flex-shrink: 0;
   background: var(--sidebar-bg);
   color: var(--sidebar-text);
-  padding: var(--s-5) 0 var(--s-4);
   display: flex;
   flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  transition: width 0.12s ease;
 }
-.sidebar .brand {
+.admin-sidebar.is-collapsed {
+  width: var(--sidebar-width-collapsed);
+}
+
+.admin-sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: var(--header-height);
+  padding: 0 var(--s-3);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+.admin-brand-mark {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+}
+.admin-brand-text {
+  color: #fff;
   font-weight: 650;
   font-size: 15px;
   letter-spacing: -0.01em;
-  padding: 0 var(--s-5) var(--s-4);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.admin-sidebar-collapse {
+  margin-left: auto;
+  color: #8b95a3;
+  padding: 2px 6px;
+}
+.admin-sidebar-collapse:hover:not(:disabled) {
+  background: var(--sidebar-active);
   color: #fff;
 }
-.sidebar nav {
+.admin-sidebar.is-collapsed .admin-sidebar-collapse {
+  margin-left: 0;
+}
+
+.admin-nav {
+  display: flex;
+  flex-direction: column;
+  padding: var(--s-3) var(--s-2) var(--s-4);
+  gap: var(--s-3);
+}
+.admin-nav-group {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 0 var(--s-3);
 }
-.sidebar nav a {
+.admin-nav-title {
+  padding: 0 var(--s-3) var(--s-1);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #75808e;
+}
+.admin-nav-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: var(--s-1) var(--s-2);
+}
+.admin-nav-link {
   display: flex;
   align-items: center;
   gap: var(--s-3);
-  padding: 9px var(--s-3);
+  padding: 8px var(--s-3);
   border-radius: var(--radius-sm);
   color: var(--sidebar-text);
   font-weight: 500;
+  white-space: nowrap;
   transition: background 0.12s ease, color 0.12s ease;
 }
-.sidebar nav a:hover {
+.admin-nav-link:hover {
   background: var(--sidebar-active);
   color: #fff;
   text-decoration: none;
 }
-.sidebar nav a.active {
+/* Активный раздел помечен и цветом, и полосой: только цветом он неразличим
+   при монохромном восприятии. */
+.admin-nav-link.active {
   background: var(--sidebar-active);
   color: #fff;
+  box-shadow: inset 2px 0 0 var(--accent);
 }
-.sidebar nav a .nav-icon {
+.admin-nav-icon {
   width: 18px;
+  flex-shrink: 0;
   text-align: center;
   opacity: 0.85;
   font-size: 15px;
 }
-
-.sidebar-footer {
-  margin-top: auto;
-  padding: var(--s-4) var(--s-5) 0;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  margin-left: var(--s-3);
-  margin-right: var(--s-3);
+.admin-nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.sidebar-footer .who {
-  color: #fff;
-  font-weight: 600;
+.admin-sidebar.is-collapsed .admin-nav-label {
+  display: none;
 }
-.sidebar-footer .role {
-  color: #8b95a3;
-  font-size: 12px;
-}
-.sidebar-footer .links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-3);
-  margin-top: var(--s-3);
-}
-.sidebar-footer a,
-.sidebar-footer .linklike {
-  color: #9aa5b3;
-  font-size: 13px;
-  background: none;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-}
-.sidebar-footer a:hover,
-.sidebar-footer .linklike:hover {
-  color: #fff;
-  text-decoration: underline;
+.admin-sidebar.is-collapsed .admin-nav-link {
+  justify-content: center;
+  padding-left: var(--s-2);
+  padding-right: var(--s-2);
 }
 
-.main {
+.admin-main {
   flex: 1;
   min-width: 0;
-  padding: var(--s-6);
-  max-width: 1240px;
+  display: flex;
+  flex-direction: column;
+}
+
+.admin-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  height: var(--header-height);
+  padding: 0 var(--s-5);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.admin-header-menu {
+  display: none;
+  font-size: 16px;
+}
+.admin-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-width: 0;
+  color: var(--text-secondary);
+}
+.admin-breadcrumb-sep {
+  color: var(--muted);
+}
+.admin-breadcrumb-current {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.admin-header-user {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+.admin-header-who {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  text-align: right;
+  min-width: 0;
+}
+.admin-header-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.admin-header-role {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.admin-content {
+  padding: var(--s-5) var(--s-5) var(--s-7);
+  max-width: 1360px;
+  min-width: 0;
+}
+
+.admin-scrim {
+  display: none;
 }
 
 .page-head {
-  margin-bottom: var(--s-5);
+  margin-bottom: var(--s-4);
+}
+.page-head-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-4);
+  flex-wrap: wrap;
+}
+.page-head-text {
+  min-width: 0;
+}
+.page-head-actions {
+  display: flex;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+  align-items: center;
 }
 .page-title {
-  font-size: 24px;
+  font-size: 21px;
   font-weight: 680;
   letter-spacing: -0.02em;
   margin: 0;
 }
 .page-subtitle {
   color: var(--text-secondary);
-  margin: var(--s-2) 0 0;
-  max-width: 68ch;
+  margin: var(--s-1) 0 0;
+  max-width: 84ch;
 }
+
 
 /* --- Карточки -------------------------------------------------------------- */
 
@@ -218,7 +353,7 @@ a:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow-sm);
-  padding: var(--s-5);
+  padding: var(--s-4);
   margin-bottom: var(--s-4);
 }
 .card-head {
@@ -226,7 +361,7 @@ a:hover {
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--s-4);
-  margin-bottom: var(--s-4);
+  margin-bottom: var(--s-3);
   flex-wrap: wrap;
 }
 /* Карточка без содержимого (только заголовок и кнопка) не должна
@@ -262,25 +397,39 @@ a:hover {
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: var(--s-4);
-  margin-bottom: var(--s-5);
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--s-3);
+  margin-bottom: var(--s-4);
 }
 .stat {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: var(--s-4) var(--s-5);
+  padding: var(--s-3) var(--s-4);
   box-shadow: var(--shadow-sm);
 }
 .stat .value {
-  font-size: 28px;
+  font-size: 24px;
   font-weight: 680;
   letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
 }
 .stat .label {
-  color: var(--muted);
+  color: var(--text);
+  font-weight: 550;
   margin-top: var(--s-1);
+}
+/* Пояснение к показателю: две строки, дальше — обрезка с подсказкой по
+   наведению. Полный текст в плитке 180px занимал больше места, чем само
+   число, и сетка показателей превращалась в текст. */
+.stat-hint {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.stat-action {
+  margin-top: var(--s-2);
 }
 
 /* --- Формы --------------------------------------------------------------- */
@@ -321,14 +470,81 @@ a:hover {
 /* Панель фильтров: поля с подписями плюс кнопки в одну линию по низу. */
 .filters {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: var(--s-4);
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: var(--s-3);
   align-items: end;
 }
 .filters .filters-actions {
   display: flex;
   gap: var(--s-2);
   align-items: center;
+}
+
+/* Скрываемая группа фильтров: список не должен уезжать за сгиб под панелью
+   отбора. Заголовок сообщает, сколько условий внутри задано. */
+.filter-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-subtle);
+  padding: var(--s-2) var(--s-3);
+  margin-top: var(--s-3);
+}
+.filter-group > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  cursor: pointer;
+  font-weight: 550;
+  font-size: 13px;
+  list-style: none;
+}
+.filter-group > summary::-webkit-details-marker {
+  display: none;
+}
+.filter-group > summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 11px;
+}
+.filter-group[open] > summary::before {
+  content: "▾";
+}
+.filter-group[open] > summary {
+  margin-bottom: var(--s-3);
+}
+.filter-group .form-grid {
+  padding-bottom: var(--s-2);
+}
+
+/* Схема модели знания: три звена в ряд, на узком экране — в столбец.
+   Показывается в самом разделе, потому что решения администратора («выключить
+   или удалить», «возможность или конкретный тренажёр») зависят от модели. */
+.model-chain {
+  display: flex;
+  align-items: stretch;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+.model-node {
+  flex: 1 1 180px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  padding: var(--s-3);
+}
+.model-node-title {
+  font-weight: 650;
+}
+.model-node .field-hint {
+  margin: var(--s-1) 0 0;
+}
+.model-arrow {
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 input[type="text"],
@@ -565,7 +781,7 @@ table {
 th,
 td {
   text-align: left;
-  padding: 11px var(--s-4);
+  padding: 8px var(--s-3);
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
@@ -577,6 +793,38 @@ th {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+/* Заголовок-кнопка сортировки: нажимаемый заголовок обязан выглядеть
+   нажимаемым, а не отличаться только поведением. */
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+.th-sort:hover:not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text);
+}
+.th-sort-mark {
+  opacity: 0.55;
+  font-size: 11px;
+}
+th.num,
+td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 tbody tr:hover {
   background: var(--panel-subtle);
@@ -586,6 +834,11 @@ tbody tr:last-child td {
 }
 td.actions {
   white-space: nowrap;
+}
+/* Обновление списка при смене страницы: старые строки остаются, но видно, что
+   они устарели. Полный скелет вместо них мигал бы на каждом переходе. */
+table.is-stale tbody {
+  opacity: 0.55;
 }
 
 /* --- Сообщения и пустые состояния ------------------------------------- */
@@ -676,7 +929,7 @@ td.actions {
   background: var(--neutral-soft);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin-bottom: var(--s-5);
+  margin-top: var(--s-3);
   flex-wrap: wrap;
 }
 .tabs a,
@@ -700,6 +953,54 @@ td.actions {
   background: var(--panel);
   color: var(--text);
   box-shadow: var(--shadow-sm);
+}
+/* Счётчик у вкладки: сколько записей внутри. Пустая вкладка видна до
+   нажатия, и открывать её ради пустого списка не приходится. */
+.tab-count {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--neutral-soft);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+.tabs button.active .tab-count {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent-hover);
+}
+
+/* --- Диалоги ---------------------------------------------------------------
+ *
+ * Только для необратимых действий: у системного `confirm` нет места на
+ * перечисление последствий и нет различия обычного и разрушительного действия.
+ */
+
+.dialog-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: var(--s-4);
+  background: rgba(16, 24, 40, 0.45);
+}
+.dialog {
+  width: 100%;
+  max-width: 460px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: var(--s-5);
+}
+.dialog .card-desc {
+  margin-top: var(--s-2);
+}
+.dialog-actions {
+  margin-top: var(--s-5);
 }
 
 /* --- Прочее ----------------------------------------------------------- */
@@ -743,6 +1044,20 @@ code,
 }
 .kv .k {
   color: var(--muted);
+}
+
+/* Изображения упражнения: ряд превью одинаковой высоты. */
+.media-grid {
+  display: flex;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+}
+.media-grid img {
+  height: 150px;
+  width: auto;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  display: block;
 }
 
 /* Порядок шагов: нумерованный список без «сырых» маркеров. */
@@ -809,34 +1124,113 @@ code,
   width: 100%;
 }
 
-/* --- Адаптив ---------------------------------------------------------- */
+/* --- Адаптив ----------------------------------------------------------
+ *
+ * Основная версия — desktop. Промежуточный экран (небольшой ноутбук) получает
+ * узкое меню, но не теряет его: превращать меню в кнопку там, где для него есть
+ * 60 пикселей, значило бы добавить нажатие к каждому переходу.
+ *
+ * Ниже 900px постоянного меню нет: рабочей области осталось бы меньше половины
+ * экрана. Меню выезжает поверх содержимого, а не сжимает его — иначе таблица
+ * перевёрстывалась бы при каждом открытии.
+ */
 
-@media (max-width: 860px) {
-  .app-shell {
-    flex-direction: column;
+@media (max-width: 1180px) {
+  .admin-sidebar {
+    width: var(--sidebar-width-collapsed);
   }
-  .sidebar {
-    width: 100%;
-    padding: var(--s-3) 0;
+  .admin-sidebar .admin-nav-label,
+  .admin-sidebar .admin-brand-text,
+  .admin-sidebar .admin-nav-title {
+    display: none;
   }
-  .sidebar nav {
-    flex-direction: row;
-    overflow-x: auto;
+  .admin-sidebar .admin-nav-link {
+    justify-content: center;
+    padding-left: var(--s-2);
+    padding-right: var(--s-2);
   }
-  .sidebar nav a {
-    white-space: nowrap;
+  /* Кнопка свёртывания на этой ширине ничего не меняет: меню уже узкое. */
+  .admin-sidebar-collapse {
+    display: none;
   }
-  .sidebar-footer {
-    margin-top: var(--s-3);
+  .admin-content {
+    padding: var(--s-4) var(--s-4) var(--s-6);
   }
-  .sidebar-footer .links {
-    margin-top: var(--s-2);
+}
+
+@media (max-width: 900px) {
+  .admin-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 40;
+    width: var(--sidebar-width);
+    transform: translateX(-100%);
+    transition: transform 0.16s ease;
   }
-  .main {
-    padding: var(--s-4);
+  .admin-sidebar.is-open {
+    transform: translateX(0);
+    box-shadow: var(--shadow-lg);
+  }
+  /* В выдвижной панели место есть: подписи и группы возвращаются. */
+  .admin-sidebar .admin-nav-label,
+  .admin-sidebar .admin-brand-text,
+  .admin-sidebar .admin-nav-title {
+    display: block;
+  }
+  .admin-sidebar .admin-nav-link {
+    justify-content: flex-start;
+    padding-left: var(--s-3);
+    padding-right: var(--s-3);
+  }
+  .admin-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    background: rgba(16, 24, 40, 0.4);
+  }
+  .admin-scrim:hover {
+    background: rgba(16, 24, 40, 0.4);
+    border: none;
+  }
+  .admin-header-menu {
+    display: inline-flex;
+  }
+  .admin-header {
+    padding: 0 var(--s-4);
+  }
+  /* Роль под именем на узком экране занимает место, которое нужнее пути до
+     раздела. Роль остаётся в разделе «Пользователи». */
+  .admin-header-role {
+    display: none;
   }
   .kv {
     grid-template-columns: 1fr;
     gap: var(--s-1);
+  }
+  .page-head-row {
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 600px) {
+  .admin-content {
+    padding: var(--s-3) var(--s-3) var(--s-5);
+  }
+  .filters {
+    grid-template-columns: 1fr;
+  }
+  .stats-grid {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .admin-sidebar {
+    transition: none;
   }
 }

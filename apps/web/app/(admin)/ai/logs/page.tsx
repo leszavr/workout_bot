@@ -1,0 +1,44 @@
+"use client";
+
+// /ai/logs — почему что-то не работает.
+//
+// Четыре журнала в одном месте: вызовы AI (токены, задержки, ошибки), попытки
+// моделей внутри одной генерации, причины fallback и изменения конфигурации.
+// Разбор инцидента начинается здесь.
+
+import AIFallbackEvents from "@/components/AIFallbackEvents";
+import AIModelAttempts from "@/components/AIModelAttempts";
+import AIObservability from "@/components/AIObservability";
+import { Card, ErrorState, Skeleton } from "@/components/ui/Primitives";
+import { useAIConfiguration } from "@/lib/aiData";
+
+export default function AILogsPage() {
+  const state = useAIConfiguration();
+
+  if (state.loading) {
+    return (
+      <Card>
+        <Skeleton rows={4} />
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      {state.error && <ErrorState message={state.error} />}
+
+      <AIFallbackEvents reloadKey={state.reloadKey} onError={state.onError} />
+
+      <AIModelAttempts reloadKey={state.reloadKey} onError={state.onError} />
+
+      <AIObservability
+        usage={state.usage}
+        audit={state.audit}
+        models={state.allModels}
+        providers={state.providers}
+        refreshing={state.refreshing}
+        onRefresh={() => state.reload().catch(() => undefined)}
+      />
+    </>
+  );
+}

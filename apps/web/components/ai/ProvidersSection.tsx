@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import {
   Card,
   Empty,
@@ -29,31 +30,28 @@ import {
   aiApi,
 } from "@/lib/api";
 
-/** Удаление с подтверждением и расшифровкой того, что мешает. */
-async function runDelete(
-  label: string,
-  action: () => Promise<void>,
-  onChanged: (message: string) => void,
-  onError: (message: string) => void
-): Promise<void> {
-  if (!window.confirm(`Удалить ${label}? Отменить это нельзя.`)) return;
-  try {
-    await action();
-    onChanged(`Удалено: ${label}`);
-  } catch (e) {
-    const error = e as ApiError;
-    const blockers = error.blockers?.map((b) => b.detail).join("; ");
-    onError(blockers ? `${error.message} Мешает: ${blockers}` : error.message);
-  }
+/**
+ * Запрос на удаление: что удаляем, чем это делается и чем грозит.
+ *
+ * Диалог рисует раздел целиком, а не каждый вложенный блок: у сервиса,
+ * подключения и модели одна и та же формулировка последствий, и три копии
+ * диалога расходились бы при первой же правке текста.
+ */
+interface DeleteRequest {
+  label: string;
+  /** Что перестанет работать. У разных уровней последствия разные. */
+  consequence: string;
+  run: () => Promise<void>;
 }
 
 interface Shared {
   canWrite: boolean;
   onChanged: (message: string) => void;
   onError: (message: string) => void;
+  requestDelete: (request: DeleteRequest) => void;
 }
 
-export default function ProvidersSection(props: Readonly<Shared & {
+export default function ProvidersSection(props: Readonly<Omit<Shared, "requestDelete"> & {
   providers: AIProviderItem[];
   endpoints: Record<number, AIEndpointItem[]>;
   models: Record<number, AIModelItem[]>;
@@ -61,14 +59,39 @@ export default function ProvidersSection(props: Readonly<Shared & {
   onTestResult: (endpointId: number, result: AIEndpointTestResult) => void;
 }>) {
   const [adding, setAdding] = useState(false);
+  const [pending, setPending] = useState<DeleteRequest | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const shared: Shared = {
     canWrite: props.canWrite,
     onChanged: props.onChanged,
     onError: props.onError,
+    requestDelete: setPending,
+  };
+
+  const confirmDelete = async () => {
+    if (!pending) return;
+    setBusy(true);
+    try {
+      await pending.run();
+      setPending(null);
+      props.onChanged(`Удалено: ${pending.label}`);
+    } catch (e) {
+      const error = e as ApiError;
+      // Сервер объясняет отказ перечнем того, что ссылается на запись. Без
+      // этого перечня «удалить нельзя» не подсказывает, что делать дальше.
+      const blockers = error.blockers?.map((b) => b.detail).join("; ");
+      props.onError(
+        blockers ? `${error.message} Мешает: ${blockers}` : error.message,
+      );
+      setPending(null);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
+    <>
     <Card
       title="Сервисы ИИ"
       description="Сервис — поставщик, к которому обращается система. У него есть адрес подключения с ключом доступа и хотя бы одна модель."
@@ -105,12 +128,25 @@ export default function ProvidersSection(props: Readonly<Shared & {
         ))
       )}
     </Card>
+
+    {pending && (
+      <ConfirmDialog
+        title={`Удалить ${pending.label}?`}
+        description={pending.consequence}
+        confirmLabel="Удалить"
+        danger
+        busy={busy}
+        onConfirm={confirmDelete}
+        onCancel={() => setPending(null)}
+      />
+    )}
+    </>
   );
 }
 
 // --- Сервис ------------------------------------------------------------------
 
-function NewProvider(props: Readonly<Shared & { onClose: () => void }>) {
+function NewProvider(props: Readonly<Omit<Shared, "requestDelete"> & { onClose: () => void }>) {
   const [name, setName] = useState("");
 
   const create = async () => {
@@ -229,12 +265,14 @@ function ProviderBlock(props: Readonly<Shared & {
               type="button"
               className="small danger"
               onClick={() =>
-                runDelete(
-                  `сервис «${provider.name}»`,
-                  () => aiApi.deleteProvider(provider.id),
-                  onChanged,
-                  onError
-                )
+                props.requestDelete({
+                  label: `сервис «${provider.name}»`,
+                  consequence:
+                    "Вместе с сервисом исчезнут его подключения и модели. " +
+                    "Если на модель ссылается задача, сервер откажет и назовёт, " +
+                    "что именно мешает.",
+                  run: () => aiApi.deleteProvider(provider.id),
+                })
               }
             >
               Удалить
@@ -295,6 +333,7 @@ function ProviderBlock(props: Readonly<Shared & {
             canWrite={canWrite}
             onChanged={onChanged}
             onError={onError}
+            requestDelete={props.requestDelete}
             endpoint={endpoint}
             models={props.models[endpoint.id] ?? []}
             testResult={props.testResults[endpoint.id]}
@@ -308,7 +347,7 @@ function ProviderBlock(props: Readonly<Shared & {
 
 // --- Адрес подключения --------------------------------------------------------
 
-function NewEndpoint(props: Readonly<Shared & {
+function NewEndpoint(props: Readonly<Omit<Shared, "requestDelete"> & {
   providerId: number;
   onClose: () => void;
 }>) {
@@ -505,12 +544,13 @@ function EndpointBlock(props: Readonly<Shared & {
               type="button"
               className="small danger"
               onClick={() =>
-                runDelete(
-                  `подключение «${endpoint.name}»`,
-                  () => aiApi.deleteEndpoint(endpoint.id),
-                  onChanged,
-                  onError
-                )
+                props.requestDelete({
+                  label: `подключение «${endpoint.name}»`,
+                  consequence:
+                    "Модели этого подключения удалятся вместе с ним, а ключ " +
+                    "доступа придётся вводить заново.",
+                  run: () => aiApi.deleteEndpoint(endpoint.id),
+                })
               }
             >
               Удалить
@@ -612,6 +652,7 @@ function EndpointBlock(props: Readonly<Shared & {
                   canWrite={canWrite}
                   onChanged={onChanged}
                   onError={onError}
+                  requestDelete={props.requestDelete}
                   model={model}
                 />
               ))}
@@ -634,7 +675,7 @@ function EndpointBlock(props: Readonly<Shared & {
  * Список может содержать сотни моделей, поэтому он скроллируется и
  * фильтруется по подстроке.
  */
-function NewModel(props: Readonly<Shared & {
+function NewModel(props: Readonly<Omit<Shared, "requestDelete"> & {
   endpointId: number;
   onClose: () => void;
 }>) {
@@ -927,12 +968,13 @@ function ModelRow(props: Readonly<Shared & { model: AIModelItem }>) {
               type="button"
               className="small danger"
               onClick={() =>
-                runDelete(
-                  `модель «${model.display_name}»`,
-                  () => aiApi.deleteModel(model.id),
-                  onChanged,
-                  onError
-                )
+                props.requestDelete({
+                  label: `модель «${model.display_name}»`,
+                  consequence:
+                    "Если модель выбрана в задаче, сервер откажет: сначала " +
+                    "уберите её из порядка вызова.",
+                  run: () => aiApi.deleteModel(model.id),
+                })
               }
             >
               Удалить
